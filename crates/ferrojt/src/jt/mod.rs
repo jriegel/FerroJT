@@ -4,52 +4,60 @@
 //! the crate only depends on [`open`] returning a [`Model`], so the reader can
 //! be filled in incrementally without touching the exporters or the CLI.
 //!
-//! Planned shape of a full implementation (left as extension points):
+//! The layers, bottom up:
 //!
-//! - `jt::ios` &mdash; parse the `SegmentObjectIdentifier` and
-//!   `MetadataSegmentDescription`/`MetadataSegment` (X3.282 §A.3).
-//! - `jt::lod` &mdash; LOD0/LOD1/LOD2 vertex, normal, colour and instance
-//!   segments, including precision trimmed components via
-//!   [`crate::codec::BitReader`].
-//! - `jt::shape` &mdash; the shape structure tree, translated into
-//!   [`crate::model::Node`].
-//!
-//! Until then every entry point returns [`crate::Error::NotImplemented`].
+//! - a byte order aware cursor over a slice, re-exported as [`Cursor`],
+//! - the GUID type [`Guid`] and the registry of known object classes,
+//!   [`class_of`],
+//! - the fixed header [`FileHeader`], the TOC table [`TocEntry`] and segment
+//!   framing [`Segment`], including the DEFLATE/XZ envelopes,
+//! - the object classes: nodes [`Node`], attributes [`Attribute`], properties
+//!   [`Property`] and representation elements [`Element`], with the shape LOD
+//!   decoders [`ShapeLodVertex`] and [`ShapeLodTriStripSet`],
+//! - the lossless, quantized and topologically compressed codecs behind those
+//!   representations: [`Package`], [`VertexData`] and [`MeshInput`],
+//! - the loader that ties it together: [`JtFile`], [`SceneGraph`], the
+//!   property table and the late-loaded representations [`LoadedElement`].
 
 use std::path::Path;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::model::Model;
+
+mod decode;
+mod guid;
+mod model;
+mod object;
+mod reader;
+mod segment;
+
+pub use decode::{
+    Context, Decoded, ESCAPE, Entry, Kind, MeshInput, Package, PointQuantizer, Topology,
+    UnifiedMesh, UniformQuantizer, Unpack, VertexData,
+};
+pub use guid::Guid;
+pub use model::{
+    JtFile, LoadedElement, ObjectRef, SceneGraph, StoredAttribute, StoredNode, StoredProperty,
+};
+pub use object::{
+    Attribute, Class, Deferred, Element, GeometricTransform, LateLoad, LodGeometry, Material, Node,
+    NodeBase, Property, RawElement, ShapeLodTriStripSet, ShapeLodVertex, class_of,
+    read_element_envelope, skip_element,
+};
+pub use reader::Cursor;
+pub use segment::{FileHeader, Segment, TocEntry, segment_type_name};
 
 /// Open a JT file and translate it into a [`Model`].
 pub fn open(path: impl AsRef<Path>) -> Result<Model> {
     let path = path.as_ref();
     tracing::debug!(path = %path.display(), "jt::open");
-    Err(Error::not_implemented("reading JT files"))
+    Ok(JtFile::open(path)?.to_model())
 }
 
-/// Read the JT header (magic, version, originator) without parsing the body.
-pub fn read_header(path: impl AsRef<Path>) -> Result<JtHeader> {
+/// Read the JT header (version, byte order, TOC offset, LSG GUID).
+pub fn read_header(path: impl AsRef<Path>) -> Result<FileHeader> {
     let path = path.as_ref();
     tracing::debug!(path = %path.display(), "jt::read_header");
-    Err(Error::not_implemented("reading JT headers"))
-}
-
-/// Summary of a JT file's header segment.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct JtHeader {
-    /// JT specification version, e.g. 10500 for JT 10.5.
-    pub version: u32,
-    /// Byte order flag from the header.
-    pub big_endian: bool,
-    /// `JT_OPEN` / `JT_V10000` style magic string.
-    pub magic: String,
-    /// Originating application.
-    pub originator: String,
-    /// File size in bytes.
-    pub file_size: u64,
-    /// Units of the model, e.g. `millimeter`.
-    pub unit: String,
-    /// Up axis of the model, e.g. `+Z`.
-    pub up_axis: String,
+    let data = std::fs::read(path)?;
+    segment::read_header(&data)
 }

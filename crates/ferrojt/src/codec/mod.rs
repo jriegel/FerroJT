@@ -9,5 +9,8 @@ mod compress;
 mod endian;
 
 pub use bits::BitReader;
-pub use compress::{deflate, inflate, is_deflate_signature};
+pub use compress::{
+    XZ_OUTPUT_LIMIT, XZ_SIGNATURE, decompress_xz, deflate, inflate, is_deflate_signature,
+    is_xz_signature,
+};
 pub use endian::{ByteOrder, ReaderExt, WriterExt};

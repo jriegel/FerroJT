@@ -53,4 +53,9 @@ impl Error {
     pub fn not_implemented(what: &'static str) -> Self {
         Self::NotImplemented(what)
     }
+
+    /// Convenience constructor for [`Error::Corrupt`].
+    pub fn corrupt(message: impl Into<String>) -> Self {
+        Self::Corrupt(message.into())
+    }
 }

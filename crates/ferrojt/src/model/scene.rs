@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{Aabb, Accessors, Material, Mesh, Primitive, Texture};
+use super::{Aabb, Accessors, Material, Mesh, Primitive, Texture, Topology};
 
 /// A rigid body transform: translation, rotation and scale.
 ///
@@ -183,7 +183,11 @@ impl Model {
             .flat_map(|mesh| mesh.primitives.iter())
             .map(|primitive| {
                 let count = self.primitive_vertex_count(primitive);
-                count.saturating_sub(2)
+                match primitive.topology {
+                    Topology::TriangleList | Topology::TriangleFan => count / 3,
+                    Topology::TriangleStrip => count.saturating_sub(2),
+                    _ => 0,
+                }
             })
             .sum()
     }

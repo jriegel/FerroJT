@@ -28,6 +28,7 @@ tracing = "0.1"
 rayon = "1.12"
 gltf-json = { version = "1.4", features = ["extras", "names"] }
 base64 = "0.22"
+lzma-rs = "0.3"
 
 # export / import
 gltf = "1.4"

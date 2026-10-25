@@ -48,6 +48,77 @@ pub fn deflate(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(encoder.finish()?)
 }
 
+/// Magic starting an `.xz` stream (`FD 37 7A 58 5A 00`).
+pub const XZ_SIGNATURE: [u8; 6] = [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00];
+
+/// Largest output a single [`decompress_xz`] call may produce.
+///
+/// JT only declares the *compressed* length of a segment, so a bound is needed
+/// to keep a damaged file from exhausting memory.
+pub const XZ_OUTPUT_LIMIT: usize = 256 * 1024 * 1024;
+
+/// `true` if `bytes` starts with an `.xz` stream header.
+pub fn is_xz_signature(bytes: &[u8]) -> bool {
+    bytes.starts_with(&XZ_SIGNATURE)
+}
+
+fn find_xz_streams(bytes: &[u8]) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut at = 0usize;
+    while let Some(offset) = find_subslice(&bytes[at..], &XZ_SIGNATURE) {
+        found.push(at + offset);
+        at += offset + XZ_SIGNATURE.len();
+    }
+    found
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
+/// Decompress the `.xz` streams stored in `bytes`.
+///
+/// JT 10.x stores segment payloads as one or more concatenated `.xz` streams
+/// (the reference reader uses `LZMA_CONCATENATED`), so the payload is split on
+/// stream magics and every stream is appended to the same output buffer.
+pub fn decompress_xz(bytes: &[u8]) -> Result<Vec<u8>> {
+    let streams = find_xz_streams(bytes);
+    if streams.is_empty() {
+        return Err(Error::invalid(0, "segment has no xz stream header"));
+    }
+    let mut out = Vec::new();
+    for (index, &start) in streams.iter().enumerate() {
+        let end = streams.get(index + 1).copied().unwrap_or(bytes.len());
+        // Stream padding between the footer and the next magic is zero bytes;
+        // the footer itself ends with `YZ`, so trimming is unambiguous.
+        let chunk = trim_zero_padding(&bytes[start..end]);
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(chunk));
+        lzma_rs::xz_decompress(&mut reader, &mut out)
+            .map_err(|e| Error::corrupt(format!("xz stream at offset {start} failed: {e}")))?;
+        if out.len() > XZ_OUTPUT_LIMIT {
+            return Err(Error::corrupt(format!(
+                "xz stream expands past the {} byte limit",
+                XZ_OUTPUT_LIMIT
+            )));
+        }
+    }
+    if out.is_empty() {
+        return Err(Error::invalid(0, "decompressed segment is empty"));
+    }
+    Ok(out)
+}
+
+fn trim_zero_padding(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1] == 0 {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
