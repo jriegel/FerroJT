@@ -2,6 +2,8 @@
 /target/
 # Cargo.lock is committed: this workspace ships binaries (ferrojt-cli).
 
+/example/
+
 # Python
 /dist/
 /.venv/
