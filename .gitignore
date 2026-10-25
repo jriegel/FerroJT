@@ -1,0 +1,24 @@
+# Rust
+/target/
+# Cargo.lock is committed: this workspace ships binaries (ferrojt-cli).
+
+# Python
+/dist/
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+*.so
+*.pyd
+*.pyi.bak
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store

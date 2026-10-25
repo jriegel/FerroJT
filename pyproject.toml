@@ -1,0 +1,37 @@
+[build-system]
+requires = ["maturin>=1.15,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ferrojt"
+version = "0.1.0"
+description = "Read OpenJT (JT) files and convert them to glTF / USD."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+authors = [{ name = "Joerg Riegel" }]
+keywords = ["jt", "openjt", "cad", "gltf", "glb", "usd", "converter"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Rust",
+  "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/jriegel/FerroJT"
+Issues = "https://github.com/jriegel/FerroJT/issues"
+
+[tool.maturin]
+manifest-path = "crates/ferrojt-python/Cargo.toml"
+module-name = "ferrojt._ferrojt"
+python-source = "python"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
