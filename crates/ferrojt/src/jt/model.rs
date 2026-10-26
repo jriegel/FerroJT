@@ -126,6 +126,12 @@ impl SceneGraph {
             .map(|stored| &stored.node)
     }
 
+    /// Look a node up by its position in [`SceneGraph::nodes`].
+    #[must_use]
+    pub fn node_at(&self, pos: usize) -> Option<&Node> {
+        self.nodes.get(pos).map(|stored| &stored.node)
+    }
+
     /// Look a property up by its object id.
     #[must_use]
     pub fn property(&self, id: i32) -> Option<&Property> {

@@ -17,7 +17,9 @@
 //! - the lossless, quantized and topologically compressed codecs behind those
 //!   representations: [`Package`], [`VertexData`] and [`MeshInput`],
 //! - the loader that ties it together: [`JtFile`], [`SceneGraph`], the
-//!   property table and the late-loaded representations [`LoadedElement`].
+//!   property table and the late-loaded representations [`LoadedElement`],
+//! - a JT native JSON writer that reports a file the way the classic JT
+//!   tooling does: [`dump`], [`write_model`] and [`recurse_down_the_tree`].
 
 use std::path::Path;
 
@@ -25,6 +27,7 @@ use crate::error::Result;
 use crate::model::Model;
 
 mod decode;
+mod dump;
 mod guid;
 mod model;
 mod object;
@@ -34,6 +37,11 @@ mod segment;
 pub use decode::{
     Context, Decoded, ESCAPE, Entry, Kind, MeshInput, Package, PointQuantizer, Topology,
     UnifiedMesh, UniformQuantizer, Unpack, VertexData,
+};
+pub use dump::{
+    DUMP_ALL, DUMP_LOD0, DUMP_MESH, DUMP_TOC, LayerInfo, dump, format_g, handle_all_children_json,
+    handle_attributes_json, handle_late_loads_meta, recurse_down_the_tree, scan_for_layer,
+    scan_for_layer_filter, write_key_value_stream, write_meshes_without_lsg, write_model,
 };
 pub use guid::Guid;
 pub use model::{
