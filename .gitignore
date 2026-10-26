@@ -16,6 +16,7 @@ __pycache__/
 *.egg-info/
 *.so
 *.pyd
+*.pdb
 *.pyi.bak
 
 # Editors / OS
