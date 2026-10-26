@@ -25,6 +25,7 @@ fn run() -> Result<()> {
     match &cli.command {
         Command::Info(args) => cli::info(args),
         Command::Inspect(args) => cli::inspect(args),
+        Command::Dump(args) => cli::dump(args),
         Command::Convert(args) => cli::convert(args),
         Command::Ls(args) => cli::ls(args),
     }

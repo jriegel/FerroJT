@@ -191,12 +191,14 @@ fn write_name(out: &mut impl Write, indent: i32, name: &str) -> Result<()> {
 
 /// Write the file banner and, when `config` asks for it, the table of contents.
 ///
-/// The `FileName` value is the path the file was opened from, reported the way
-/// the reference tool reports it.
+/// The `FileName` value is the path the file was opened from. Backslashes are
+/// turned into slashes first, which is what the reference tool does before it
+/// opens the file.
 pub fn write_model(file: &JtFile, out: &mut impl Write, indent: i32, config: i32) -> Result<()> {
     tabs(out, indent)?;
     out.write_all(b"\"FileName\":\"")?;
-    write_text(out, &file.path.display().to_string())?;
+    let path = file.path.display().to_string().replace('\\', "/");
+    write_text(out, &path)?;
     out.write_all(b"\",\n")?;
 
     tabs(out, indent)?;
@@ -706,23 +708,28 @@ pub fn handle_all_children_json(
 
 /// Read a JT file and return its JSON dump.
 ///
-/// `indent` is the indentation of the dumped object; the reference tool uses
-/// one for a single file and two when several files are dumped as an array.
+/// The result is one complete JSON object, the way the reference tool writes a
+/// single file. `indent` is the indentation of that object's members; the
+/// reference uses one for a single file and two when several files are dumped
+/// as an array.
 ///
 /// # Errors
 ///
 /// [`Error::Io`](crate::Error::Io) is returned when the dump cannot be built.
 pub fn dump(file: &JtFile, config: i32, indent: i32) -> Result<String> {
     let mut out = Vec::new();
+    out.write_all(b"{\n")?;
     write_model(file, &mut out, indent, config)?;
     if let Some(graph) = file.lsg.as_ref() {
         if let Some(root) = graph.root() {
             let mut level = indent;
             recurse_down_the_tree(config, &mut level, &mut out, graph, root)?;
+            out.write_all(b"}\n")?;
             return Ok(String::from_utf8_lossy(&out).into_owned());
         }
     }
     write_meshes_without_lsg(file, &mut out)?;
+    out.write_all(b"}\n")?;
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 

@@ -37,6 +37,8 @@ pub enum Command {
     Info(InfoArgs),
     /// Dump the parsed scene as JSON.
     Inspect(InspectArgs),
+    /// Dump a file the way the classic JT tooling reports it.
+    Dump(DumpArgs),
     /// Convert a file to another format.
     Convert(ConvertArgs),
     /// List the scene graph.
@@ -61,6 +63,24 @@ pub struct InspectArgs {
     /// Pretty print the JSON.
     #[arg(short, long)]
     pub pretty: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct DumpArgs {
+    /// Files to dump. Several files are written as a JSON array.
+    pub files: Vec<PathBuf>,
+
+    /// Write the JSON to this file instead of standard output.
+    #[arg(short, long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Leave the table of contents out of the dump.
+    #[arg(long)]
+    pub no_toc: bool,
+
+    /// Leave the index arrays of every representation out of the dump.
+    #[arg(long)]
+    pub no_indices: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -167,6 +187,51 @@ pub fn inspect(args: &InspectArgs) -> Result<()> {
         serde_json::to_string(&value)?
     };
     println!("{text}");
+    Ok(())
+}
+
+/// Dump files the way the classic JT tooling reports them.
+///
+/// Several files are written as a JSON array with the members of each object
+/// indented one level deeper, which is what the reference tool does.
+pub fn dump(args: &DumpArgs) -> Result<()> {
+    if args.files.is_empty() {
+        bail!("no input JT files given");
+    }
+    let mut config = ferrojt::jt::DUMP_ALL;
+    if args.no_toc {
+        config &= !ferrojt::jt::DUMP_TOC;
+    }
+    if args.no_indices {
+        config &= !ferrojt::jt::DUMP_MESH;
+    }
+
+    let multiple = args.files.len() > 1;
+    let indent = i32::from(multiple) + 1;
+
+    let mut text = String::new();
+    if multiple {
+        text.push_str("[\n");
+    }
+    for (position, path) in args.files.iter().enumerate() {
+        if position != 0 {
+            text.push(',');
+        }
+        let file = ferrojt::jt::JtFile::open(path)
+            .map_err(|err| map_error(path, err))
+            .with_context(|| format!("reading {}", path.display()))?;
+        text.push_str(&ferrojt::jt::dump(&file, config, indent)?);
+    }
+    if multiple {
+        text.push_str("]\n");
+    }
+
+    match &args.output {
+        Some(path) => {
+            std::fs::write(path, &text).with_context(|| format!("writing {}", path.display()))?;
+        }
+        None => print!("{text}"),
+    }
     Ok(())
 }
 
@@ -345,5 +410,78 @@ mod tests {
             default_output(path, Some(TargetFormat::Usd)),
             PathBuf::from("gear.usda")
         );
+    }
+
+    fn parse_dump(args: &[&str]) -> DumpArgs {
+        match Cli::try_parse_from(args).expect("valid arguments").command {
+            Command::Dump(args) => args,
+            other => panic!("expected the dump subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dump_arguments_mirror_the_reference_tool() {
+        let args = parse_dump(&["ferrojt", "dump", "one.jt"]);
+        assert_eq!(args.files, [PathBuf::from("one.jt")]);
+        assert_eq!(args.output, None);
+
+        let args = parse_dump(&["ferrojt", "dump", "one.jt", "two.jt", "-o", "out.json"]);
+        assert_eq!(args.files.len(), 2);
+        assert_eq!(args.output, Some(PathBuf::from("out.json")));
+
+        let args = parse_dump(&["ferrojt", "dump", "one.jt", "--no-toc", "--no-indices"]);
+        assert!(args.no_toc);
+        assert!(args.no_indices);
+    }
+
+    /// Several files become one JSON array, which is what the reference tool
+    /// writes and what the tests compare against.
+    ///
+    /// Only samples that have a reference dump are used. `SampleJT_Server.jt`
+    /// has a `Shape_Vertex` child under an `Instance`, and the reference writer
+    /// has no branch for that node type: it emits the separator comma and then
+    /// nothing at all, which leaves a dangling comma in its own output. The
+    /// Rust writer reproduces that byte for byte, so the sample cannot be
+    /// parsed as JSON and is left to the byte-for-byte comparison in
+    /// `crates/ferrojt/tests/dump.rs`.
+    #[test]
+    fn dumping_several_files_produces_a_json_array() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("the workspace root")
+            .join("data")
+            .join("ExampleFiles");
+        let reference = root.parent().expect("data directory").join("Reference");
+        let has_reference = |path: &Path| {
+            let stem = path.file_stem().expect("stem").to_string_lossy();
+            reference.join(format!("{stem}.json")).is_file()
+        };
+        let mut files = std::fs::read_dir(&root)
+            .expect("sample directory")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jt") && has_reference(path))
+            .collect::<Vec<_>>();
+        files.sort();
+        files.truncate(2);
+        if files.len() < 2 {
+            return;
+        }
+
+        let directory = std::env::temp_dir().join("ferrojt-cli-dump-test");
+        std::fs::create_dir_all(&directory).expect("temporary directory");
+        let output = directory.join("array.json");
+        let args = DumpArgs {
+            files,
+            output: Some(output.clone()),
+            no_toc: false,
+            no_indices: false,
+        };
+        dump(&args).expect("dumping the samples");
+
+        let text = std::fs::read_to_string(&output).expect("dump output");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("the dump is JSON");
+        assert_eq!(value.as_array().map(Vec::len), Some(2));
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
