@@ -1,32 +1,41 @@
 # OpenJT reader contract
 
-> **Placeholder.** The format details and the reference implementation will be
-> supplied; this file records the contract the reader has to satisfy so the rest
-> of the workspace stays stable.
+> **Implemented.** The reader lives in `crates/ferrojt/src/jt` and covers the
+> versions found in `data/ExampleFiles` (JT 8.0, 8.1, 9.5 and 10.3). The
+> contract below is what it satisfies today; it is kept because the rest of the
+> workspace still depends on it.
 
 ## Entry points
 
-| Item | Current state | Required behaviour |
-| --- | --- | --- |
-| `jt::open(path) -> Result<Model>` | `Err(NotImplemented("reading JT files"))` | Parse the whole file into a populated `Model`. |
-| `jt::read_header(path) -> Result<JtHeader>` | `Err(NotImplemented("reading JT headers"))` | Parse only the header, cheaply, for `ferrojt info`. |
-| `JtHeader` | defined (`version`, `big_endian`, `magic`, `originator`, `file_size`, `unit`, `up_axis`) | Feed `Model::unit` / `Model::up_axis` and `Model::source`. |
+| Item | Behaviour |
+| --- | --- |
+| `jt::open(path) -> Result<Model>` | Parses the file and converts the JT native view into a populated `Model`. |
+| `jt::read_header(path) -> Result<FileHeader>` | Parses only the header banner (version, byte order, TOC offset, LSG GUID) for `ferrojt info`. |
+| `jt::JtFile::open(path)` | The JT native view: header, TOC table and the decoded logical scene graph. This is what `ferrojt dump` and `ferrojt.JtFile` use. |
+| `jt::dump(file, config, indent) -> Result<String>` | The JSON layout the JT tooling writes; see [dump.md](dump.md). |
 
-Planned submodules, named in `jt/mod.rs`:
+Submodules:
 
-* `jt::ios` — the segment/object instance table and its aliases.
-* `jt::lod` — LOD tiers, level 0 triangle data and the lower level tessellations.
-* `jt::shape` — B-rep / shape structure and the node hierarchy.
+* `jt::segment` — header banner, TOC table, segment framing and the
+  DEFLATE/XZ envelopes.
+* `jt::reader` — the endian aware cursor every element reader is built on.
+* `jt::object` — LSG node types, attributes and element objects (shape LODs,
+  proxy meta data, XT B-rep).
+* `jt::decode` — the compression codecs: Huffman, the range/CDP driver, the
+  vertex coders and the mesh coder.
+* `jt::model` — `JtFile` plus `SceneGraph`, the handle based JT scene.
+* `jt::guid` — the object identifier type and the well known type GUIDs.
 
-## What the reader must produce
+## What the reader produces
 
-1. `Model::source` set to the file name, `unit` and `up_axis` taken from the
-   header so exporters can rescale.
+1. `Model::source` set to the file name and `Model::extras` carrying the format,
+   the version and the segment count; `unit`/`up_axis` stay at their defaults
+   because the JT header does not store them.
 2. One `Node` per JT node instance, with `name`, `kind` (the JT node type as a
    string), a `Transform` in JT's right handed / CCW / `x y z w` convention, and
    `children` in file order.
 3. Geometry appended to `Model::accessors` as `BufferBlock` bytes plus one
-   `Attribute` per channel, named `POSITION`, `NORMAL`, `COLOR_n`, `TEXCOORD_n`.
+   `Attribute` per channel, named `POSITION` and `NORMAL`.
    `Primitive::attributes` holds the returned handles.
 4. `bounds` filled wherever the file provides them; otherwise left `None` so the
    exporter can compute them.
@@ -37,19 +46,20 @@ Planned submodules, named in `jt/mod.rs`:
 * No `unsafe` — `crates/ferrojt` is `#![forbid(unsafe_code)]`.
 * Use `codec::ByteOrder` explicitly; never assume host endianness.
 * Use `codec::BitReader` for the packed header fields (MSB first).
-* Use `codec::inflate` for DEFLATE compressed segments.
+* Use `codec::inflate` for DEFLATE compressed segments and `codec::decompress_xz`
+  for the XZ envelopes JT 10.x uses.
 * Every malformed byte sequence must return `Error::Invalid { offset, message }`
   with the offset of the offending field, never panic and never read past the
   buffer.
 * Truncated files must be detected before a slice is indexed.
+* A single damaged element must not lose the file: the reader logs a warning and
+  skips to the end of the element, the way the reference implementation does.
 
-## Tests expected with the reader
+## Tests
 
-* Header round trip for each JT version.
-* A single instance LOD0 triangle strip producing exact `POSITION` bytes and
-  correct `Aabb`.
-* A compressed segment inflating to the same bytes as the uncompressed one.
-* A truncated file returning `Error::Invalid`, asserted with `#[should_panic]`
-  free checks.
-* End to end: `ferrojt::open(sample.jt)` then `export::to_format(Format::Glb, ..)`
-  parses back with the `gltf` dev dependency.
+* `crates/ferrojt/tests/samples.rs` — every sample opens, the TOC count and the
+  LOD0 vertex/index counts are pinned, and the root is a `Partition`.
+* `crates/ferrojt/tests/dump.rs` — every sample with a reference dump under
+  `data/Reference` matches it semantically, and every dump is valid JSON.
+* Unit tests in `jt/decode` compare the codecs against the reference output byte
+  for byte.

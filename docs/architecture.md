@@ -3,16 +3,27 @@
 ```mermaid
 flowchart LR
   JT[OpenJT file] -->|jt::open| M[Model]
+  JT -->|jt::JtFile::open| JN[JT native view]
+  JN -->|jt::dump| JSON[JSON dump]
+  JN -->|to_model| M
   M -->|export::to_format| GLTF[glTF / GLB]
   M -->|export::to_format| USD[USD]
-  M -->|serde| JSON[JSON]
+  M -->|serde| JSON
   CLI[ferrojt CLI] --> M
+  CLI --> JN
   PY[python ferrojt] --> M
+  PY --> JN
 ```
 
 Everything flows through one neutral structure, [`Model`](../crates/ferrojt/src/model/scene.rs).
 Readers produce it, writers consume it, and the CLI and Python bindings are thin
 wrappers over `ferrojt::open` plus `ferrojt::export::*`.
+
+JT is read twice over. `jt::JtFile` keeps the format's own shape — header, TOC
+table and a handle based `SceneGraph` — because `ferrojt dump` and
+`ferrojt.JtFile` have to reproduce the JT tooling byte for byte, which the
+neutral model cannot. `JtFile::to_model()` then flattens that view into a
+`Model` for the exporters.
 
 ## The neutral model
 
@@ -44,7 +55,26 @@ Design rules:
   `Write`. JT stores metadata big endian and vertex data in either order, so the
   order is always an explicit argument.
 * `bits` — an MSB first `BitReader` for the packed JT header fields.
-* `compress` — zlib signature check, `inflate` and `deflate`.
+* `compress` — zlib and XZ signature checks plus `inflate`, `deflate` and
+  `decompress_xz`. JT 10.x concatenates several XZ streams per segment, so
+  `find_xz_streams` splits them before decoding.
+
+## The JT reader
+
+`jt/` is the format layer, and it is deliberately separate from `model/`:
+
+* `jt::segment` — header banner, TOC table, segment framing, compression
+  envelopes.
+* `jt::reader` — the endian aware cursor every element reader uses.
+* `jt::object` — LSG nodes, attributes and element objects.
+* `jt::decode` — Huffman, the range/CDP driver, the vertex coders and the mesh
+  coder, verified byte for byte against the reference output.
+* `jt::model` — `JtFile` and `SceneGraph`, plus `to_model()`.
+* `jt::dump` — the JSON layout the JT tooling writes, including the C `%g`
+  number formatting that `format_g` reproduces.
+
+See [jt-reader.md](jt-reader.md) and [usd-writer.md](usd-writer.md) for the two
+contracts that bound the workspace.
 
 ## Exporters
 

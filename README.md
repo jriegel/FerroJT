@@ -87,6 +87,10 @@ maturin develop            # into the active virtual environment
 pytest
 ```
 
+`maturin develop` installs into the environment that is currently active; if the
+virtual environment was created but not activated, point `VIRTUAL_ENV` at it
+first.
+
 ```python
 import ferrojt
 
@@ -125,6 +129,11 @@ Requires Python 3.10 or newer.
   `(buffer, offset, count, components, component_type)`. Readers never copy
   vertex data, and exporters widen what glTF cannot express (`f16`/`f64` → `f32`).
 * **`#![forbid(unsafe_code)]`** in the core library.
+
+The reasoning behind these choices is in [`docs/`](docs): the neutral model and
+the two-layer JT design in [architecture.md](docs/architecture.md), what the
+reader guarantees in [jt-reader.md](docs/jt-reader.md), and how the JSON dump
+reaches the reference output in [dump.md](docs/dump.md).
 
 ## License
 

@@ -6,14 +6,18 @@ does. They are not a specification of the JT format itself.
 | Note | Contents |
 | --- | --- |
 | [architecture.md](architecture.md) | How the crates, the neutral model and the readers/writers fit together. |
-| [jt-reader.md](jt-reader.md) | The contract the OpenJT reader has to satisfy. **Placeholder — to be filled in with the implementation to follow.** |
-| [usd-writer.md](usd-writer.md) | The model → USD mapping and the two candidate implementations. |
+| [jt-reader.md](jt-reader.md) | The contract the OpenJT reader satisfies: entry points, submodules, output rules and tests. |
+| [dump.md](dump.md) | The JT native JSON dump: config bits, `%g` formatting and how the reference dumps are compared. |
+| [usd-writer.md](usd-writer.md) | The model → USD mapping and the two candidate implementations. The USD writer itself is still a stub. |
 
-## Adding a reader
+## Reading another format
 
-1. Create `crates/ferrojt/src/jt/<segment>.rs` and parse into the neutral model.
-2. Fill `jt::open` so it returns a populated [`Model`](../crates/ferrojt/src/model/scene.rs).
-3. Set `Format::is_readable` accordingly and add a round trip test.
+1. Create `crates/ferrojt/src/<format>/` and parse into the neutral
+   [`Model`](../crates/ferrojt/src/model/scene.rs).
+2. Add a `Format` variant, teach `Format::detect`/`FromStr` its extensions, and
+   mark it in `Format::is_readable`.
+3. Add a sample under `data/ExampleFiles` and a test that pins its node and
+   triangle counts.
 
 Nothing in `export/`, `ferrojt-cli` or `ferrojt-python` needs to change.
 
