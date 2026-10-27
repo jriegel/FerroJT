@@ -270,6 +270,12 @@ impl JtFile {
     }
 
     /// Translate the file into the format agnostic [`Model`] used by exporters.
+    ///
+    /// A range LOD holds the same shape at several levels of detail. Only the
+    /// highest one is turned into a mesh, so an export does not repeat the
+    /// geometry of a part once per tier. Every node of the scene graph is
+    /// still translated, and [`Mesh::lod_level`] records which tier a mesh
+    /// came from.
     #[must_use]
     pub fn to_model(&self) -> Model {
         let mut model = Model::new();
@@ -285,7 +291,7 @@ impl JtFile {
         let Some(root) = graph.root else {
             return model;
         };
-        let index = build_node(graph, &mut model, root, &mut HashSet::new());
+        let index = build_node(graph, &mut model, root, &mut HashSet::new(), LodWalk::ROOT);
         model.default_scene_mut().roots = vec![index];
         model.bounds = model.nodes.get(index).and_then(|node| node.bounds);
         model
@@ -527,6 +533,7 @@ fn push_mesh(
     geometry: &LodGeometry,
     material: Option<usize>,
     name: Option<String>,
+    lod_level: Option<u32>,
 ) -> usize {
     let mut primitive = Primitive {
         topology: Topology::TriangleList,
@@ -593,7 +600,7 @@ fn push_mesh(
         name,
         primitives: vec![primitive],
         bounds: bounds_of_positions(&geometry.vertices),
-        lod_level: None,
+        lod_level,
         extras: None,
     })
 }
@@ -627,6 +634,7 @@ fn build_node(
     model: &mut Model,
     pos: usize,
     expanded: &mut HashSet<usize>,
+    lod: LodWalk,
 ) -> usize {
     let Some(node) = graph.nodes.get(pos).map(|stored| &stored.node) else {
         return model.push_node(model::Node::default());
@@ -644,14 +652,17 @@ fn build_node(
         ..model::Node::default()
     };
 
-    for load in node.late_loads() {
-        if let Some(geometry) = graph.geometry_for(load) {
-            let mesh = push_mesh(model, geometry, material, name.clone());
-            out.instances.push(model::Instance {
-                mesh,
-                material,
-                lod_bias: 1.0,
-            });
+    if lod.keeps_geometry() {
+        let level = lod.level();
+        for load in node.late_loads() {
+            if let Some(geometry) = graph.geometry_for(load) {
+                let mesh = push_mesh(model, geometry, material, name.clone(), level);
+                out.instances.push(model::Instance {
+                    mesh,
+                    material,
+                    lod_bias: 1.0,
+                });
+            }
         }
     }
 
@@ -661,14 +672,73 @@ fn build_node(
     }
 
     let mut children = Vec::new();
+    let mut walk = if matches!(node, Node::RangeLod(_)) {
+        LodWalk::FIRST
+    } else {
+        lod
+    };
     for child in graph.children_of(node).into_iter().flatten() {
-        children.push(build_node(graph, model, child, expanded));
+        children.push(build_node(graph, model, child, expanded, walk));
+        let class_name = graph
+            .nodes
+            .get(child)
+            .map_or("", |stored| stored.node.class_name());
+        walk.next_tier(class_name);
     }
     if let Some(target) = graph.instance_target(node) {
-        children.push(build_node(graph, model, target, expanded));
+        children.push(build_node(graph, model, target, expanded, walk));
     }
     model.nodes[index].children = children;
     index
+}
+
+/// Where a node sits in the level of detail stack of a range LOD.
+///
+/// JT does not store the tier of a representation: a range LOD simply lists
+/// its children from the finest to the coarsest one. The reference glTF
+/// writer numbers them while walking, starting at zero and moving on at every
+/// group of that subtree, and drops the shape of anything that is not tier
+/// zero. This mirrors that, so the same file exports the same mesh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LodWalk {
+    /// Set below a range LOD, where the tier of a branch matters.
+    inside: bool,
+    /// Tier of the branch currently being walked.
+    level: u32,
+}
+
+impl LodWalk {
+    /// Outside of any range LOD, where every representation is kept.
+    const ROOT: Self = Self {
+        inside: false,
+        level: 0,
+    };
+
+    /// The first child of a range LOD.
+    const FIRST: Self = Self {
+        inside: true,
+        level: 0,
+    };
+
+    /// `true` when the representations of this branch belong in the model.
+    #[must_use]
+    fn keeps_geometry(self) -> bool {
+        !self.inside || self.level == 0
+    }
+
+    /// The tier to record on a mesh, if a range LOD defines one.
+    #[must_use]
+    fn level(self) -> Option<u32> {
+        self.inside.then_some(self.level)
+    }
+
+    /// Move past a child of a range LOD. Only a group counts as a tier, and a
+    /// group nested in a group moves on too, as it does in the reference.
+    fn next_tier(&mut self, class_name: &str) {
+        if self.inside && class_name == "Group" {
+            self.level += 1;
+        }
+    }
 }
 
 /// The transform described by a node's geometric transform attribute.

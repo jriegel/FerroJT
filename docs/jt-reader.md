@@ -37,9 +37,16 @@ Submodules:
 3. Geometry appended to `Model::accessors` as `BufferBlock` bytes plus one
    `Attribute` per channel, named `POSITION` and `NORMAL`.
    `Primitive::attributes` holds the returned handles.
-4. `bounds` filled wherever the file provides them; otherwise left `None` so the
+4. Only the finest level of detail of a range LOD. A `RangeLOD` lists its
+   children from the finest tier down and JT does not store that tier, so it is
+   counted while walking: the first group below a `RangeLOD` is tier 0, the next
+   tier 1, and so on. A shape at any other tier contributes no mesh, which is
+   what the reference glTF writer does. The nodes themselves are all kept, so
+   the graph keeps its shape, and `Mesh::lod_level` records the tier a mesh came
+   from. `jt::dump` is not filtered — a dump still reports every tier.
+5. `bounds` filled wherever the file provides them; otherwise left `None` so the
    exporter can compute them.
-5. `Model::bounds` as the union of the root nodes.
+6. `Model::bounds` as the union of the root nodes.
 
 ## Constraints
 
@@ -58,7 +65,10 @@ Submodules:
 ## Tests
 
 * `crates/ferrojt/tests/samples.rs` — every sample opens, the TOC count and the
-  LOD0 vertex/index counts are pinned, and the root is a `Partition`.
+  vertex/index counts of every representation are pinned, and the root is a
+  `Partition`.
+* `crates/ferrojt/tests/model.rs` — a converted model holds one mesh per range
+  LOD, tagged `lod_level: Some(0)`, and keeps every node of the graph.
 * `crates/ferrojt/tests/dump.rs` — every sample with a reference dump under
   `data/Reference` matches it semantically, and every dump is valid JSON.
 * Unit tests in `jt/decode` compare the codecs against the reference output byte

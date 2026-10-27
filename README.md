@@ -128,6 +128,10 @@ Requires Python 3.10 or newer.
   byte buffers; an [`Attribute`](crates/ferrojt/src/model/geometry.rs) is
   `(buffer, offset, count, components, component_type)`. Readers never copy
   vertex data, and exporters widen what glTF cannot express (`f16`/`f64` → `f32`).
+* **One mesh per part.** A range LOD stores the same shape at several levels of
+  detail; `to_model()` keeps only the finest one and tags it with
+  `Mesh::lod_level`, so a glTF or USD export does not repeat a part once per
+  tier. A JT dump still reports every tier.
 * **`#![forbid(unsafe_code)]`** in the core library.
 
 The reasoning behind these choices is in [`docs/`](docs): the neutral model and

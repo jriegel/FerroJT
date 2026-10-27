@@ -258,6 +258,8 @@ impl JtFile {
 
     /// The scene as a [`Model`], which is what the exporters consume.
     ///
+    /// Only the finest level of detail of a range LOD is turned into a mesh.
+    ///
     /// Raises `RuntimeError` while the file is closed.
     fn model(&self) -> PyResult<Model> {
         let Some(file) = self.inner.as_ref() else {

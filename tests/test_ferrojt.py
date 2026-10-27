@@ -85,8 +85,10 @@ def test_open_rejects_a_file_that_is_not_jt(tmp_path) -> None:
 def test_model_repr_and_counts() -> None:
     model = ferrojt.open(str(BLOCK_95))
     assert model.node_count > 0
-    assert model.mesh_count == 3
-    assert model.triangle_count == 36
+    # The file holds three identical levels of detail of one cube; an export
+    # carries only the finest one.
+    assert model.mesh_count == 1
+    assert model.triangle_count == 12
     assert model.vertex_count > 0
     assert repr(model).startswith("Model(nodes=")
     assert any("block" in name for name in model.node_names())
@@ -206,7 +208,7 @@ def test_jt_file_model_is_exportable(tmp_path) -> None:
     assert jt.open()
 
     model = jt.model()
-    assert model.triangle_count == 36
+    assert model.triangle_count == 12
     data = model.to_bytes("glb")
     assert data[:4] == b"glTF"
     assert json.loads(model.to_json())["nodes"] == model.node_count

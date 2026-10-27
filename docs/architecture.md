@@ -23,7 +23,9 @@ JT is read twice over. `jt::JtFile` keeps the format's own shape — header, TOC
 table and a handle based `SceneGraph` — because `ferrojt dump` and
 `ferrojt.JtFile` have to reproduce the JT tooling byte for byte, which the
 neutral model cannot. `JtFile::to_model()` then flattens that view into a
-`Model` for the exporters.
+`Model` for the exporters, and in doing so keeps only the finest level of
+detail of every range LOD: a glTF or USD file gets one mesh per part rather
+than one per tier. See [jt-reader.md](jt-reader.md).
 
 ## The neutral model
 
