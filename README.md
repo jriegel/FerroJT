@@ -51,6 +51,7 @@ data/
   Reference/               reference JSON dumps used as the oracle
 docs/                      design notes
 build-wheel.bat            builds the PyPI wheels (Windows + Linux + sdist)
+AGENTS.md                  conventions and pitfalls for automated contributors
 ```
 
 ## Building

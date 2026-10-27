@@ -10,6 +10,10 @@ does. They are not a specification of the JT format itself.
 | [dump.md](dump.md) | The JT native JSON dump: config bits, `%g` formatting and how the reference dumps are compared. |
 | [usd-writer.md](usd-writer.md) | The model → USD mapping and the two candidate implementations. The USD writer itself is still a stub. |
 
+[../AGENTS.md](../AGENTS.md) holds the short version of the same rules — build
+commands, the parity constraints and the known pitfalls — for automated
+contributors.
+
 ## Reading another format
 
 1. Create `crates/ferrojt/src/<format>/` and parse into the neutral
