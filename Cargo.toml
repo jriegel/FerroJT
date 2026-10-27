@@ -9,7 +9,7 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Read OpenJT (JT) files and convert them to glTF / USD."
 repository = "https://github.com/jriegel/FerroJT"
-authors = ["Joerg Riegel"]
+authors = ["Juergen Riegel"]
 keywords = ["jt", "openjt", "cad", "gltf", "usd"]
 categories = ["parser-implementations", "graphics", "data-structures"]
 

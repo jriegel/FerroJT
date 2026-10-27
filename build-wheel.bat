@@ -72,6 +72,7 @@ if "%WHAT%"=="sdist" goto :sdist
 echo.
 echo == Windows wheel ==========================================================
 "%PY%" -m maturin build --release --locked --strip -i "%PY%" -o "%OUT%" || exit /b 1
+if "%WHAT%"=="windows" goto :summary
 
 :linux
 if "%WHAT%"=="sdist" goto :sdist
@@ -94,6 +95,7 @@ echo == Source distribution ====================================================
 rem --------------------------------------------------------------------------
 rem 3. Summary
 rem --------------------------------------------------------------------------
+:summary
 echo.
 echo == dist\ ==================================================================
 dir /b "%OUT%"
