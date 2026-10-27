@@ -46,6 +46,13 @@ without it):
 .\.venv\Scripts\python.exe tests\test_visual.py           # compare, diff -> tests/_visual_out/
 ```
 
+Interactive viewer (also needs `open3d`; it is a tool, not a test — nothing in it
+is named `test_*`, so pytest still collects 41 tests):
+
+```powershell
+.\.venv\Scripts\python.exe tests\test_viewer.py data\ExampleFiles\example_block_jt9.5.jt
+```
+
 Wheels for PyPI: `build-wheel.bat [windows|linux|sdist]` (default all) → `dist/`.
 Upload with `python -m twine upload dist\*`.
 
@@ -143,6 +150,31 @@ Upload with `python -m twine upload dist\*`.
   `tests/_visual_out/`.
 - Cosmetic, ignorable: the MSVC linker note (`Bibliothek "..._ferrojt.dll.lib" …`)
   surfaces as `warning: linker stdout` for `ferrojt-python`.
+- **Open3D GUI (`tests/test_viewer.py`)**: there is no `gui.O3DVisualizer` — build a
+  plain `gui.Window` + `gui.SceneWidget`. `SceneWidget::Mouse` **always** runs the
+  built-in interactor and always returns CONSUMED, so a Python handler cannot
+  suppress it: pick the inert `Controls.ROTATE_IBL` (it only rotates an unused IBL,
+  but flashes the skybox — `scene.show_skybox(False)`, and these three
+  `show_*` are **methods**, not properties). `DRAG` events only arrive while the
+  `BUTTON_DOWN` returned CONSUMED (mouse grabber). `Window.set_on_key` returning
+  True blocks the focused `SceneWidget`; ESC closes before any callback. Ticks run
+  at ~100 Hz unless a redraw is forced — `set_on_tick_event` returning True gives a
+  real FPS number. With ≥2 children frames are not auto-assigned: register
+  `set_on_layout` **before** `add_child` and place both from `content_rect`
+  (menubar costs 28 px). `gui.MouseEvent`/`KeyEvent` have **no Python constructor**
+  but every property has a setter — drive the callbacks with duck-typed fakes in
+  probes. Drag and drop does not work out of the box (GLFW forwards drops to an
+  empty unbound `Window::OnDragDropped`), so the viewer hooks `WM_DROPFILES`
+  itself: find the window by class `GLFW30` + pid via `EnumWindows` (the callback
+  receives the HWND as a **plain int**, `.value` raises), then
+  `comctl32.SetWindowSubclass` — `SetWindowLongPtrW(GWLP_WNDPROC)` is silently
+  never called on a GLFW window. Pass other messages to `DefSubclassProc`, keep
+  every ctypes callback object alive (GC → 0xC0000005), `wintypes` has no `HDROP`
+  (use `c_void_p`), `GetLastError`/`DragFinish` live in kernel32/shell32.
+  Synthetic `PostMessageW` **key** messages reach `set_on_key`, synthetic **mouse**
+  messages never reach open3d (raw input); `SendMessageW` from a tick callback
+  crashes. Exiting aborts in `~VulkanFboCache:72` (exit `0xC0000409`) — that is
+  isl-org/Open3D#7593, expected, `main()` still returns 0.
 
 ## Language / platform gotchas hit before
 

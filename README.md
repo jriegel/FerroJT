@@ -26,6 +26,7 @@ FerroJT is a Rust workspace with three parts:
 | CLI | done |
 | Python bindings | done (packaged with `maturin`) |
 | Visual regression (rendered export vs. reference picture) | done (`tests/test_visual.py`, Open3D) |
+| Interactive viewer (drag and drop, fly camera) | done (`tests/test_viewer.py`, Open3D) |
 
 The reader covers the versions found in `data/ExampleFiles`: JT 8.0, 8.1, 9.5
 and 10.3. Every sample with a reference dump under `data/Reference` is compared
@@ -49,7 +50,8 @@ crates/
   ferrojt-python/          pyo3 extension module `_ferrojt`
 python/ferrojt/            pure python package that re-exports _ferrojt
 tests/                     pytest suite for the python package (incl. the visual
-                           regression test and its diff pictures)
+                           regression test and its diff pictures) plus the
+                           interactive viewer
 data/
   ExampleFiles/            sample JT files
   Reference/               reference JSON dumps and reference pictures (the oracle)
@@ -161,6 +163,32 @@ passes when at least `0.995` of the possible colour difference is left unused
 (`FERROJT_VISUAL_THRESHOLD`), and a pixel counts as changed when it moves by more
 than `8` (`FERROJT_VISUAL_EPS`). A failure writes a three panel picture — render,
 reference, amplified difference — to `tests/_visual_out/`.
+
+### Interactive viewer
+
+`tests/test_viewer.py` opens an Open3D window and shows a JT file, so the export can
+be looked at rather than only counted:
+
+```sh
+python tests/test_viewer.py                       # empty, load through File ▸ Open
+python tests/test_viewer.py data/ExampleFiles/example_block_jt9.5.jt
+```
+
+| Input | Action |
+| --- | --- |
+| drag a `.jt` file onto the window, or `File ▸ Open` | load it |
+| left drag | orbit around the model |
+| right drag | look around from the camera |
+| middle drag | pan |
+| wheel | dolly in and out |
+| `w` `a` `s` `d` | fly forward, right, back, left |
+| `q` `z` | fly up / down |
+| `ESC` | close (same as `File ▸ Exit`) |
+
+The frame rate is shown in the top left corner. The file goes through the same
+glTF export as `ferrojt convert` — written to a temporary `.glb` and read back —
+so the viewer shows exactly what the writer produces, materials included. It needs
+the same extra as the visual regression test, `pip install -e ".[test,visual]"`.
 
 ### Wheels
 

@@ -117,3 +117,8 @@ change.
   rendered offscreen and compared with a reference picture in `data/Reference`,
   so a regression in the geometry shows as a picture rather than only as a count.
   See [../README.md](../README.md), "Visual regression".
+* `tests/test_viewer.py` is not a test but a tool: an Open3D window that loads a
+  JT file through drag and drop or `File ▸ Open` and shows it with a fly camera.
+  It goes through the same glTF export, so it is the quickest way to see what a
+  change to the writer did to the picture. See [../README.md](../README.md),
+  "Interactive viewer".
