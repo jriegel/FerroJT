@@ -112,3 +112,8 @@ change.
   for byte.
 * Unit tests in `jt/model` build a synthetic scene graph, because no sample has
   a part on a layer its filter rejects.
+* `tests/test_ferrojt.py` — the same reference dumps through the python bindings.
+* `tests/test_visual.py` — the export of the three `example_block` versions is
+  rendered offscreen and compared with a reference picture in `data/Reference`,
+  so a regression in the geometry shows as a picture rather than only as a count.
+  See [../README.md](../README.md), "Visual regression".

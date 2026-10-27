@@ -13,7 +13,7 @@ detail lives in `docs/`.
 | `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `pyproject.toml` + `python/ferrojt/` + `tests/`. |
 | `python/ferrojt/` | Pure-Python package re-exporting `_ferrojt` (`__init__.py`, `_ferrojt.pyi`, `py.typed`). |
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
-| `data/Reference/` | Reference JSON dumps from the JT tooling — **the oracle**. |
+| `data/Reference/` | Reference JSON dumps from the JT tooling **and** reference PNG pictures — **the oracle**. |
 | `example/` | GPL-2.0 C++ sources (TKJT, ToolsLib, JtDump, PyOpenJt). Behavioural reference only, never linked or copied; gitignored. |
 | `docs/` | `README.md` index, `architecture.md`, `jt-reader.md`, `dump.md`, `usd-writer.md`. |
 
@@ -36,6 +36,14 @@ Python (`.venv` at the repo root, gitignored):
 $env:VIRTUAL_ENV = "$PWD\.venv"
 .\.venv\Scripts\python.exe -m maturin develop
 .\.venv\Scripts\python.exe -m pytest
+```
+
+Visual regression (needs `open3d`, `pip install -e ".[test,visual]"`; the tests skip
+without it):
+
+```powershell
+.\.venv\Scripts\python.exe tests\test_visual.py --write   # recreate data/Reference/*.png
+.\.venv\Scripts\python.exe tests\test_visual.py           # compare, diff -> tests/_visual_out/
 ```
 
 Wheels for PyPI: `build-wheel.bat [windows|linux|sdist]` (default all) → `dist/`.
@@ -121,6 +129,18 @@ Upload with `python -m twine upload dist\*`.
   deprecated → use twine.
 - The sdist file list comes from `cargo package --list`, so anything gitignored
   (including `data/`) is absent unless added via `[tool.maturin] include`.
+- **Open3D 0.20 (`tests/test_visual.py`)**: the **first** `render_to_image()` of a
+  freshly created `OffscreenRenderer` returns a black frame — render one frame and
+  discard it. Creating a **second** renderer in one process aborts the Vulkan engine
+  (`Precondition in destroy:1416 … MaterialInstance "unlitBackground" … still in
+  use`), so the module keeps one process-wide renderer and calls
+  `scene.clear_geometry()` between samples. Without `scene.set_background()` **and**
+  `scene.set_lighting()` the picture is all zeros. API names:
+  `MaterialRecord.base_color` (not `.color`), `scene.add_geometry(name, mesh,
+  material)` (not `.add`), `TriangleMesh` has no `.materials`. Comparison is
+  `1 - mean|Δ|/255` with `FERROJT_VISUAL_THRESHOLD` (0.995) / `FERROJT_VISUAL_EPS`
+  (8); references are `data/Reference/<stem>.png`, diffs go to the gitignored
+  `tests/_visual_out/`.
 - Cosmetic, ignorable: the MSVC linker note (`Bibliothek "..._ferrojt.dll.lib" …`)
   surfaces as `warning: linker stdout` for `ferrojt-python`.
 
@@ -133,7 +153,8 @@ Upload with `python -m twine upload dist\*`.
 ## Toolchain baseline
 
 rustc/cargo 1.97.1, host `x86_64-pc-windows-msvc`, VS 2022 MSVC, Python 3.13.7,
-maturin 1.15.0, ziglang 0.16.0 (pip), git 2.50.1. Pinned deps in the root
+maturin 1.15.0, ziglang 0.16.0 (pip), open3d 0.20.0 (pip, newest for 3.13),
+git 2.50.1. Pinned deps in the root
 `Cargo.toml`: thiserror 2.0, serde 1.0, serde_json 1.0, flate2 1.1, half 2.7,
 bytemuck 1.25, tracing 0.1, rayon 1.12, gltf-json 1.4, gltf 1.4 (dev), base64 0.22,
 lzma-rs 0.3, clap 4.6, anyhow 1.0, tracing-subscriber 0.3, indicatif 0.18,

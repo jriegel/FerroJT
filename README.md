@@ -25,10 +25,13 @@ FerroJT is a Rust workspace with three parts:
 | USD writer | stub — returns `NotImplemented` |
 | CLI | done |
 | Python bindings | done (packaged with `maturin`) |
+| Visual regression (rendered export vs. reference picture) | done (`tests/test_visual.py`, Open3D) |
 
 The reader covers the versions found in `data/ExampleFiles`: JT 8.0, 8.1, 9.5
 and 10.3. Every sample with a reference dump under `data/Reference` is compared
-semantically in `crates/ferrojt/tests/dump.rs` and in `tests/test_ferrojt.py`.
+semantically in `crates/ferrojt/tests/dump.rs` and in `tests/test_ferrojt.py`, and
+the three versions of `example_block` are additionally compared as a rendered
+picture in `tests/test_visual.py`.
 
 ## Layout
 
@@ -45,10 +48,11 @@ crates/
   ferrojt-cli/             `ferrojt` binary
   ferrojt-python/          pyo3 extension module `_ferrojt`
 python/ferrojt/            pure python package that re-exports _ferrojt
-tests/                     pytest suite for the python package
+tests/                     pytest suite for the python package (incl. the visual
+                           regression test and its diff pictures)
 data/
   ExampleFiles/            sample JT files
-  Reference/               reference JSON dumps used as the oracle
+  Reference/               reference JSON dumps and reference pictures (the oracle)
 docs/                      design notes
 build-wheel.bat            builds the PyPI wheels (Windows + Linux + sdist)
 AGENTS.md                  conventions and pitfalls for automated contributors
@@ -99,6 +103,9 @@ pytest
 virtual environment was created but not activated, point `VIRTUAL_ENV` at it
 first.
 
+The visual regression tests need an extra: `pip install -e ".[test,visual]"` adds
+`open3d` and `numpy`. Without them those tests skip instead of failing.
+
 ```python
 import ferrojt
 
@@ -131,6 +138,29 @@ The keywords work on `ferrojt.open`, `ferrojt.read`, `JtFile.model`,
 `ValueError`.
 
 Requires Python 3.10 or newer.
+
+### Visual regression
+
+`tests/test_visual.py` renders the glTF export of a sample and compares the picture
+with a reference PNG next to the reference dumps, named after the sample:
+`data/Reference/example_block_jt9.5.png`. It is the same workflow as the JSON oracle
+— the reference is committed, a mismatch is a test failure.
+
+```sh
+python tests/test_visual.py --write           # (re)create the references
+python tests/test_visual.py                   # compare, write diff pictures
+python tests/test_visual.py --threshold 0.99  # loosen the match
+```
+
+The picture is deterministic: a fixed 640x480 frame, the classic isometric view
+direction `[1, 1, 1]`, a fit-all camera derived from the bounding sphere, one flat
+grey material and a shadowless headlight, so the render reports the geometry and not
+how a loader happens to read a glTF material. A GPU shader is not bit exact across
+drivers, so the comparison is a similarity score rather than equality: the render
+passes when at least `0.995` of the possible colour difference is left unused
+(`FERROJT_VISUAL_THRESHOLD`), and a pixel counts as changed when it moves by more
+than `8` (`FERROJT_VISUAL_EPS`). A failure writes a three panel picture — render,
+reference, amplified difference — to `tests/_visual_out/`.
 
 ### Wheels
 

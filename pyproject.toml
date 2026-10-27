@@ -21,6 +21,8 @@ classifiers = [
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+# Rendering the export for the visual regression tests (tests/test_visual.py).
+visual = ["open3d>=0.20", "numpy>=1.26"]
 
 [project.urls]
 Homepage = "https://github.com/jriegel/FerroJT"
