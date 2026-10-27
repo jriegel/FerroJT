@@ -50,6 +50,7 @@ data/
   ExampleFiles/            sample JT files
   Reference/               reference JSON dumps used as the oracle
 docs/                      design notes
+build-wheel.bat            builds the PyPI wheels (Windows + Linux + sdist)
 ```
 
 ## Building
@@ -116,6 +117,39 @@ print(ferrojt.dump("gear.jt"))     # one line shortcut for the same dump
 ```
 
 Requires Python 3.10 or newer.
+
+### Wheels
+
+`pyo3` is built with the `abi3-py310` feature, so the extension uses the stable
+ABI: **one wheel per platform covers every CPython from 3.10 upwards**, there is
+no wheel per Python version. `build-wheel.bat` builds them all into `dist/`:
+
+```bat
+build-wheel.bat            windows wheel + linux wheel + sdist
+build-wheel.bat windows    host wheel only
+build-wheel.bat linux      cross compiled linux wheel only
+build-wheel.bat sdist      source distribution only
+```
+
+It produces
+
+```text
+ferrojt-0.1.0-cp310-abi3-win_amd64.whl                                    Windows
+ferrojt-0.1.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl   Linux, glibc >= 2.17
+ferrojt-0.1.0.tar.gz                                                      source distribution
+```
+
+Upload the whole set together with `python -m twine upload dist\*` — PyPI serves
+the file matching the installer, and the sdist covers anything else. A single
+universal wheel is not possible for a native extension: the platform tag is part
+of the file name.
+
+The Linux wheel is cross compiled on Windows with `zig` as the linker, so no
+Docker is needed. The script installs both prerequisites itself: `zig` comes from
+the `maturin[zig]` extra and the `x86_64-unknown-linux-gnu` standard library from
+`rustup target add`. macOS and the ARM wheels cannot be produced on a Windows
+host; `maturin generate-ci github > .github\workflows\CI.yml` generates the full
+matrix instead.
 
 ## Design notes
 

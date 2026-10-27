@@ -9,7 +9,7 @@ description = "Read OpenJT (JT) files and convert them to glTF / USD."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT OR Apache-2.0"
-authors = [{ name = "Joerg Riegel" }]
+authors = [{ name = "Juergen Riegel" }]
 keywords = ["jt", "openjt", "cad", "gltf", "glb", "usd", "converter"]
 classifiers = [
   "Development Status :: 3 - Alpha",
