@@ -58,6 +58,16 @@ that for all three config combinations.
 Reference files also carry a UTF-8 BOM; strip it (Rust `\u{feff}`, Python
 `encoding="utf-8-sig"`) before parsing.
 
+## Layer information
+
+A `MetaData` node reports its `LAYERFILTERnnn::` streams as a `"layer-filter"`
+array of `{ "name", "layer": [...] }` objects plus `"active-layer-filter"`, and a
+`Part` with a `LAYER::` tag reports it as `"layer": [...]`. `scan_for_layer` and
+`scan_for_layer_filter` parse those streams, and `jt::model` reads the very same
+ones to decide what an export keeps — but a dump is never filtered: it reports
+every filter, every tag and every part, whatever the export does with them. See
+[jt-reader.md](jt-reader.md).
+
 ## Comparison rules
 
 `crates/ferrojt/tests/dump.rs` and `tests/test_ferrojt.py` both compare

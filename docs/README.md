@@ -6,7 +6,7 @@ does. They are not a specification of the JT format itself.
 | Note | Contents |
 | --- | --- |
 | [architecture.md](architecture.md) | How the crates, the neutral model and the readers/writers fit together. |
-| [jt-reader.md](jt-reader.md) | The contract the OpenJT reader satisfies: entry points, submodules, output rules and tests. |
+| [jt-reader.md](jt-reader.md) | The contract the OpenJT reader satisfies: entry points, submodules, output rules, layer filters and tests. |
 | [dump.md](dump.md) | The JT native JSON dump: config bits, `%g` formatting and how the reference dumps are compared. |
 | [usd-writer.md](usd-writer.md) | The model → USD mapping and the two candidate implementations. The USD writer itself is still a stub. |
 

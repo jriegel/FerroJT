@@ -96,6 +96,15 @@ pub struct ConvertArgs {
     #[arg(short, long, value_enum)]
     pub format: Option<TargetFormat>,
 
+    /// Named layer filter to apply. Defaults to the filter the file declares
+    /// as active, or to its first filter when the file leaves that unset.
+    #[arg(long, value_name = "NAME", conflicts_with = "no_layer_filter")]
+    pub layer_filter: Option<String>,
+
+    /// Export every part and ignore the layer filters of the file.
+    #[arg(long)]
+    pub no_layer_filter: bool,
+
     /// Replace the output file if it exists.
     #[arg(short = 'y', long)]
     pub force: bool,
@@ -236,7 +245,14 @@ pub fn dump(args: &DumpArgs) -> Result<()> {
 }
 
 pub fn convert(args: &ConvertArgs) -> Result<()> {
-    let model = load(&args.input)?;
+    let file = jt_file(&args.input)?;
+    let model = if args.no_layer_filter {
+        file.to_model_unfiltered()
+    } else if let Some(name) = args.layer_filter.as_deref() {
+        file.to_model_with_filter(name)?
+    } else {
+        file.to_model()
+    };
 
     let output = args
         .output
@@ -312,6 +328,13 @@ fn print_node(model: &Model, index: usize, depth: usize, bar: &ProgressBar) {
 
 fn load(path: &Path) -> Result<Model> {
     ferrojt::open(path)
+        .map_err(|err| map_error(path, err))
+        .with_context(|| format!("loading {}", path.display()))
+}
+
+/// Read a JT file without turning it into a model yet.
+fn jt_file(path: &Path) -> Result<ferrojt::jt::JtFile> {
+    ferrojt::jt::JtFile::open(path)
         .map_err(|err| map_error(path, err))
         .with_context(|| format!("loading {}", path.display()))
 }
@@ -432,6 +455,46 @@ mod tests {
         let args = parse_dump(&["ferrojt", "dump", "one.jt", "--no-toc", "--no-indices"]);
         assert!(args.no_toc);
         assert!(args.no_indices);
+    }
+
+    fn parse_convert(args: &[&str]) -> ConvertArgs {
+        match Cli::try_parse_from(args).expect("valid arguments").command {
+            Command::Convert(args) => args,
+            other => panic!("expected the convert subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_arguments_carry_the_layer_filter() {
+        let args = parse_convert(&["ferrojt", "convert", "gear.jt"]);
+        assert_eq!(args.layer_filter, None);
+        assert!(!args.no_layer_filter);
+
+        let args = parse_convert(&["ferrojt", "convert", "gear.jt", "--layer-filter", "LAYCUR"]);
+        assert_eq!(args.layer_filter.as_deref(), Some("LAYCUR"));
+        assert!(!args.no_layer_filter);
+
+        let args = parse_convert(&["ferrojt", "convert", "gear.jt", "--no-layer-filter"]);
+        assert_eq!(args.layer_filter, None);
+        assert!(args.no_layer_filter);
+    }
+
+    #[test]
+    fn a_named_filter_and_no_filter_cannot_be_combined() {
+        let error = Cli::try_parse_from([
+            "ferrojt",
+            "convert",
+            "gear.jt",
+            "--layer-filter",
+            "ALL",
+            "--no-layer-filter",
+        ])
+        .expect_err("the two filters conflict");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{error}"
+        );
     }
 
     /// Several files become one JSON array, which is what the reference tool

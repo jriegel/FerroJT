@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::jt::dump::{LayerInfo, handle_late_loads_meta, scan_for_layer, scan_for_layer_filter};
 use crate::jt::guid::Guid;
 use crate::jt::object::{
     Attribute, Class, Element, LateLoad, LodGeometry, Material, Node, Property, class_of,
@@ -74,6 +75,41 @@ pub struct LoadedElement {
     pub segment_type: i32,
     /// The element.
     pub element: Element,
+}
+
+/// The layer filter an export applies to the parts of a scene graph.
+///
+/// A JT file declares its named filters in the key/value stream of a meta data
+/// node and tags each part with the layers it belongs to. The filter decides
+/// which of those parts are drawn; it never removes a node from the scene
+/// graph, only the geometry of the part it rejects.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LayerFilter {
+    /// Name of the filter, `None` when the file declares none.
+    pub name: Option<String>,
+    /// Layer numbers the filter selects.
+    pub layers: Vec<u32>,
+}
+
+impl LayerFilter {
+    /// `true` when the filter selects layers, i.e. when parts have to be
+    /// checked against it at all.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !self.layers.is_empty()
+    }
+
+    /// Does a part tagged with `layers` survive this filter?
+    ///
+    /// A part that carries no layer tag at all is not affected by a filter and
+    /// is kept, which is what the classic JT viewer does for an untagged part.
+    #[must_use]
+    pub fn keeps(&self, layers: &[u32]) -> bool {
+        if !self.is_active() || layers.is_empty() {
+            return true;
+        }
+        layers.iter().any(|layer| self.layers.contains(layer))
+    }
 }
 
 /// The logical scene graph of one JT file.
@@ -193,6 +229,42 @@ impl SceneGraph {
         self.loaded_element(load)?.geometry()
     }
 
+    /// The named layer filters declared by the meta data nodes of the graph.
+    ///
+    /// A file can spread its meta data over several nodes; the first one that
+    /// declares filters wins, in file order, which is what the classic JT
+    /// viewer stores and puts in its filter box.
+    #[must_use]
+    pub fn layer_info(&self) -> Option<LayerInfo> {
+        for stored in &self.nodes {
+            if !matches!(stored.node, Node::MetaData(_)) {
+                continue;
+            }
+            let stream = handle_late_loads_meta(self, stored.node.late_loads());
+            if stream.is_empty() {
+                continue;
+            }
+            let info = scan_for_layer_filter(&stream);
+            if !info.filters.is_empty() {
+                return Some(info);
+            }
+        }
+        None
+    }
+
+    /// The layer numbers a part node is tagged with.
+    ///
+    /// A part that has no key/value stream, or one without a `LAYER::` key, is
+    /// not tagged and answers with an empty vector.
+    #[must_use]
+    pub fn layers_of(&self, node: &Node) -> Vec<u32> {
+        let stream = handle_late_loads_meta(self, node.late_loads());
+        if stream.is_empty() {
+            return Vec::new();
+        }
+        scan_for_layer(&stream)
+    }
+
     fn bind_name(&mut self, id: i32, name: &str) {
         let Some(pos) = self.node_pos(id) else {
             return;
@@ -276,22 +348,126 @@ impl JtFile {
     /// geometry of a part once per tier. Every node of the scene graph is
     /// still translated, and [`Mesh::lod_level`] records which tier a mesh
     /// came from.
+    ///
+    /// When the file declares layer filters, the default one also decides
+    /// which parts contribute geometry; see [`JtFile::layer_filter`].
     #[must_use]
     pub fn to_model(&self) -> Model {
+        self.build_model(self.layer_filter(None).ok().flatten().as_ref())
+    }
+
+    /// Translate the file into a [`Model`] that contains every part.
+    ///
+    /// The layer filters of the file are ignored, which is what the JSON dump
+    /// shows and what `ferrojt convert --no-layer-filter` writes.
+    #[must_use]
+    pub fn to_model_unfiltered(&self) -> Model {
+        self.build_model(None)
+    }
+
+    /// Translate the file into a [`Model`] with one named layer filter.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] is returned when `name` is not a filter of this
+    /// file, and the message lists the filters that are available.
+    pub fn to_model_with_filter(&self, name: &str) -> Result<Model> {
+        let filter = self.layer_filter(Some(name))?;
+        Ok(self.build_model(filter.as_ref()))
+    }
+
+    /// The filter an export uses, `None` when the file has no layer
+    /// information at all.
+    ///
+    /// `name` selects one of the filters the file declares. `None` asks for
+    /// the default one: the filter named by `ACTIVELAYERFILTER::`, or, when
+    /// the file leaves that empty as most writers do, the first filter in
+    /// sorted order — the selection the classic JT viewer makes.
+    ///
+    /// # Errors
+    ///
+    /// See [`JtFile::to_model_with_filter`].
+    pub fn layer_filter(&self, name: Option<&str>) -> Result<Option<LayerFilter>> {
+        let Some(graph) = self.lsg.as_ref() else {
+            return Ok(None);
+        };
+        let Some(info) = graph.layer_info() else {
+            if name.is_some() {
+                return Err(Error::invalid(0, "this file declares no layer filters"));
+            }
+            return Ok(None);
+        };
+        let chosen = match name {
+            Some(name) => {
+                let layers = info.filters.get(name).ok_or_else(|| {
+                    let available = info
+                        .filters
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Error::invalid(0, format!("there is no layer filter {name:?}; {available}"))
+                })?;
+                Some(LayerFilter {
+                    name: Some(name.to_owned()),
+                    layers: layers.clone(),
+                })
+            }
+            None => {
+                // An empty `ACTIVELAYERFILTER::` is the common case: the writer
+                // knows the filters but has not picked one, so the first of the
+                // sorted names is used, exactly as the viewer's filter box does.
+                let active = if info.active.is_empty() {
+                    info.filters.keys().next()
+                } else {
+                    info.filters
+                        .get_key_value(&info.active)
+                        .map(|(name, _)| name)
+                };
+                let Some(active) = active else {
+                    return Ok(None);
+                };
+                Some(LayerFilter {
+                    name: Some(active.clone()),
+                    layers: info.filters.get(active).cloned().unwrap_or_default(),
+                })
+            }
+        };
+        Ok(chosen)
+    }
+
+    /// Walk the scene graph into a [`Model`], drawing only the parts the given
+    /// filter accepts.
+    #[must_use]
+    fn build_model(&self, filter: Option<&LayerFilter>) -> Model {
         let mut model = Model::new();
         model.source = Some(self.path.display().to_string());
-        model.extras = Some(json!({
+        let mut extras = json!({
             "format": "JT",
             "version": self.header.version_text(),
             "segments": self.toc.len(),
-        }));
+        });
+        if let Some(filter) = filter {
+            extras["layer_filter"] = json!({
+                "name": filter.name,
+                "layers": filter.layers,
+            });
+        }
+        model.extras = Some(extras);
         let Some(graph) = &self.lsg else {
             return model;
         };
         let Some(root) = graph.root else {
             return model;
         };
-        let index = build_node(graph, &mut model, root, &mut HashSet::new(), LodWalk::ROOT);
+        let index = build_node(
+            graph,
+            &mut model,
+            root,
+            &mut HashSet::new(),
+            LodWalk::ROOT,
+            filter,
+        );
         model.default_scene_mut().roots = vec![index];
         model.bounds = model.nodes.get(index).and_then(|node| node.bounds);
         model
@@ -629,12 +805,17 @@ fn bounds_of_positions(values: &[f32]) -> Option<Aabb> {
 }
 
 /// Recursively translate one graph node into a [`model::Node`].
+///
+/// A part whose layers are rejected by `filter` keeps its node — the graph
+/// keeps its shape — but neither its attributes, its geometry nor its children
+/// are translated, which is what the reference glTF writer skips as well.
 fn build_node(
     graph: &SceneGraph,
     model: &mut Model,
     pos: usize,
     expanded: &mut HashSet<usize>,
     lod: LodWalk,
+    filter: Option<&LayerFilter>,
 ) -> usize {
     let Some(node) = graph.nodes.get(pos).map(|stored| &stored.node) else {
         return model.push_node(model::Node::default());
@@ -652,7 +833,11 @@ fn build_node(
         ..model::Node::default()
     };
 
-    if lod.keeps_geometry() {
+    let drawn = match (node, filter) {
+        (Node::Part(_), Some(filter)) => filter.keeps(&graph.layers_of(node)),
+        _ => true,
+    };
+    if drawn && lod.keeps_geometry() {
         let level = lod.level();
         for load in node.late_loads() {
             if let Some(geometry) = graph.geometry_for(load) {
@@ -671,6 +856,10 @@ fn build_node(
         return index;
     }
 
+    if !drawn {
+        return index;
+    }
+
     let mut children = Vec::new();
     let mut walk = if matches!(node, Node::RangeLod(_)) {
         LodWalk::FIRST
@@ -678,7 +867,7 @@ fn build_node(
         lod
     };
     for child in graph.children_of(node).into_iter().flatten() {
-        children.push(build_node(graph, model, child, expanded, walk));
+        children.push(build_node(graph, model, child, expanded, walk, filter));
         let class_name = graph
             .nodes
             .get(child)
@@ -686,7 +875,7 @@ fn build_node(
         walk.next_tier(class_name);
     }
     if let Some(target) = graph.instance_target(node) {
-        children.push(build_node(graph, model, target, expanded, walk));
+        children.push(build_node(graph, model, target, expanded, walk, filter));
     }
     model.nodes[index].children = children;
     index
@@ -867,4 +1056,330 @@ fn to_quaternion(m: [[f64; 3]; 3]) -> [f32; 4] {
         )
     };
     [x as f32, y as f32, z as f32, w as f32]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::ByteOrder;
+    use crate::jt::object::{
+        Deferred, Group, MetaData, Part, Partition, ProxyMetaData, ShapeLodVertex,
+    };
+
+    /// The filters of the fixture: `ALL` covers layer 1, `LAYCUR` only layer
+    /// 20, and the file leaves the active one unset.
+    const FILTERS: &[u8] = b"LAYERFILTER001::\x00ALL=1,2,256\x00LAYERFILTER000::\x00LAYCUR=20\x00ACTIVELAYERFILTER::\x00\x00";
+
+    /// The layer tag of the tagged part of the fixture.
+    const TAG: &[u8] = b"LAYER::\x001\x00";
+
+    /// One triangle, enough to make a part contribute a mesh.
+    fn geometry() -> LodGeometry {
+        LodGeometry {
+            indices: vec![0, 1, 2],
+            vertices: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            vertex_count: 3,
+            ..LodGeometry::default()
+        }
+    }
+
+    /// Register the element a late-load property refers to.
+    fn register(graph: &mut SceneGraph, property_id: i32, element: Element) {
+        graph.loaded_ids.insert(property_id, graph.loaded.len());
+        graph.loaded.push(LoadedElement {
+            property_id,
+            segment: Guid::default(),
+            segment_type: 3,
+            element,
+        });
+    }
+
+    /// A hand built scene graph: a root that holds a meta data node, a part
+    /// tagged with layer 1 which in turn holds a group, and a part that carries
+    /// no layer tag at all.
+    ///
+    /// `filters` and `tag` are the key/value streams of the meta data node and
+    /// of the tagged part; `None` stands for a node without such a stream,
+    /// which is how a file with no layer information at all looks.
+    fn fixture(filters: Option<&[u8]>, tag: Option<&[u8]>) -> JtFile {
+        let mut graph = SceneGraph::default();
+
+        let kids = vec![
+            Deferred { object_id: 1 },
+            Deferred { object_id: 2 },
+            Deferred { object_id: 3 },
+        ];
+        let root = Partition {
+            base: Group {
+                children: kids.clone(),
+                name: "root".to_owned(),
+                ..Group::default()
+            },
+            file_name: "fixture.jt".to_owned(),
+            up_axis: 0,
+            name: "root".to_owned(),
+            children: kids,
+        };
+        graph.nodes.push(StoredNode {
+            id: 0,
+            node: Node::Partition(root),
+        });
+        graph.objects.insert(0, ObjectRef::Node(0));
+
+        let mut meta = MetaData {
+            name: "MetaData".to_owned(),
+            ..MetaData::default()
+        };
+        if let Some(stream) = filters {
+            meta.base.base.late_loads.push(LateLoad {
+                property_id: 11,
+                guid: Guid::default(),
+                segment_type: 3,
+                object_id: 1,
+            });
+            register(
+                &mut graph,
+                11,
+                Element::ProxyMetaData(ProxyMetaData {
+                    stream: stream.to_vec(),
+                }),
+            );
+        }
+        graph.nodes.push(StoredNode {
+            id: 1,
+            node: Node::MetaData(meta),
+        });
+        graph.objects.insert(1, ObjectRef::Node(1));
+
+        let mut tagged = Part {
+            name: "tagged.part".to_owned(),
+            ..Part::default()
+        };
+        tagged.base.base.children = vec![Deferred { object_id: 4 }];
+        if let Some(stream) = tag {
+            tagged.base.base.base.late_loads.push(LateLoad {
+                property_id: 12,
+                guid: Guid::default(),
+                segment_type: 3,
+                object_id: 1,
+            });
+            register(
+                &mut graph,
+                12,
+                Element::ProxyMetaData(ProxyMetaData {
+                    stream: stream.to_vec(),
+                }),
+            );
+        }
+        tagged.base.base.base.late_loads.push(LateLoad {
+            property_id: 13,
+            guid: Guid::default(),
+            segment_type: 3,
+            object_id: 1,
+        });
+        register(
+            &mut graph,
+            13,
+            Element::ShapeLodVertex(ShapeLodVertex {
+                geometry: geometry(),
+            }),
+        );
+        graph.nodes.push(StoredNode {
+            id: 2,
+            node: Node::Part(tagged),
+        });
+        graph.objects.insert(2, ObjectRef::Node(2));
+
+        let mut plain = Part {
+            name: "plain.part".to_owned(),
+            ..Part::default()
+        };
+        plain.base.base.base.late_loads.push(LateLoad {
+            property_id: 14,
+            guid: Guid::default(),
+            segment_type: 3,
+            object_id: 1,
+        });
+        register(
+            &mut graph,
+            14,
+            Element::ShapeLodVertex(ShapeLodVertex {
+                geometry: geometry(),
+            }),
+        );
+        graph.nodes.push(StoredNode {
+            id: 3,
+            node: Node::Part(plain),
+        });
+        graph.objects.insert(3, ObjectRef::Node(3));
+
+        graph.nodes.push(StoredNode {
+            id: 4,
+            node: Node::Group(Group {
+                name: "child.group".to_owned(),
+                ..Group::default()
+            }),
+        });
+        graph.objects.insert(4, ObjectRef::Node(4));
+
+        graph.root = Some(0);
+        JtFile {
+            path: PathBuf::from("fixture.jt"),
+            header: FileHeader {
+                major: 9,
+                minor: 5,
+                order: ByteOrder::Little,
+                toc_offset: 0,
+                lsg_guid: Guid::default(),
+            },
+            toc: Vec::new(),
+            lsg: Some(graph),
+            offsets: HashMap::new(),
+        }
+    }
+
+    /// Position of the model node with a given name.
+    fn node_index(model: &Model, name: &str) -> usize {
+        model
+            .nodes
+            .iter()
+            .position(|node| node.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("the model has no node {name:?}"))
+    }
+
+    #[test]
+    fn a_filter_only_rejects_parts_that_carry_a_layer_tag() {
+        let filter = LayerFilter {
+            name: None,
+            layers: vec![7],
+        };
+        assert!(filter.is_active());
+        assert!(filter.keeps(&[]), "an untagged part is not affected");
+        assert!(filter.keeps(&[7]));
+        assert!(!filter.keeps(&[8]));
+        assert!(
+            LayerFilter::default().keeps(&[8]),
+            "an empty filter selects nothing to check"
+        );
+    }
+
+    #[test]
+    fn the_default_filter_is_the_first_of_the_declared_ones() {
+        let file = fixture(Some(FILTERS), Some(TAG));
+        let filter = file
+            .layer_filter(None)
+            .expect("the fixture resolves")
+            .expect("the fixture declares filters");
+        assert_eq!(filter.name.as_deref(), Some("ALL"));
+        assert_eq!(filter.layers, vec![1, 2, 256]);
+
+        let model = file.to_model();
+        assert_eq!(model.meshes.len(), 2, "layer 1 is part of ALL");
+        let extras = model.extras.expect("the model carries extras");
+        assert_eq!(extras["layer_filter"]["name"], "ALL");
+        assert_eq!(extras["layer_filter"]["layers"], json!([1, 2, 256]));
+    }
+
+    #[test]
+    fn a_filter_drops_the_geometry_of_the_parts_it_rejects() {
+        let file = fixture(Some(FILTERS), Some(TAG));
+        let model = file
+            .to_model_with_filter("LAYCUR")
+            .expect("LAYCUR is declared");
+        assert_eq!(model.meshes.len(), 1, "only the untagged part is left");
+
+        // The rejected part keeps its node, but loses its mesh and its subtree.
+        let dropped = node_index(&model, "tagged.part");
+        assert!(model.nodes[dropped].instances.is_empty());
+        assert!(model.nodes[dropped].children.is_empty());
+        assert_eq!(model.nodes.len(), 4, "the child of that part is gone");
+
+        let all = file.to_model();
+        assert_eq!(all.nodes.len(), 5, "the graph keeps its shape");
+        let kept = node_index(&all, "tagged.part");
+        assert_eq!(all.nodes[kept].instances.len(), 1);
+        assert_eq!(all.nodes[kept].children.len(), 1);
+    }
+
+    #[test]
+    fn a_part_on_another_layer_is_dropped_by_the_default_filter() {
+        let file = fixture(Some(FILTERS), Some(b"LAYER::\x0020\x00"));
+        assert_eq!(file.to_model().meshes.len(), 1, "ALL does not cover 20");
+        assert_eq!(
+            file.to_model_unfiltered().meshes.len(),
+            2,
+            "ignoring the filters keeps both parts"
+        );
+        assert_eq!(
+            file.to_model_with_filter("LAYCUR")
+                .expect("LAYCUR is declared")
+                .meshes
+                .len(),
+            2,
+            "LAYCUR covers 20"
+        );
+    }
+
+    #[test]
+    fn an_unknown_filter_names_the_ones_that_exist() {
+        let file = fixture(Some(FILTERS), Some(TAG));
+        let error = file
+            .to_model_with_filter("nope")
+            .expect_err("nope is not declared");
+        let message = error.to_string();
+        assert!(
+            message.contains("ALL, LAYCUR"),
+            "the message has to list the filters: {message}"
+        );
+    }
+
+    #[test]
+    fn a_file_without_layer_information_exports_everything() {
+        let file = fixture(None, None);
+        let graph = file.lsg.as_ref().expect("the fixture has a graph");
+        assert!(graph.layer_info().is_none());
+        assert_eq!(file.layer_filter(None).expect("nothing to resolve"), None);
+        assert_eq!(file.to_model().meshes.len(), 2);
+        assert_eq!(file.to_model_unfiltered().meshes.len(), 2);
+        assert_eq!(file.to_model().nodes.len(), 5);
+        assert!(
+            file.to_model()
+                .extras
+                .expect("extras")
+                .get("layer_filter")
+                .is_none(),
+            "no filter means nothing to record"
+        );
+
+        let error = file
+            .layer_filter(Some("ALL"))
+            .expect_err("the fixture declares no filter");
+        assert!(error.to_string().contains("no layer filters"));
+    }
+
+    #[test]
+    fn layers_and_filters_come_from_the_key_value_streams() {
+        let file = fixture(Some(FILTERS), Some(TAG));
+        let graph = file.lsg.as_ref().expect("the fixture has a graph");
+
+        let info = graph
+            .layer_info()
+            .expect("the meta data node declares filters");
+        assert_eq!(info.active, "");
+        assert_eq!(
+            info.filters.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["ALL", "LAYCUR"]
+        );
+        assert_eq!(info.filters["LAYCUR"], vec![20]);
+
+        assert_eq!(
+            graph.layers_of(graph.node_at(2).expect("the tagged part")),
+            vec![1]
+        );
+        assert!(
+            graph
+                .layers_of(graph.node_at(3).expect("the untagged part"))
+                .is_empty()
+        );
+    }
 }

@@ -24,4 +24,4 @@ bug reports, feature requests, and code improvements.
 
 By contributing, you agree that your contributions will be licensed under the [MIT License](LICENSE).
 
-Thank you for contributing to openusd!
+Thank you for contributing to FerroJT!

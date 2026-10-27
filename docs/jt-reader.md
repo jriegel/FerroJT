@@ -47,6 +47,42 @@ Submodules:
 5. `bounds` filled wherever the file provides them; otherwise left `None` so the
    exporter can compute them.
 6. `Model::bounds` as the union of the root nodes.
+7. `Model::extras["layer_filter"]` naming the filter the export applied, when
+   the file declares any; see below.
+
+## Layer filters
+
+JT keeps a lightweight layer model in the key/value streams of the meta data:
+`LAYERFILTERnnn::` declares a named filter and the layers it accepts, and
+`ACTIVELAYERFILTER::` names the one the CAD system had selected when the file
+was written. Every `Part` can carry a `LAYER::` tag with the layers it belongs
+to. The JT Layer tool in `example/` reads those streams with its own ad-hoc
+scanning, and FerroJT mirrors the result:
+
+* `SceneGraph::layer_info()` returns the declared filters plus the active name,
+  and `SceneGraph::layers_of(node)` the layers a node is tagged with. Both read
+  the same concatenated `ProxyMetaData` streams the JSON dump reports, so the
+  dump and the export never disagree about what the file says.
+* `JtFile::layer_filter(name)` resolves a filter. Omitting the name yields the
+  filter named by `ACTIVELAYERFILTER::`, falling back to the first one in name
+  order when the file leaves that empty — the samples all do, and the JT Layer
+  tool's combo box lands on index 0 in exactly that case. An unknown name is an
+  `Error::Invalid` that lists the available filters.
+* `build_node` gates `Node::Part` only: a part whose tag shares no layer with
+  the filter contributes no geometry and no children. Everything else —
+  `Partition`, `MetaData`, `LOD`, `RangeLOD`, `Group`, `Instance` — is never
+  gated, and a part without a tag is always kept. The node itself is always
+  kept, so the scene graph keeps its shape even when a part is filtered out.
+* `to_model()` applies that default, `to_model_with_filter("NAME")` a chosen
+  one, and `to_model_unfiltered()` none at all. The effective filter is recorded
+  in `Model::extras["layer_filter"]` as `{ "name": …, "layers": […] }`.
+* `jt::dump` is not filtered: the JSON export always reports every filter, every
+  tag and every part, whatever the export decides to do.
+
+Of the samples, the JT 8.x files declare no filter at all, and the JT 9.5/10.3
+ones declare `ALL` and `LAYCUR` with an empty active name; every part of every
+sample survives its own default filter, so the pinned export counts do not
+change.
 
 ## Constraints
 
@@ -68,8 +104,11 @@ Submodules:
   vertex/index counts of every representation are pinned, and the root is a
   `Partition`.
 * `crates/ferrojt/tests/model.rs` — a converted model holds one mesh per range
-  LOD, tagged `lod_level: Some(0)`, and keeps every node of the graph.
+  LOD, tagged `lod_level: Some(0)`, keeps every node of the graph, and applies
+  the layer filters the samples declare without losing a part of them.
 * `crates/ferrojt/tests/dump.rs` — every sample with a reference dump under
   `data/Reference` matches it semantically, and every dump is valid JSON.
 * Unit tests in `jt/decode` compare the codecs against the reference output byte
   for byte.
+* Unit tests in `jt/model` build a synthetic scene graph, because no sample has
+  a part on a layer its filter rejects.

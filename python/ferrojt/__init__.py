@@ -7,6 +7,8 @@ convenience helpers.
 
 from __future__ import annotations
 
+from typing import Any
+
 from ._ferrojt import JtFile, Model, __version__, detect_format, open
 
 __all__ = [
@@ -26,9 +28,14 @@ def formats() -> list[str]:
     return ["jt", "gltf", "glb", "usd"]
 
 
-def read(path: str) -> Model:
-    """Alias for :func:`open` that reads a CAD file into a :class:`Model`."""
-    return open(path)
+def read(path: str, **kwargs: Any) -> Model:
+    """Alias for :func:`open` that reads a CAD file into a :class:`Model`.
+
+    Accepts the same keywords: ``layer_filter="NAME"`` selects one of the
+    layer filters the file declares, and ``all_layers=True`` exports every
+    part instead of applying the filter of the file.
+    """
+    return open(path, **kwargs)
 
 
 def dump(path: str) -> str:

@@ -83,6 +83,30 @@ Upload with `python -m twine upload dist\*`.
 - Pinned LOD0 counts (`crates/ferrojt/tests/model.rs`): block 8.1/9.5/10.3 →
   1 mesh / 12 triangles; plate1-8.0 → 2 / 617; plate1-9.5 → 2 / 486.
   `tests/test_ferrojt.py` asserts `mesh_count == 1`, `triangle_count == 12`.
+- **Layer filters gate `Node::Part` only.** The filters live in the
+  `LAYERFILTERnnn::` key/value streams of a `MetaData` node, the tags in the
+  `LAYER::` stream of a `Part`; both are read from the concatenated
+  `ProxyMetaData` late loads via `scan_for_layer_filter` / `scan_for_layer`
+  (`jt::dump` helpers), so dump and export agree on what the file says.
+  `JtFile::layer_filter(name)`: no name → the filter named by
+  `ACTIVELAYERFILTER::`, else the **first key of the sorted `BTreeMap`** (all
+  samples leave it empty; the JT Layer tool combo box lands on index 0).
+  Unknown name → `Error::invalid(0, …)` listing the available names. A part with
+  no tag is **kept** (deviation from `JtGltfMesh.cpp`, keeps plate1-9.5 at
+  2/486); `Partition`/`MetaData`/`LOD`/`RangeLOD`/`Group`/`Instance` are never
+  gated, and a rejected part keeps its node but loses geometry, children and
+  instance target. API: `to_model()` / `to_model_unfiltered()` /
+  `to_model_with_filter(&str)`; the effective filter is
+  `Model::extras["layer_filter"] = {"name", "layers"}`. `LayerFilter` is
+  re-exported from `ferrojt::jt`. `jt::dump` stays unfiltered. No sample loses a
+  part to its own filter, so the pinned counts above are unchanged — a drop can
+  only be shown with a forced filter or the synthetic fixture in `jt/model.rs`.
+- `pyo3` 0.30 cannot express a tri-state keyword: nested
+  `Option<Option<&str>>` is ambiguous (`SomeWrap<T>` matches both `T` and
+  `Option<T>`, E0283). Model it as two parameters — the Python API is
+  `layer_filter="NAME"` / `all_layers=True`, and combining them is
+  `ValueError`. CLI equivalent: `--layer-filter NAME` (conflicts with
+  `--no-layer-filter`) / `--no-layer-filter`.
 - `pyo3` 0.30: releasing the GIL is the **method** `py.detach(|| ...)` (re-acquire
   with `Python::attach`); `Python::allow_threads` is gone. Optional args need
   `#[pyo3(signature = (path, format = None))]`. Error mapping:

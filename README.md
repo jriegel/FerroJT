@@ -74,12 +74,18 @@ cargo run -p ferrojt-cli -- ls      gear.jt
 cargo run -p ferrojt-cli -- inspect gear.jt --pretty
 cargo run -p ferrojt-cli -- dump    gear.jt -o gear.json
 cargo run -p ferrojt-cli -- convert gear.jt -f glb -o gear.glb
+cargo run -p ferrojt-cli -- convert gear.jt --layer-filter LAYCUR -o gear.glb
+cargo run -p ferrojt-cli -- convert gear.jt --no-layer-filter -o gear.glb
 ```
 
 `dump` writes the same JSON the reference JT dump tool produces: the header, the
 TOC table and the logical scene graph with its LOD geometry. `--no-toc` drops the
 TOC table and `--no-indices` keeps the index arrays empty; several files become
-one JSON array.
+one JSON array. A dump is never filtered by layer.
+
+`convert` applies the layer filter the file declares as active, or its first
+filter when the file leaves that unset: `--layer-filter NAME` picks another one
+of the declared filters, and `--no-layer-filter` exports every part.
 
 ## Python
 
@@ -116,6 +122,13 @@ if jt.open():
 
 print(ferrojt.dump("gear.jt"))     # one line shortcut for the same dump
 ```
+
+The export honours the layer filters of the file. `layer_filters()` lists the
+names it declares and `active_layer_filter()` the one applied by default;
+`layer_filter="NAME"` picks another one and `all_layers=True` keeps every part.
+The keywords work on `ferrojt.open`, `ferrojt.read`, `JtFile.model`,
+`JtFile.writeGlTf` and `JtFile.write_gltf`; combining the two of them raises
+`ValueError`.
 
 Requires Python 3.10 or newer.
 
@@ -167,6 +180,11 @@ matrix instead.
   detail; `to_model()` keeps only the finest one and tags it with
   `Mesh::lod_level`, so a glTF or USD export does not repeat a part once per
   tier. A JT dump still reports every tier.
+* **Layers filter parts, not nodes.** A JT file names its layer filters in the
+  meta data and tags each part with the layers it belongs to; an export drops the
+  geometry of a part whose layers the active filter does not accept, but keeps
+  every node of the scene graph. A file without layer information exports all of
+  its parts, and a dump always shows everything.
 * **`#![forbid(unsafe_code)]`** in the core library.
 
 The reasoning behind these choices is in [`docs/`](docs): the neutral model and

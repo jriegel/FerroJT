@@ -71,7 +71,8 @@ Design rules:
 * `jt::object` — LSG nodes, attributes and element objects.
 * `jt::decode` — Huffman, the range/CDP driver, the vertex coders and the mesh
   coder, verified byte for byte against the reference output.
-* `jt::model` — `JtFile` and `SceneGraph`, plus `to_model()`.
+* `jt::model` — `JtFile` and `SceneGraph`, plus `to_model()` and the layer
+  filter that decides which parts an export keeps.
 * `jt::dump` — the JSON layout the JT tooling writes, including the C `%g`
   number formatting that `format_g` reproduces.
 

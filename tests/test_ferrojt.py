@@ -220,3 +220,101 @@ def test_jt_file_model_is_exportable(tmp_path) -> None:
     # USD export is a planned feature, not a implemented one.
     with pytest.raises(NotImplementedError):
         model.save(str(tmp_path / "model.usda"))
+
+
+#: The layer filters each sample declares, and the one an export uses by
+#: default. A JT 8.x file declares none at all, and the newer ones all leave
+#: ``ACTIVELAYERFILTER::`` empty, so the first name in sorted order wins.
+FILTERS = {
+    "example_block_jt10.3.jt": (["ALL", "LAYCUR"], "ALL"),
+    "example_block_jt8.1.jt": ([], None),
+    "example_block_jt9.5.jt": (["ALL", "LAYCUR"], "ALL"),
+    "opening_protection_plate1_jt8.0.jt": ([], None),
+    "opening_protection_plate1_jt9.5.jt": (["ALL", "LAYCUR"], "ALL"),
+}
+
+
+def sample_ids() -> list[str]:
+    return [name for name in FILTERS if (SAMPLES / name).is_file()]
+
+
+@needs_sample
+def test_the_declared_layer_filters_are_the_ones_of_the_reference() -> None:
+    jt = ferrojt.JtFile(str(BLOCK_95))
+    assert jt.open()
+
+    assert jt.layer_filters() == ["ALL", "LAYCUR"]
+    assert jt.active_layer_filter() == "ALL"
+
+    # The dump still shows every filter of the file, filtered export or not.
+    assert "layer-filter" in jt.json()
+
+
+@pytest.mark.parametrize("name", sample_ids(), ids=sample_ids())
+def test_layer_filters_of_a_sample(name: str) -> None:
+    declared, default = FILTERS[name]
+    jt = ferrojt.JtFile(str(SAMPLES / name))
+    assert jt.open(), f"{name} could not be read"
+
+    assert jt.layer_filters() == declared
+    assert jt.active_layer_filter() == default
+
+
+@pytest.mark.parametrize("name", sample_ids(), ids=sample_ids())
+def test_no_sample_loses_a_part_to_its_own_filter(name: str) -> None:
+    declared, _ = FILTERS[name]
+    jt = ferrojt.JtFile(str(SAMPLES / name))
+    assert jt.open(), f"{name} could not be read"
+
+    filtered = jt.model()
+    unfiltered = jt.model(all_layers=True)
+    assert filtered.node_count == unfiltered.node_count
+    assert filtered.triangle_count == unfiltered.triangle_count
+
+    # Asking for a filter the file does not declare is an error, and the
+    # message names the ones it does.
+    if declared:
+        with pytest.raises(ValueError, match=", ".join(declared)):
+            jt.model(layer_filter="nope")
+        assert jt.model(layer_filter=declared[-1]).triangle_count == filtered.triangle_count
+    else:
+        with pytest.raises(ValueError, match="no layer filters"):
+            jt.model(layer_filter="nope")
+
+
+@needs_sample
+def test_layer_filter_and_all_layers_cannot_be_combined() -> None:
+    jt = ferrojt.JtFile(str(BLOCK_95))
+    assert jt.open()
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        jt.model(layer_filter="ALL", all_layers=True)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ferrojt.open(str(BLOCK_95), layer_filter="ALL", all_layers=True)
+
+
+@needs_sample
+def test_read_accepts_the_layer_keywords(tmp_path) -> None:
+    model = ferrojt.read(str(BLOCK_95))
+    assert model.triangle_count == 12
+
+    # A file without layer information exports everything either way.
+    other = ferrojt.read(str(SAMPLES / "example_block_jt8.1.jt"), all_layers=True)
+    assert other.triangle_count > 0
+
+    jt = ferrojt.JtFile(str(BLOCK_95))
+    assert jt.open()
+    assert jt.write_gltf(str(tmp_path / "laycur"), layer_filter="LAYCUR") is True
+    assert (tmp_path / "laycur.gltf").is_file()
+    assert jt.writeGlTf(str(tmp_path / "all"), all_layers=True) is True
+    assert (tmp_path / "all.gltf").is_file()
+
+
+@needs_sample
+def test_a_file_without_layer_information_has_no_default_filter() -> None:
+    jt = ferrojt.JtFile(str(SAMPLES / "example_block_jt8.1.jt"))
+    assert jt.open()
+
+    assert jt.layer_filters() == []
+    assert jt.active_layer_filter() is None
+    assert jt.model().triangle_count == jt.model(all_layers=True).triangle_count

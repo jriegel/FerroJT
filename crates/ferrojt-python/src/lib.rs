@@ -25,10 +25,17 @@ fn py_err(err: ferrojt::Error) -> PyErr {
 }
 
 /// Open a CAD file and return a [`Model`].
+///
+/// `layer_filter` selects one of the named layer filters the file declares;
+/// leaving it out applies the filter the file marks as active. `all_layers`
+/// exports every part and ignores the filters of the file.
 #[pyfunction]
-fn open(path: &str) -> PyResult<Model> {
-    let model = ferrojt::open(path).map_err(py_err)?;
-    Ok(Model { inner: model })
+#[pyo3(signature = (path, *, layer_filter = None, all_layers = false))]
+fn open(path: &str, layer_filter: Option<&str>, all_layers: bool) -> PyResult<Model> {
+    let file = ferrojt::jt::JtFile::open(path).map_err(py_err)?;
+    Ok(Model {
+        inner: build_model(&file, layer_filter, all_layers)?,
+    })
 }
 
 /// Return the container format detected for `path`.
@@ -237,13 +244,21 @@ impl JtFile {
     ///
     /// Like the C++ extension, `path` is a name without an extension: `.gltf`
     /// is appended unless the name already ends in `.gltf` or `.glb`.
-    #[pyo3(name = "writeGlTf")]
-    fn write_gl_tf(&self, py: Python<'_>, path: &str) -> PyResult<bool> {
+    ///
+    /// `layer_filter` and `all_layers` follow [`JtFile::model`].
+    #[pyo3(name = "writeGlTf", signature = (path, *, layer_filter = None, all_layers = false))]
+    fn write_gl_tf(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        layer_filter: Option<&str>,
+        all_layers: bool,
+    ) -> PyResult<bool> {
         let Some(file) = self.inner.as_ref() else {
             return Ok(false);
         };
         let target = gltf_target(path);
-        let model = file.to_model();
+        let model = build_model(file, layer_filter, all_layers)?;
         let format = ferrojt::Format::detect(&target);
         py.detach(|| ferrojt::export::write_to_file(format, &model, &target))
             .map_err(py_err)?;
@@ -251,17 +266,28 @@ impl JtFile {
     }
 
     /// Snake case alias of [`JtFile::write_gl_tf`].
-    #[pyo3(name = "write_gltf")]
-    fn write_gltf(&self, py: Python<'_>, path: &str) -> PyResult<bool> {
-        self.write_gl_tf(py, path)
+    #[pyo3(name = "write_gltf", signature = (path, *, layer_filter = None, all_layers = false))]
+    fn write_gltf(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        layer_filter: Option<&str>,
+        all_layers: bool,
+    ) -> PyResult<bool> {
+        self.write_gl_tf(py, path, layer_filter, all_layers)
     }
 
     /// The scene as a [`Model`], which is what the exporters consume.
     ///
     /// Only the finest level of detail of a range LOD is turned into a mesh.
     ///
+    /// `layer_filter` selects one of the named filters the file declares; see
+    /// [`JtFile::layer_filters`]. Leaving it out applies the filter the file
+    /// marks as active, and `all_layers=True` keeps every part.
+    ///
     /// Raises `RuntimeError` while the file is closed.
-    fn model(&self) -> PyResult<Model> {
+    #[pyo3(signature = (*, layer_filter = None, all_layers = false))]
+    fn model(&self, layer_filter: Option<&str>, all_layers: bool) -> PyResult<Model> {
         let Some(file) = self.inner.as_ref() else {
             return Err(PyRuntimeError::new_err(format!(
                 "{} is not open",
@@ -269,8 +295,31 @@ impl JtFile {
             )));
         };
         Ok(Model {
-            inner: file.to_model(),
+            inner: build_model(file, layer_filter, all_layers)?,
         })
+    }
+
+    /// The names of the layer filters the file declares, in name order.
+    /// Returns an empty list while the file is closed or when it declares none.
+    fn layer_filters(&self) -> Vec<String> {
+        let Some(file) = self.inner.as_ref() else {
+            return Vec::new();
+        };
+        file.lsg
+            .as_ref()
+            .and_then(|graph| graph.layer_info())
+            .map(|info| info.filters.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The filter an export uses when none is asked for, or `None` when the
+    /// file carries no layer information at all.
+    fn active_layer_filter(&self) -> Option<String> {
+        self.inner
+            .as_ref()
+            .and_then(|file| file.layer_filter(None).ok())
+            .flatten()
+            .and_then(|filter| filter.name)
     }
 
     fn __repr__(&self) -> String {
@@ -290,6 +339,26 @@ fn gltf_target(path: &str) -> String {
         path.to_string()
     } else {
         format!("{path}.gltf")
+    }
+}
+
+/// Apply the layer filter keywords of the Python API to a file.
+///
+/// * neither keyword – the filter the file declares as active
+/// * `all_layers`    – every part, the filters of the file are ignored
+/// * `layer_filter`  – that filter, or `ValueError` when the file has none
+fn build_model(
+    file: &ferrojt::jt::JtFile,
+    layer_filter: Option<&str>,
+    all_layers: bool,
+) -> PyResult<ferrojt::Model> {
+    match (layer_filter, all_layers) {
+        (Some(_), true) => Err(PyValueError::new_err(
+            "layer_filter and all_layers cannot be combined",
+        )),
+        (Some(name), false) => file.to_model_with_filter(name).map_err(py_err),
+        (None, true) => Ok(file.to_model_unfiltered()),
+        (None, false) => Ok(file.to_model()),
     }
 }
 

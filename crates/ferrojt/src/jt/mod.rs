@@ -45,7 +45,8 @@ pub use dump::{
 };
 pub use guid::Guid;
 pub use model::{
-    JtFile, LoadedElement, ObjectRef, SceneGraph, StoredAttribute, StoredNode, StoredProperty,
+    JtFile, LayerFilter, LoadedElement, ObjectRef, SceneGraph, StoredAttribute, StoredNode,
+    StoredProperty,
 };
 pub use object::{
     Attribute, Class, Deferred, Element, GeometricTransform, LateLoad, LodGeometry, Material, Node,

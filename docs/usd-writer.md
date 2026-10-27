@@ -34,6 +34,10 @@ The scene layer maps almost one to one onto USD:
 `export/gltf.rs` does (`read_component`, `widen`), so the two exporters share the
 same accessor semantics.
 
+Level of detail and layer filtering already happened in the reader, so a USD
+stage gets the same subset of the file a glTF export writes; the effective filter
+is available as `Model::extras["layer_filter"]` if the stage should record it.
+
 ## Two candidate implementations
 
 ### A. Hand-written `.usda` (ASCII) writer — recommended first step
