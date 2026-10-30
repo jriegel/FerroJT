@@ -6,7 +6,7 @@
 //! table tying the two together. Representation data lives in other segments
 //! and is pulled in through late-load properties.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
@@ -464,7 +464,7 @@ impl JtFile {
             graph,
             &mut model,
             root,
-            &mut HashSet::new(),
+            &mut Built::default(),
             LodWalk::ROOT,
             filter,
         );
@@ -804,6 +804,24 @@ fn bounds_of_positions(values: &[f32]) -> Option<Aabb> {
     (!bounds.is_empty()).then_some(bounds)
 }
 
+/// What has been translated from the scene graph so far.
+///
+/// An instance node points at a subtree that is shared rather than copied: the
+/// reference reader walks that subtree once per instance, and a viewer expects
+/// to see the instantiated shape as many times as the file instantiates it.
+/// Every graph position is still translated exactly once, so the shared
+/// subtree appears as one [`model::Node`] that both instances refer to — which
+/// is also what glTF encodes as a node listed by two parents.
+#[derive(Default)]
+struct Built {
+    /// Graph position to the model node built for it.
+    ///
+    /// Recorded before the children are walked, so a reference cycle — or a
+    /// subtree reached twice — resolves to the node already under way instead
+    /// of recursing forever.
+    done: HashMap<usize, usize>,
+}
+
 /// Recursively translate one graph node into a [`model::Node`].
 ///
 /// A part whose layers are rejected by `filter` keeps its node — the graph
@@ -813,10 +831,13 @@ fn build_node(
     graph: &SceneGraph,
     model: &mut Model,
     pos: usize,
-    expanded: &mut HashSet<usize>,
+    built: &mut Built,
     lod: LodWalk,
     filter: Option<&LayerFilter>,
 ) -> usize {
+    if let Some(&index) = built.done.get(&pos) {
+        return index;
+    }
     let Some(node) = graph.nodes.get(pos).map(|stored| &stored.node) else {
         return model.push_node(model::Node::default());
     };
@@ -852,10 +873,7 @@ fn build_node(
     }
 
     let index = model.push_node(out);
-    if !expanded.insert(pos) {
-        return index;
-    }
-
+    built.done.insert(pos, index);
     if !drawn {
         return index;
     }
@@ -867,7 +885,7 @@ fn build_node(
         lod
     };
     for child in graph.children_of(node).into_iter().flatten() {
-        children.push(build_node(graph, model, child, expanded, walk, filter));
+        children.push(build_node(graph, model, child, built, walk, filter));
         let class_name = graph
             .nodes
             .get(child)
@@ -875,7 +893,7 @@ fn build_node(
         walk.next_tier(class_name);
     }
     if let Some(target) = graph.instance_target(node) {
-        children.push(build_node(graph, model, target, expanded, walk, filter));
+        children.push(build_node(graph, model, target, built, walk, filter));
     }
     model.nodes[index].children = children;
     index
@@ -1020,6 +1038,9 @@ fn decompose(matrix: &[f64; 16]) -> Transform {
 }
 
 /// Convert a rotation matrix to an `x, y, z, w` quaternion.
+///
+/// The result is unit length, which the glTF writer also insists on: a
+/// non-normalised quaternion silently scales the geometry it rotates.
 fn to_quaternion(m: [[f64; 3]; 3]) -> [f32; 4] {
     let trace = m[0][0] + m[1][1] + m[2][2];
     let (x, y, z, w) = if trace > 0.0 {
@@ -1028,7 +1049,7 @@ fn to_quaternion(m: [[f64; 3]; 3]) -> [f32; 4] {
             (m[2][1] - m[1][2]) * s,
             (m[0][2] - m[2][0]) * s,
             (m[1][0] - m[0][1]) * s,
-            0.5 / s,
+            0.25 / s,
         )
     } else if m[0][0] > m[1][1] && m[0][0] > m[2][2] {
         let s = 2.0 * (1.0 + m[0][0] - m[1][1] - m[2][2]).sqrt();
@@ -1381,5 +1402,36 @@ mod tests {
                 .layers_of(graph.node_at(3).expect("the untagged part"))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_transform_attribute_yields_a_unit_quaternion() {
+        // A quarter turn about Z: the quaternion has to be normalised, or the
+        // glTF writer scales the geometry it rotates.
+        let matrix = [
+            0.0, -1.0, 0.0, 0.0, //
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            4.0, 5.0, 6.0, 1.0,
+        ];
+        let transform = decompose(&matrix);
+        assert_eq!(transform.translation, [4.0, 5.0, 6.0]);
+        assert_eq!(transform.scale, [1.0, 1.0, 1.0]);
+        let [x, y, z, w] = transform.rotation;
+        let norm = (x * x + y * y + z * z + w * w).sqrt();
+        assert!((norm - 1.0).abs() < 1e-6, "not unit length: {norm}");
+        let half_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((z - half_sqrt2).abs() < 1e-6, "wrong sine: {z}");
+        assert!((w - half_sqrt2).abs() < 1e-6, "wrong cosine: {w}");
+        assert!(x.abs() < 1e-6 && y.abs() < 1e-6, "off axis: {x} {y}");
+
+        // The identity matrix, which takes the trace branch, stays identity.
+        let identity = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        assert_eq!(decompose(&identity).rotation, [0.0, 0.0, 0.0, 1.0]);
     }
 }

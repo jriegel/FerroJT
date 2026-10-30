@@ -44,10 +44,18 @@ Submodules:
    what the reference glTF writer does. The nodes themselves are all kept, so
    the graph keeps its shape, and `Mesh::lod_level` records the tier a mesh came
    from. `jt::dump` is not filtered — a dump still reports every tier.
-5. `bounds` filled wherever the file provides them; otherwise left `None` so the
+5. An `Instance` node keeps the subtree it points at. JT stores an instantiated
+   part once and refers to it from several `Instance` nodes — the plate samples
+   hold one screw and instantiate it twice, at `y = -25` and `y = +25` — so
+   every graph position is translated exactly once and both instances end up as
+   children of the same model node. That is what glTF encodes as one node listed
+   by two parents: the geometry is shared, the instance transforms are not. A
+   subtree reached twice resolves to the node already built rather than being
+   copied, which also breaks a reference cycle.
+6. `bounds` filled wherever the file provides them; otherwise left `None` so the
    exporter can compute them.
-6. `Model::bounds` as the union of the root nodes.
-7. `Model::extras["layer_filter"]` naming the filter the export applied, when
+7. `Model::bounds` as the union of the root nodes.
+8. `Model::extras["layer_filter"]` naming the filter the export applied, when
    the file declares any; see below.
 
 ## Layer filters
@@ -104,8 +112,9 @@ change.
   vertex/index counts of every representation are pinned, and the root is a
   `Partition`.
 * `crates/ferrojt/tests/model.rs` — a converted model holds one mesh per range
-  LOD, tagged `lod_level: Some(0)`, keeps every node of the graph, and applies
-  the layer filters the samples declare without losing a part of them.
+  LOD, tagged `lod_level: Some(0)`, keeps every node of the graph, keeps the
+  subtree of every `Instance` and lets two instances share one, and applies the
+  layer filters the samples declare without losing a part of them.
 * `crates/ferrojt/tests/dump.rs` — every sample with a reference dump under
   `data/Reference` matches it semantically, and every dump is valid JSON.
 * Unit tests in `jt/decode` compare the codecs against the reference output byte
@@ -113,7 +122,8 @@ change.
 * Unit tests in `jt/model` build a synthetic scene graph, because no sample has
   a part on a layer its filter rejects.
 * `tests/test_ferrojt.py` — the same reference dumps through the python bindings.
-* `tests/test_visual.py` — the export of the three `example_block` versions is
+* `tests/test_visual.py` — the export of every sample — the three
+  `example_block` versions and the two `opening_protection_plate1` ones — is
   rendered offscreen and compared with a reference picture in `data/Reference`,
   so a regression in the geometry shows as a picture rather than only as a count.
   See [../README.md](../README.md), "Visual regression".

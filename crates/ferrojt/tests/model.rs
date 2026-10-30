@@ -165,6 +165,75 @@ fn every_node_of_the_scene_graph_survives() {
     }
 }
 
+#[test]
+fn every_instance_keeps_the_subtree_it_instantiates() {
+    // The plate samples hold one screw and instantiate it twice, at y = -25
+    // and y = +25. An instance must never collapse into an empty node: the
+    // viewer has to draw the screw twice, once per instance transform.
+    for name in [
+        "opening_protection_plate1_jt8.0.jt",
+        "opening_protection_plate1_jt9.5.jt",
+    ] {
+        let file = sample(name);
+        let graph = file
+            .lsg
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name}: no logical scene graph"));
+        let model = file.to_model();
+
+        let in_graph = graph
+            .nodes
+            .iter()
+            .filter(|stored| stored.node.class_name() == "Instance")
+            .count();
+        let instances = model
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.kind.as_deref() == Some("Instance"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            instances.len(),
+            in_graph,
+            "{name}: an instance disappeared from the model"
+        );
+        assert_eq!(instances.len(), 2, "{name}: expected two instances");
+
+        let mut targets = Vec::new();
+        for (index, node) in &instances {
+            assert_eq!(
+                node.children.len(),
+                1,
+                "{name}: instance {index} lost the subtree it instantiates"
+            );
+            targets.push(node.children[0]);
+        }
+
+        // Both instances point at the same translated subtree, which is what
+        // glTF encodes as one node with two parents: the geometry is shared,
+        // the transforms are not.
+        assert_eq!(
+            targets[0], targets[1],
+            "{name}: the two instances do not share one subtree"
+        );
+        let target = &model.nodes[targets[0]];
+        assert!(
+            !target.children.is_empty(),
+            "{name}: the instanced subtree is empty"
+        );
+
+        // The instance transforms are what separate the two copies.
+        let offsets = instances
+            .iter()
+            .map(|(_, node)| node.transform.translation)
+            .collect::<Vec<_>>();
+        assert_ne!(
+            offsets[0], offsets[1],
+            "{name}: both instances carry the same transform"
+        );
+    }
+}
+
 /// The layer filters the samples declare, and the one the export applies by
 /// default. A file of the JT 8.x era has none at all, and the newer ones all
 /// leave `ACTIVELAYERFILTER::` empty, so the first of the sorted names wins.

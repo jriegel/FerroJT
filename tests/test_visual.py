@@ -54,11 +54,15 @@ REFERENCES = DATA / "Reference"
 #: Where mismatch pictures are written; not part of the repository.
 DIFF_DIR = Path(__file__).resolve().parent / "_visual_out"
 
-#: The three versions of the same cube, one per JT generation.
-BLOCKS = [
+#: The samples to render: the three versions of the same cube, one per JT
+#: generation, and the two versions of an assembly that instantiates one screw
+#: twice — the instances have to show up as two copies of that screw.
+MODELS = [
     "example_block_jt8.1.jt",
     "example_block_jt9.5.jt",
     "example_block_jt10.3.jt",
+    "opening_protection_plate1_jt8.0.jt",
+    "opening_protection_plate1_jt9.5.jt",
 ]
 
 # --- the fixed picture ------------------------------------------------------
@@ -278,7 +282,7 @@ def compare(sample: str, work_dir: Path, threshold: float = THRESHOLD) -> Compar
 # --- the pytest side --------------------------------------------------------
 
 needs_samples = pytest.mark.skipif(
-    not all(sample_path(name).is_file() for name in BLOCKS),
+    not all(sample_path(name).is_file() for name in MODELS),
     reason="the sample JT files are not checked out",
 )
 
@@ -286,7 +290,7 @@ needs_samples = pytest.mark.skipif(
 @needs_open3d
 @needs_numpy
 @needs_samples
-@pytest.mark.parametrize("sample", BLOCKS)
+@pytest.mark.parametrize("sample", MODELS)
 def test_the_render_matches_the_reference_picture(sample: str, tmp_path: Path) -> None:
     """The glTF export of a sample renders like its reference picture."""
     result = compare(sample, tmp_path)
@@ -301,7 +305,7 @@ def test_the_render_matches_the_reference_picture(sample: str, tmp_path: Path) -
 @needs_samples
 def test_a_reference_picture_exists_for_every_sample() -> None:
     """The references are part of the repository, like the JSON dumps."""
-    missing = [str(reference_path(name)) for name in BLOCKS if not reference_path(name).is_file()]
+    missing = [str(reference_path(name)) for name in MODELS if not reference_path(name).is_file()]
     assert not missing, "missing reference picture(s): " + ", ".join(missing)
 
 
@@ -335,8 +339,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--sample",
         action="append",
-        choices=BLOCKS,
-        help="only this sample (repeatable), all three by default",
+        choices=MODELS,
+        help="only this sample (repeatable), every sample by default",
     )
     parser.add_argument(
         "--threshold",
@@ -354,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
     if o3d is None:
         print("open3d is not installed: pip install open3d", file=sys.stderr)
         return 2
-    names = args.sample or BLOCKS
+    names = args.sample or MODELS
     missing = [str(sample_path(name)) for name in names if not sample_path(name).is_file()]
     if missing:
         print("missing sample file(s): " + ", ".join(missing), file=sys.stderr)

@@ -47,7 +47,7 @@ without it):
 ```
 
 Interactive viewer (also needs `open3d`; it is a tool, not a test — nothing in it
-is named `test_*`, so pytest still collects 41 tests):
+is named `test_*`, so pytest still collects 43 tests):
 
 ```powershell
 .\.venv\Scripts\python.exe tests\test_viewer.py data\ExampleFiles\example_block_jt9.5.jt
@@ -69,7 +69,8 @@ Upload with `python -m twine upload dist\*`.
 - Dual license `MIT OR Apache-2.0`. Author string is `Juergen Riegel` in both
   `Cargo.toml` and `pyproject.toml`.
 - Commit on `main`, one commit per completed unit. `Cargo.lock` is committed;
-  `target/`, `dist/`, `.venv/`, `data/`, `example/` are not.
+  `target/`, `dist/`, `.venv/`, `example/` are not. `data/` **is** committed
+  (samples, reference JSON and reference PNGs) — only `data/fmsr_*` is ignored.
 
 ## Things that will bite you
 
@@ -98,6 +99,19 @@ Upload with `python -m twine upload dist\*`.
 - Pinned LOD0 counts (`crates/ferrojt/tests/model.rs`): block 8.1/9.5/10.3 →
   1 mesh / 12 triangles; plate1-8.0 → 2 / 617; plate1-9.5 → 2 / 486.
   `tests/test_ferrojt.py` asserts `mesh_count == 1`, `triangle_count == 12`.
+- **An `Instance` shares its subtree, it is not copied.** The plate samples hold
+  one screw and instantiate it twice (`y = -25` and `y = +25`). `build_node`
+  memoises by graph position in `Built { done: HashMap<usize, usize> }`, recorded
+  *before* the children are walked, so a second visit returns the node already
+  built and both instances point at the same model index — valid glTF (one node,
+  two parents), and it keeps the pinned counts and `every_node_of_the_scene_graph_survives`
+  green. The old `expanded: HashSet` returned a *fresh, childless* node on the
+  second visit, which is why one screw vanished in the viewer. `done` doubles as
+  the cycle guard; there is no separate path set.
+- `to_quaternion` must return a **unit** quaternion: the trace branch is
+  `s = 0.5 / sqrt(trace + 1)`, `w = 0.25 / s` (the `0.5 / s` version gave `w = 2`
+  for the identity). glTF normalises, so the bug only shows as a scaled mesh when
+  the model is consumed directly.
 - **Layer filters gate `Node::Part` only.** The filters live in the
   `LAYERFILTERnnn::` key/value streams of a `MetaData` node, the tags in the
   `LAYER::` stream of a `Part`; both are read from the concatenated
