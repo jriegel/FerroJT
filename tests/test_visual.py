@@ -14,10 +14,11 @@ shader is not bit exact across drivers, the comparison is a similarity score
 rather than equality: the picture passes when at least ``THRESHOLD`` of the
 possible colour difference is left unused.
 
-Two Open3D quirks shape :func:`render_sample`: the first frame of a freshly
-created ``OffscreenRenderer`` comes back empty, so one frame is rendered and
-discarded, and creating a renderer per picture is both slow and unstable, so
-the whole process shares a single one.
+Two Open3D quirks shape :func:`render_sample`: a frame of an
+``OffscreenRenderer`` can come back blank — always the first of a view, and
+occasionally a later one after the scene changed — so :func:`shoot` renders
+until it gets a frame that contains the background, and creating a renderer per
+picture is both slow and unstable, so the whole process shares a single one.
 
 Run it as a script to (re)create the references or to inspect a mismatch::
 
@@ -80,10 +81,27 @@ UP = np.array([0.0, 0.0, 1.0]) if np is not None else None
 MARGIN = 1.15
 #: Opaque white background, so a missing mesh is visible as a blank picture.
 BACKGROUND = [1.0, 1.0, 1.0, 1.0]
-#: One flat grey material for every mesh: the picture then depends on the
-#: geometry alone and not on how a loader happens to read a glTF material.
+#: One flat grey material for every mesh: the reference picture then depends on
+#: the geometry alone and not on how a loader happens to read a glTF material.
+#: The colours themselves are proven separately by
+#: :func:`test_the_exported_colours_survive_the_render`, which renders the same
+#: file with its own materials and measures the chroma of the result.
 BASE_COLOR = (0.72, 0.72, 0.72, 1.0)
 SHADER = "defaultLit"
+
+#: The sample the colour proof renders: a grey plate with a yellow-green screw,
+#: instantiated twice, so the picture has a clearly non-grey area.
+COLOUR_SAMPLE = "opening_protection_plate1_jt9.5.jt"
+#: A pixel counts as coloured when its channels spread by more than this much;
+#: a grey pixel — background, plate or shadow — has a spread of zero.
+CHROMA_EPS = 40.0
+#: How much of the picture has to be coloured for the colours to have survived.
+#: Measured for the plate sample: 0.00% with the flat grey override, 0.96% with
+#: the materials of the export, so the margin either way is wide.
+CHROMA_MIN = 0.003
+
+#: Frames :func:`shoot` is willing to render before it gives up on a view.
+MAX_FRAMES = 8
 
 #: How alike the pictures have to be, in ``0..1``. Overridable so a different
 #: GPU or Open3D version does not fail the suite outright.
@@ -115,15 +133,14 @@ def export_glb(sample: str, work_dir: Path) -> Path:
 
 def fit_camera(
     render: "o3d.visualization.rendering.OffscreenRenderer",
-    mesh: "o3d.geometry.TriangleMesh",
+    box: "o3d.geometry.AxisAlignedBoundingBox",
 ) -> None:
-    """Place the camera so that the whole mesh fills the frame.
+    """Place the camera so that the whole bounding box fills the frame.
 
-    The distance follows from the bounding sphere of the mesh and the field of
+    The distance follows from the bounding sphere of the box and the field of
     view, which is the "fit all" zoom of a viewer; the direction and the up
     vector are the fixed ones of this module, so the picture is reproducible.
     """
-    box = mesh.get_axis_aligned_bounding_box()
     center = np.asarray(box.get_center(), dtype=np.float64)
     radius = 0.5 * float(np.linalg.norm(np.asarray(box.get_extent(), dtype=np.float64)))
     if radius <= 0.0:  # an empty mesh still has to produce a picture
@@ -164,10 +181,58 @@ def render_sample(sample: str, work_dir: Path) -> "np.ndarray":
     material.shader = SHADER
     material.base_color = BASE_COLOR
     render.scene.add_geometry("model", mesh, material)
-    fit_camera(render, mesh)
-    render.render_to_image()  # the first frame of a new view comes back empty
-    image = np.asarray(render.render_to_image())
+    fit_camera(render, mesh.get_axis_aligned_bounding_box())
+    return shoot(render)
+
+
+def render_sample_as_exported(sample: str, work_dir: Path) -> "np.ndarray":
+    """Render ``sample`` with the materials of the export, not a flat grey.
+
+    ``read_triangle_mesh`` flattens a glTF into one mesh and drops its
+    materials, so the colour proof has to go through ``read_triangle_model``
+    and ``add_model``, which keep the material of every primitive.
+    """
+    model = o3d.io.read_triangle_model(str(export_glb(sample, work_dir)))
+    render = get_renderer()
+    render.scene.clear_geometry()
+    render.scene.add_model("model", model)
+    # The bounding box of the scene covers every mesh of the model, which a
+    # single mesh of it would not: the plate is wide and the screw is small.
+    fit_camera(render, render.scene.bounding_box)
+    return shoot(render)
+
+
+def shoot(render: "o3d.visualization.rendering.OffscreenRenderer") -> "np.ndarray":
+    """Render frames until the engine returns one that is not blank.
+
+    The first frame of a freshly created view comes back empty, and on some
+    drivers a later frame does too after the scene changed — measured on one
+    machine, a blank frame appears for the first sample and then again at a
+    random position. A blank frame is all zeros, while a real one always
+    contains the background, so the two are easy to tell apart.
+    """
+    image = np.zeros((0, 0, 3), dtype=np.uint8)
+    for _ in range(MAX_FRAMES):
+        image = np.asarray(render.render_to_image())
+        if image.size and image[..., :3].max() > 0:
+            break
     return np.ascontiguousarray(image[..., :3], dtype=np.uint8)
+
+
+def chroma(image: "np.ndarray", eps: float = CHROMA_EPS) -> tuple[float, "np.ndarray"]:
+    """The fraction of ``image`` that is coloured, and the mean colour of it.
+
+    Chroma is the spread between the strongest and weakest channel of a pixel,
+    so a grey pixel — the background, a grey part, a shadow — measures zero no
+    matter how light or dark it is. That makes it a direct test of "the colour
+    of the file reached the picture".
+    """
+    values = image.astype(np.float64)
+    spread = values.max(axis=2) - values.min(axis=2)
+    mask = spread > eps
+    if not mask.any():
+        return 0.0, np.zeros(3, dtype=np.float64)
+    return float(mask.mean()), values[mask].mean(axis=0)
 
 
 @dataclass
@@ -303,6 +368,54 @@ def test_the_render_matches_the_reference_picture(sample: str, tmp_path: Path) -
 @needs_open3d
 @needs_numpy
 @needs_samples
+def test_the_exported_colours_survive_the_render(tmp_path: Path) -> None:
+    """The colours of a JT file have to reach the picture, not only the glTF.
+
+    The reference pictures are deliberately flat grey, so they cannot show
+    this: a wrong material mapping — a colour dropped, or a roughness derived
+    from the shininess exponent of the file, which turns every part into a
+    mirror and blows the colour out to white — still matches them. Rendering
+    the same export with its own materials and measuring the chroma does: a
+    grey plate on a white background stays grey, the yellow-green screw does
+    not.
+    """
+    image = render_sample_as_exported(COLOUR_SAMPLE, tmp_path)
+    fraction, mean = chroma(image)
+
+    assert fraction > CHROMA_MIN, (
+        f"{COLOUR_SAMPLE}: only {fraction * 100:.2f}% of the picture is coloured "
+        f"(chroma > {CHROMA_EPS:g}); the colours of the file did not survive"
+    )
+    # The coloured area is the screw, which is yellow-green: green is the
+    # strongest channel and blue the weakest, not a washed out grey.
+    assert mean[1] > mean[0] > mean[2], (
+        f"{COLOUR_SAMPLE}: the coloured pixels average {mean}, "
+        "which is not the yellow-green of the screw"
+    )
+
+
+@needs_open3d
+@needs_numpy
+@needs_samples
+def test_the_flat_grey_render_of_the_same_sample_has_no_colour(
+    tmp_path: Path,
+) -> None:
+    """The other half of the colour proof: the grey reference picture is grey.
+
+    Without this the assertion above proves nothing — a picture that is
+    coloured no matter what the material says would pass it too.
+    """
+    image = render_sample(COLOUR_SAMPLE, tmp_path)
+    fraction, _ = chroma(image)
+    assert fraction < 0.001, (
+        f"{COLOUR_SAMPLE}: {fraction * 100:.2f}% of the flat grey render is "
+        "coloured, so the chroma measure does not separate the two"
+    )
+
+
+@needs_open3d
+@needs_numpy
+@needs_samples
 def test_a_reference_picture_exists_for_every_sample() -> None:
     """The references are part of the repository, like the JSON dumps."""
     missing = [str(reference_path(name)) for name in MODELS if not reference_path(name).is_file()]
@@ -323,6 +436,22 @@ def test_the_similarity_of_a_picture_with_itself_is_one() -> None:
         1.0 - 128.0 / 255.0
     )
     assert similarity(image, np.zeros((6, 4, 3), dtype=np.uint8))[0] == 0.0
+
+
+@needs_numpy
+def test_the_chroma_of_a_picture_separates_colour_from_grey() -> None:
+    """The chroma measure itself: grey pixels measure zero, coloured ones do not."""
+    grey = np.full((4, 4, 3), 200, dtype=np.uint8)
+    assert chroma(grey)[0] == 0.0
+
+    mixed = grey.copy()
+    mixed[2:, 2:] = [180, 220, 60]  # the yellow-green of the screw
+    fraction, mean = chroma(mixed)
+    assert fraction == pytest.approx(0.25)
+    assert mean == pytest.approx([180.0, 220.0, 60.0])
+
+    # A dark grey shadow is still not a colour, however strong the contrast.
+    assert chroma(np.full((4, 4, 3), 20, dtype=np.uint8))[0] == 0.0
 
 
 # --- the script side --------------------------------------------------------

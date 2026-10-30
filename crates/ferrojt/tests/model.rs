@@ -260,6 +260,221 @@ fn sample(name: &str) -> ferrojt::jt::JtFile {
     ferrojt::jt::JtFile::open(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
 }
 
+/// The diffuse colours the reference dump of a sample reports, sorted. The
+/// plate files paint the plate grey and the screw yellow-green, which is the
+/// one appearance a viewer notices; the cube is a single bluish grey.
+const COLOURS: &[(&str, &[[f32; 4]])] = &[
+    (
+        "example_block_jt10.3.jt",
+        &[[0.596_063, 0.666_667, 0.686_259, 1.0]],
+    ),
+    // The 8.0/8.1 writers round the cube colour differently from 9.5/10.3.
+    ("example_block_jt8.1.jt", &[[0.6, 0.6, 0.6, 1.0]]),
+    (
+        "example_block_jt9.5.jt",
+        &[[0.596_063, 0.666_667, 0.686_259, 1.0]],
+    ),
+    (
+        "opening_protection_plate1_jt8.0.jt",
+        &[[0.6, 0.6, 0.6, 1.0], [0.8, 1.0, 0.2, 1.0]],
+    ),
+    (
+        "opening_protection_plate1_jt9.5.jt",
+        &[[0.6, 0.6, 0.6, 1.0], [0.8, 1.0, 0.2, 1.0]],
+    ),
+];
+
+/// The colours of a sample as the reference dump states them, read from the
+/// `Attribute_MaterialDiffuseColor` keys of its JSON oracle.
+fn reference_colours(name: &str) -> Vec<[f32; 4]> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("the workspace root")
+        .join("data")
+        .join("Reference")
+        .join(Path::new(name).with_extension("json"));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()));
+    // The reference dumps start with a UTF-8 byte order mark.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned();
+    let value: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|err| panic!("{name}: {err}"));
+
+    let mut found = Vec::new();
+    let mut stack = vec![&value];
+    while let Some(current) = stack.pop() {
+        match current {
+            serde_json::Value::Object(map) => {
+                for (key, item) in map {
+                    if key == "Attribute_MaterialDiffuseColor" {
+                        let numbers = item.as_array().unwrap_or_else(|| {
+                            panic!("{name}: the diffuse colour is not an array")
+                        });
+                        let colour = numbers
+                            .iter()
+                            .map(|number| number.as_f64().expect("a number") as f32)
+                            .collect::<Vec<_>>();
+                        found.push([colour[0], colour[1], colour[2], colour[3]]);
+                    }
+                    stack.push(item);
+                }
+            }
+            serde_json::Value::Array(items) => stack.extend(items),
+            _ => {}
+        }
+    }
+    found.sort_by(|a, b| {
+        a.iter()
+            .zip(b)
+            .fold(std::cmp::Ordering::Equal, |acc, (x, y)| {
+                acc.then(x.total_cmp(y))
+            })
+    });
+    found.dedup();
+    found
+}
+
+/// Compare two colours channel by channel. The reference dumps print a number
+/// with C's `%g`, i.e. six significant digits, so the decimal parsed from a dump
+/// is only within ~1e-6 of the `float` the file really stores — while the
+/// colours that must never be confused (the grey plate and the yellow-green
+/// screw, or the two ways the 8.x and 9.x writers round the cube) differ by
+/// thousandths.
+fn assert_colour(actual: &[f32], expected: &[f32], context: &str) {
+    assert_eq!(actual.len(), expected.len(), "{context}");
+    for (got, want) in actual.iter().zip(expected) {
+        assert!((got - want).abs() <= 1e-5, "{context}: {got} is not {want}");
+    }
+}
+
+#[test]
+fn the_diffuse_colour_of_a_sample_reaches_the_model() {
+    for (name, colours) in COLOURS {
+        let file = sample(name);
+        let model = file.to_model();
+
+        // The dump and the export have to agree on what the file says.
+        let wanted = reference_colours(name);
+        assert_eq!(wanted.len(), colours.len(), "{name}");
+        for (got, want) in wanted.iter().zip(colours.iter()) {
+            assert_colour(got, want, &format!("{name}: the reference dump"));
+        }
+
+        let mut got = model
+            .materials
+            .iter()
+            .map(|material| material.base_color.factor)
+            .collect::<Vec<_>>();
+        got.sort_by(|a, b| {
+            a.iter()
+                .zip(b)
+                .fold(std::cmp::Ordering::Equal, |acc, (x, y)| {
+                    acc.then(x.total_cmp(y))
+                })
+        });
+        for (index, colour) in colours.iter().enumerate() {
+            assert_colour(
+                &got[index],
+                colour,
+                &format!("{name}: the model does not carry the colours of the file"),
+            );
+        }
+
+        // A file repeats one appearance on every shape of a part, so the model
+        // holds one material per distinct colour, not one per attribute.
+        assert_eq!(
+            model.materials.len(),
+            colours.len(),
+            "{name}: a repeated material was appended instead of reused"
+        );
+
+        // Every mesh of the export has to point at one of them.
+        for mesh in &model.meshes {
+            for primitive in &mesh.primitives {
+                assert!(
+                    primitive.material.is_some(),
+                    "{name}: a mesh carries no material"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_material_of_the_export_matches_the_model() {
+    // The colour has to survive the writer as well: `baseColorFactor` is what a
+    // glTF viewer paints the mesh with.
+    for (name, colours) in COLOURS {
+        let model = sample(name).to_model();
+        let bytes = ferrojt::export::to_format(ferrojt::Format::Glb, &model)
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        let (json_len, _) =
+            ferrojt::export::parse_header(&bytes).unwrap_or_else(|err| panic!("{name}: {err}"));
+        let json: serde_json::Value = serde_json::from_slice(&bytes[20..20 + json_len])
+            .unwrap_or_else(|err| panic!("{name}: the glTF JSON is not valid: {err}"));
+
+        let materials = json["materials"].as_array().expect("materials");
+        assert_eq!(materials.len(), colours.len(), "{name}");
+        let mut got = materials
+            .iter()
+            .map(|material| {
+                material["pbrMetallicRoughness"]["baseColorFactor"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{name}: a material has no baseColorFactor"))
+                    .iter()
+                    .map(|number| number.as_f64().expect("a number") as f32)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        got.sort_by(|a, b| {
+            a.iter()
+                .zip(b)
+                .fold(std::cmp::Ordering::Equal, |acc, (x, y)| {
+                    acc.then(x.total_cmp(y))
+                })
+        });
+        for (index, colour) in colours.iter().enumerate() {
+            assert_colour(
+                &got[index],
+                colour,
+                &format!("{name}: the exported baseColorFactor is not the colour of the file"),
+            );
+        }
+
+        // The reference writer pairs the colour with a matte, double sided
+        // look; a shininess derived roughness would render the parts as
+        // mirrors and blow the colour out to white.
+        for material in materials {
+            let pbr = &material["pbrMetallicRoughness"];
+            assert_eq!(pbr["metallicFactor"], serde_json::json!(0.2), "{name}");
+            assert_eq!(pbr["roughnessFactor"], serde_json::json!(0.8), "{name}");
+            assert_eq!(material["doubleSided"], serde_json::json!(true), "{name}");
+
+            // What a metallic/roughness workflow cannot hold has to survive in
+            // `extras`, or a consumer would have to re-read the JT file.
+            let extras = &material["extras"];
+            for field in ["ambient", "specular", "shininess", "reflectivity"] {
+                assert!(
+                    extras.get(field).is_some(),
+                    "{name}: the exported material lost the JT {field}"
+                );
+            }
+        }
+
+        // And the primitives actually reference those materials.
+        for mesh in json["meshes"].as_array().expect("meshes") {
+            for primitive in mesh["primitives"].as_array().expect("primitives") {
+                let index = primitive["material"].as_u64().expect("a material index");
+                assert!(
+                    (index as usize) < materials.len(),
+                    "{name}: a primitive points outside the material table"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn the_declared_layer_filters_are_the_ones_of_the_reference_dumps() {
     for (name, declared, default) in FILTERS {

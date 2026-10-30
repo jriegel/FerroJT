@@ -449,8 +449,18 @@ fn to_material(root: &Root, mat: &crate::model::Material) -> Result<material::Ma
         alpha_cutoff: None,
         double_sided: mat.double_sided,
         extensions: None,
-        extras: None,
+        extras: raw_extras(&mat.extras),
     })
+}
+
+/// The source specific fields of a material as glTF `extras`.
+///
+/// A fixed-function format such as JT carries more of an appearance than a
+/// metallic/roughness workflow can hold — ambient and specular colour, a
+/// shininess exponent — and a consumer that can use them should not have to
+/// re-read the source file for them.
+fn raw_extras(extras: &Option<serde_json::Value>) -> Option<Box<serde_json::value::RawValue>> {
+    serde_json::value::RawValue::from_string(extras.as_ref()?.to_string()).ok()
 }
 
 fn texture_info(root: &Root, index: Option<usize>, tex_coord: u8) -> Option<texture::Info> {

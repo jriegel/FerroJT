@@ -57,6 +57,38 @@ Submodules:
 7. `Model::bounds` as the union of the root nodes.
 8. `Model::extras["layer_filter"]` naming the filter the export applied, when
    the file declares any; see below.
+9. One `Material` per distinct appearance, reached from
+   `Primitive::material`; see the materials section below.
+
+## Materials and colours
+
+A JT file stores a fixed-function colour set — ambient, diffuse, specular,
+emission, a shininess exponent and a reflectivity — on a `Part` or `Shape`
+node as attributes, and repeats the same set on every shape below that part.
+The reader maps it once per distinct set:
+
+| JT attribute | Neutral model | glTF |
+| --- | --- | --- |
+| `MaterialDiffuseColor` | `Material::base_color` | `pbrMetallicRoughness.baseColorFactor` |
+| `MaterialEmissionColor` | `Material::emissive` | `emissiveFactor` |
+| — | `metallic` = `0.2` | `pbrMetallicRoughness.metallicFactor` |
+| — | `roughness` = `0.8` | `pbrMetallicRoughness.roughnessFactor` |
+| — | `double_sided` = `true` | `doubleSided` |
+| `MaterialAmbientColor`, `MaterialSpecularColor`, `MaterialShininess`, `MaterialReflectivity` | `Material::extras` | `extras` of the material |
+
+The two fixed factors are what the reference glTF writer of `example/` uses
+(`ToolsLib/src/JtGltfMesh.cpp`), and they matter: JT has no metallic/roughness
+workflow, and the samples all carry a shininess exponent of 128. Feeding such
+an exponent to glTF as a roughness makes every part a near mirror, and under
+the default lighting of a viewer the colour blows out to white — which looks
+exactly like a colour that was never exported. The exponent is therefore kept
+in `extras` for a consumer that can use it, and the geometry is double sided
+because a JT part is not guaranteed to have consistent winding.
+
+`Model::add_material` stores one entry per distinct material, so the plate
+samples export two materials even though they repeat the colour attribute
+twelve times; the reference writer appends one per mesh instead, which is a
+harmless deviation — the same appearance, fewer entries.
 
 ## Layer filters
 
@@ -113,8 +145,10 @@ change.
   `Partition`.
 * `crates/ferrojt/tests/model.rs` — a converted model holds one mesh per range
   LOD, tagged `lod_level: Some(0)`, keeps every node of the graph, keeps the
-  subtree of every `Instance` and lets two instances share one, and applies the
-  layer filters the samples declare without losing a part of them.
+  subtree of every `Instance` and lets two instances share one, applies the
+  layer filters the samples declare without losing a part of them, and carries
+  the diffuse colours of the file — both in the model and in the exported
+  glTF — as one material per distinct colour.
 * `crates/ferrojt/tests/dump.rs` — every sample with a reference dump under
   `data/Reference` matches it semantically, and every dump is valid JSON.
 * Unit tests in `jt/decode` compare the codecs against the reference output byte

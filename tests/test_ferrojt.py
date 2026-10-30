@@ -8,6 +8,7 @@ Python layer is checked against the very same oracle.
 from __future__ import annotations
 
 import json
+import struct
 from pathlib import Path
 
 import pytest
@@ -220,6 +221,86 @@ def test_jt_file_model_is_exportable(tmp_path) -> None:
     # USD export is a planned feature, not a implemented one.
     with pytest.raises(NotImplementedError):
         model.save(str(tmp_path / "model.usda"))
+
+
+#: The diffuse colours a sample paints its parts with, sorted, as its
+#: reference dump states them. The plate files are the revealing ones: a grey
+#: plate and a yellow-green screw, which is the appearance a viewer shows. The
+#: 8.x writers round the cube colour differently from the 9.x ones.
+COLOURS = {
+    "example_block_jt10.3.jt": [[0.596063, 0.666667, 0.686259, 1.0]],
+    "example_block_jt8.1.jt": [[0.6, 0.6, 0.6, 1.0]],
+    "example_block_jt9.5.jt": [[0.596063, 0.666667, 0.686259, 1.0]],
+    "opening_protection_plate1_jt8.0.jt": [
+        [0.6, 0.6, 0.6, 1.0],
+        [0.8, 1.0, 0.2, 1.0],
+    ],
+    "opening_protection_plate1_jt9.5.jt": [
+        [0.6, 0.6, 0.6, 1.0],
+        [0.8, 1.0, 0.2, 1.0],
+    ],
+}
+
+
+def colour_ids() -> list[str]:
+    return [name for name in COLOURS if (SAMPLES / name).is_file()]
+
+
+def glb_json(data: bytes) -> dict:
+    """Return the JSON document of a GLB blob.
+
+    A GLB is a 12 byte header, then a chunk whose 4 byte length comes before
+    its type, so the JSON itself starts at offset 20.
+    """
+    assert data[:4] == b"glTF", "not a GLB"
+    (json_length,) = struct.unpack_from("<I", data, 12)
+    return json.loads(data[20 : 20 + json_length])
+
+
+@needs_sample
+@pytest.mark.parametrize("name", colour_ids(), ids=colour_ids())
+def test_the_colour_of_a_sample_reaches_the_gltf(name: str) -> None:
+    """The colour of a JT part has to arrive as ``baseColorFactor``.
+
+    ``Model.to_json()`` only reports counts, so the exported document is
+    parsed to see the materials themselves.
+    """
+    model = ferrojt.read(str(SAMPLES / name))
+    document = glb_json(model.to_bytes("glb"))
+
+    materials = document["materials"]
+    # A file repeats one appearance on every shape of a part, so the export
+    # holds one material per distinct colour, not one per attribute.
+    assert len(materials) == len(COLOURS[name]), f"{name}: materials were duplicated"
+
+    got = sorted(
+        material["pbrMetallicRoughness"]["baseColorFactor"] for material in materials
+    )
+    for colour, want in zip(got, sorted(COLOURS[name])):
+        # The reference dumps print six significant digits, so compare loosely.
+        assert all(abs(a - b) < 1e-5 for a, b in zip(colour, want)), name
+
+    # The reference glTF writer pairs the colour with a matte, double sided
+    # look. A roughness derived from the shininess exponent of a JT file would
+    # make every part a mirror and blow the colour out to white.
+    for material in materials:
+        pbr = material["pbrMetallicRoughness"]
+        assert pbr["metallicFactor"] == 0.2
+        assert pbr["roughnessFactor"] == 0.8
+        assert material["doubleSided"] is True
+        # What a metallic/roughness workflow cannot express survives in
+        # ``extras``, so a consumer does not have to re-read the JT file.
+        assert set(material["extras"]) >= {
+            "ambient",
+            "specular",
+            "shininess",
+            "reflectivity",
+        }, name
+
+    # And every mesh has to point at one of those materials.
+    for mesh in document["meshes"]:
+        for primitive in mesh["primitives"]:
+            assert primitive["material"] < len(materials), name
 
 
 #: The layer filters each sample declares, and the one an export uses by

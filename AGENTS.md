@@ -47,7 +47,7 @@ without it):
 ```
 
 Interactive viewer (also needs `open3d`; it is a tool, not a test — nothing in it
-is named `test_*`, so pytest still collects 43 tests):
+is named `test_*`, so pytest still collects 51 tests):
 
 ```powershell
 .\.venv\Scripts\python.exe tests\test_viewer.py data\ExampleFiles\example_block_jt9.5.jt
@@ -112,6 +112,26 @@ Upload with `python -m twine upload dist\*`.
   `s = 0.5 / sqrt(trace + 1)`, `w = 0.25 / s` (the `0.5 / s` version gave `w = 2`
   for the identity). glTF normalises, so the bug only shows as a scaled mesh when
   the model is consumed directly.
+- **JT colours *are* exported — `test_visual.py` forces flat grey on purpose.**
+  A "the colour is missing" report is almost always the viewer or the grey
+  oracle, not the writer. The mapping is `diffuse → baseColorFactor`,
+  `emission → emissiveFactor`, and the fixed `metallic 0.2` / `roughness 0.8` /
+  `doubleSided true` of `JtGltfMesh.cpp:531-545`. Do **not** derive roughness
+  from the JT shininess exponent: the samples all carry 128, which as a glTF
+  roughness is a near mirror and blows the colour out to white (that was the
+  original bug). Ambient/specular/shininess/reflectivity go to the glTF material
+  `extras` (`gltf::raw_extras`). `Model::add_material` dedups, so plate1 exports
+  2 materials although the attribute repeats 9–12 times. Colour proof:
+  `tests/model.rs` pins the colours against the reference dumps, and
+  `test_visual.py` renders plate1-9.5 with its own materials and requires
+  chroma > 40 on > 0.3 % of the pixels (measured 0.96 %; the grey render is
+  0.00 %) — the PNG references cannot show colour at all.
+- **Open3D blank frames are not limited to the first one.** `render_to_image()`
+  also returns an all-zero frame at random positions after `clear_geometry()`
+  (seen on the first sample and again mid-run). `test_visual.py::shoot` renders
+  up to `MAX_FRAMES` and keeps the first frame whose max channel is > 0; a
+  single discard is not enough and the failure looks like "similarity 0.129,
+  100% of the pixels differ".
 - **Layer filters gate `Node::Part` only.** The filters live in the
   `LAYERFILTERnnn::` key/value streams of a `MetaData` node, the tags in the
   `LAYER::` stream of a `Part`; both are read from the concatenated

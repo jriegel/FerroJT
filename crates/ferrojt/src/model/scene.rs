@@ -176,6 +176,22 @@ impl Model {
         self.materials.len() - 1
     }
 
+    /// Return the index of `material`, appending it unless an identical
+    /// material is already in the model.
+    ///
+    /// A source format repeats one appearance across many shapes; keeping a
+    /// single entry per distinct material is what a glTF consumer expects.
+    pub fn add_material(&mut self, material: Material) -> usize {
+        if let Some(index) = self
+            .materials
+            .iter()
+            .position(|existing| *existing == material)
+        {
+            return index;
+        }
+        self.push_material(material)
+    }
+
     /// Total number of triangles across all meshes, when index counts are known.
     pub fn triangle_count(&self) -> usize {
         self.meshes

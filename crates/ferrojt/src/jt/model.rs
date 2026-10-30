@@ -961,6 +961,10 @@ fn transform_of(graph: &SceneGraph, node: &Node) -> Transform {
 }
 
 /// The material described by a node's material attribute, appended on demand.
+///
+/// A file repeats the same colour set on every shape of a part, so an
+/// identical material is reused rather than appended again: the plate samples
+/// carry the attribute nine or twelve times but describe only two materials.
 fn material_of(graph: &SceneGraph, model: &mut Model, node: &Node) -> Option<usize> {
     let source = graph
         .attributes_of(node)
@@ -969,18 +973,24 @@ fn material_of(graph: &SceneGraph, model: &mut Model, node: &Node) -> Option<usi
             Attribute::Material(attribute) => Some(attribute.clone()),
             _ => None,
         })?;
-    Some(model.push_material(to_material(&source)))
+    Some(model.add_material(to_material(&source)))
 }
 
 /// Translate a JT material attribute into a [`PbrMaterial`].
 ///
 /// JT stores a fixed-function colour set rather than a metallic/roughness
-/// workflow, so shininess is mapped onto roughness inversely.
+/// workflow, so only the diffuse and emissive colours carry over directly. The
+/// reference glTF writer pairs them with a fixed metal-free plastic look and
+/// double sided geometry, which is what a CAD viewer expects; the shininess it
+/// cannot express is kept in [`extras`](PbrMaterial::extras) for a consumer
+/// that wants it.
 fn to_material(source: &Material) -> PbrMaterial {
     PbrMaterial {
         base_color: Channel::constant(source.diffuse),
+        metallic: Channel::constant([METALLIC_FACTOR; 4]),
+        roughness: Channel::constant([ROUGHNESS_FACTOR; 4]),
         emissive: Channel::constant(source.emission),
-        roughness: Channel::constant([roughness_of(source.shininess); 4]),
+        double_sided: true,
         extras: Some(json!({
             "ambient": source.ambient,
             "specular": source.specular,
@@ -991,11 +1001,16 @@ fn to_material(source: &Material) -> PbrMaterial {
     }
 }
 
-/// Map a shininess exponent onto a roughness factor.
-fn roughness_of(shininess: f32) -> f32 {
-    let roughness = 1.0 - (shininess / (shininess + 1.0)).sqrt();
-    roughness.clamp(0.0, 1.0)
-}
+/// Metallic factor of a JT material, as in the reference glTF writer.
+const METALLIC_FACTOR: f32 = 0.2;
+
+/// Roughness factor of a JT material, as in the reference glTF writer.
+///
+/// The shininess exponent of a JT file cannot be mapped onto roughness
+/// directly: the samples all carry a highlight exponent of 128, which as a
+/// glTF roughness would be a near mirror and blows the colour out to white
+/// under the default lighting of a viewer.
+const ROUGHNESS_FACTOR: f32 = 0.8;
 
 /// Split a row-major 4x4 matrix into translation, rotation and scale.
 fn decompose(matrix: &[f64; 16]) -> Transform {
