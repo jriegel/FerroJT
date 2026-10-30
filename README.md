@@ -164,6 +164,13 @@ passes when at least `0.995` of the possible colour difference is left unused
 than `8` (`FERROJT_VISUAL_EPS`). A failure writes a three panel picture — render,
 reference, amplified difference — to `tests/_visual_out/`.
 
+Six samples are covered: the three `example_block` versions, the two
+`opening_protection_plate1` ones and `SampleJT_Server.jt`. Two Open3D offscreen
+quirks are worked around in the test: a frame can come back blank, so the render is
+retried until it contains the background, and screen-space ambient occlusion makes
+the colour pass return an all-zero frame for the ~1M-triangle server mesh, so it is
+switched off — invisibly, measured on the smaller samples.
+
 ### Interactive viewer
 
 `tests/test_viewer.py` opens an Open3D window and shows a JT file, so the export can

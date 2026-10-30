@@ -164,9 +164,10 @@ change.
   a part on a layer its filter rejects or a representation without vertices.
 * `tests/test_ferrojt.py` — the same reference dumps through the python bindings.
 * `tests/test_visual.py` — the export of every sample — the three
-  `example_block` versions and the two `opening_protection_plate1` ones — is
-  rendered offscreen and compared with a reference picture in `data/Reference`,
-  so a regression in the geometry shows as a picture rather than only as a count.
+  `example_block` versions, the two `opening_protection_plate1` ones and
+  `SampleJT_Server.jt` — is rendered offscreen and compared with a reference
+  picture in `data/Reference`, so a regression in the geometry shows as a
+  picture rather than only as a count.
   See [../README.md](../README.md), "Visual regression".
 * `tests/test_viewer.py` is not a test but a tool: an Open3D window that loads a
   JT file through drag and drop or `File ▸ Open` and shows it with a fly camera.

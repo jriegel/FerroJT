@@ -47,7 +47,7 @@ without it):
 ```
 
 Interactive viewer (also needs `open3d`; it is a tool, not a test — nothing in it
-is named `test_*`, so pytest still collects 52 tests):
+is named `test_*`, so pytest still collects 53 tests):
 
 ```powershell
 .\.venv\Scripts\python.exe tests\test_viewer.py data\ExampleFiles\example_block_jt9.5.jt
@@ -132,6 +132,22 @@ Upload with `python -m twine upload dist\*`.
   up to `MAX_FRAMES` and keeps the first frame whose max channel is > 0; a
   single discard is not enough and the failure looks like "similarity 0.129,
   100% of the pixels differ".
+- **Screen-space ambient occlusion blanks the colour pass for the server mesh.**
+  `SampleJT_Server.jt` (~1.02 M triangles merged, 20 meshes via
+  `read_triangle_model`) renders as an all-zero 640×480 frame in roughly 5 of 6
+  fresh processes — `shoot` never gets a frame, and the failure again looks like
+  "100% of the pixels differ". Nothing is wrong with the geometry: `render_to_
+  depth_image(z_in_view_space=True)` returns ~18 760 finite pixels while the
+  colour pass is zero, so the mesh rasterises. `render.scene.view.
+  set_ambient_occlusion(False)` fixes it (8/8, 8/8, 7/8, 8/8 in four fresh
+  processes, good frame always at index 2); the other view knobs do not —
+  `set_antialiasing(False)`, `set_sample_count(1)`, `set_shadowing(False)` are
+  0/6, `set_post_processing(False)` 1/6. It is picture-neutral: AO on vs off
+  scores 0.99809 on every sample with ≤ 0.001 % of the pixels changed, which is
+  the noise floor of the comparison itself, so the five older references still
+  pass unchanged. Not NaNs (0), not degenerate triangles, not the camera, not
+  the lighting profile, not pacing; splitting the mesh into 2/4/8/16 geometries
+  or decimating is worse, and vertex clustering changes the picture.
 - **Layer filters gate `Node::Part` only.** The filters live in the
   `LAYERFILTERnnn::` key/value streams of a `MetaData` node, the tags in the
   `LAYER::` stream of a `Part`; both are read from the concatenated
@@ -192,10 +208,15 @@ Upload with `python -m twine upload dist\*`.
   `scene.clear_geometry()` between samples. Without `scene.set_background()` **and**
   `scene.set_lighting()` the picture is all zeros. API names:
   `MaterialRecord.base_color` (not `.color`), `scene.add_geometry(name, mesh,
-  material)` (not `.add`), `TriangleMesh` has no `.materials`. Comparison is
+  material)` (not `.add`), `TriangleMesh` has no `.materials`; the post-processing
+  knobs are on `scene.view` (`set_ambient_occlusion`, `set_antialiasing(enabled,
+  temporal)`, `set_post_processing`, `set_sample_count`, `set_shadowing`) and
+  `Open3DScene` has no `get_post_process_setting`; `TriangleMesh` has
+  `merge_close_vertices(eps)`, not `merge_vertices`. Comparison is
   `1 - mean|Δ|/255` with `FERROJT_VISUAL_THRESHOLD` (0.995) / `FERROJT_VISUAL_EPS`
   (8); references are `data/Reference/<stem>.png`, diffs go to the gitignored
-  `tests/_visual_out/`.
+  `tests/_visual_out/`. Six samples are covered — the three `example_block`, the
+  two `opening_protection_plate1` and `SampleJT_Server.jt`.
 - Cosmetic, ignorable: the MSVC linker note (`Bibliothek "..._ferrojt.dll.lib" …`)
   surfaces as `warning: linker stdout` for `ferrojt-python`.
 - **Open3D GUI (`tests/test_viewer.py`)**: there is no `gui.O3DVisualizer` — build a

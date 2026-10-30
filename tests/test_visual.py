@@ -19,6 +19,10 @@ Two Open3D quirks shape :func:`render_sample`: a frame of an
 occasionally a later one after the scene changed — so :func:`shoot` renders
 until it gets a frame that contains the background, and creating a renderer per
 picture is both slow and unstable, so the whole process shares a single one.
+A third is the reason :func:`get_renderer` switches ambient occlusion off: with
+screen-space AO enabled, the colour pass of the ~1M-triangle server mesh comes
+back all zero on some GPUs — the depth pass still contains the geometry, so
+nothing failed to rasterise — and the picture is unreliably blank.
 
 Run it as a script to (re)create the references or to inspect a mismatch::
 
@@ -56,14 +60,17 @@ REFERENCES = DATA / "Reference"
 DIFF_DIR = Path(__file__).resolve().parent / "_visual_out"
 
 #: The samples to render: the three versions of the same cube, one per JT
-#: generation, and the two versions of an assembly that instantiates one screw
-#: twice — the instances have to show up as two copies of that screw.
+#: generation, the two versions of an assembly that instantiates one screw
+#: twice — the instances have to show up as two copies of that screw — and the
+#: large server assembly, which has no reference dump at all and is the one
+#: sample whose file declares representations without vertices.
 MODELS = [
     "example_block_jt8.1.jt",
     "example_block_jt9.5.jt",
     "example_block_jt10.3.jt",
     "opening_protection_plate1_jt8.0.jt",
     "opening_protection_plate1_jt9.5.jt",
+    "SampleJT_Server.jt",
 ]
 
 # --- the fixed picture ------------------------------------------------------
@@ -166,6 +173,15 @@ def get_renderer() -> "o3d.visualization.rendering.OffscreenRenderer":
         _render.scene.set_background(BACKGROUND)
         # A headlight: no scene lights, so no shadow placement to disagree about.
         _render.scene.set_lighting(_render.scene.LightingProfile.NO_SHADOWS, [0.0, 0.0, 0.0])
+        # Screen-space ambient occlusion is a post-process of the colour pass, and
+        # for the ~1M-triangle server mesh it makes that pass return an all-zero
+        # frame: the depth pass still holds the geometry, so the mesh rasterises
+        # fine and only the picture is blank. Turning it off makes that sample
+        # render every time, and it is invisible in the pictures — measured on the
+        # five smaller samples, AO on and off differ by less than 0.2% of the
+        # scale on at most 0.001% of the pixels, which is the noise of the
+        # comparison itself.
+        _render.scene.view.set_ambient_occlusion(False)
     return _render
 
 
