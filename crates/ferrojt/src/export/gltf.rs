@@ -328,6 +328,10 @@ fn to_primitive(
         attributes.insert(Checked::Valid(semantic), index);
     }
     if !attributes.contains_key(&Checked::Valid(mesh::Semantic::Positions)) {
+        // glTF 3.2 requires POSITION in every primitive. A JT file can declare
+        // a representation with no vertices — `SampleJT_Server.jt` holds 36 of
+        // them — and the reader leaves those out, so this only ever fires for a
+        // model built by hand.
         return Err(Error::Unsupported(
             "a primitive without a POSITION attribute cannot be exported to glTF".into(),
         ));

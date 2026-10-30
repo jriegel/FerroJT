@@ -399,3 +399,34 @@ def test_a_file_without_layer_information_has_no_default_filter() -> None:
     assert jt.layer_filters() == []
     assert jt.active_layer_filter() is None
     assert jt.model().triangle_count == jt.model(all_layers=True).triangle_count
+
+
+#: The one sample without a reference dump. It is also the only one whose file
+#: declares representations with no vertices at all — 36 of them.
+SERVER = SAMPLES / "SampleJT_Server.jt"
+
+needs_server = pytest.mark.skipif(
+    not SERVER.is_file(), reason="the server sample is not checked out"
+)
+
+
+@needs_server
+def test_shapes_without_vertices_are_left_out_of_the_export() -> None:
+    """A representation that declares no vertices keeps its node, not a mesh.
+
+    glTF requires a ``POSITION`` attribute in every primitive, so such a shape
+    used to abort the whole document with "a primitive without a POSITION
+    attribute cannot be exported to glTF".
+    """
+    model = ferrojt.read(str(SERVER))
+    assert model.node_count == 2158
+    assert model.mesh_count == 105
+    assert model.triangle_count == 124154
+
+    document = glb_json(model.to_bytes("glb"))
+    assert len(document["nodes"]) == model.node_count
+    assert len(document["meshes"]) == model.mesh_count
+    for mesh in document["meshes"]:
+        for primitive in mesh["primitives"]:
+            assert "POSITION" in primitive["attributes"], "a primitive has no POSITION"
+            assert primitive["attributes"]["POSITION"] is not None

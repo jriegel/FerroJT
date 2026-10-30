@@ -47,7 +47,7 @@ without it):
 ```
 
 Interactive viewer (also needs `open3d`; it is a tool, not a test — nothing in it
-is named `test_*`, so pytest still collects 51 tests):
+is named `test_*`, so pytest still collects 52 tests):
 
 ```powershell
 .\.venv\Scripts\python.exe tests\test_viewer.py data\ExampleFiles\example_block_jt9.5.jt
@@ -150,6 +150,20 @@ Upload with `python -m twine upload dist\*`.
   re-exported from `ferrojt::jt`. `jt::dump` stays unfiltered. No sample loses a
   part to its own filter, so the pinned counts above are unchanged — a drop can
   only be shown with a forced filter or the synthetic fixture in `jt/model.rs`.
+- **`SampleJT_Server.jt` declares 36 empty representations** (of 850): the dump
+  says `NumIndices/NumVertices/NumNormals: 0`, so nothing failed to decode — the
+  file simply has shapes with no vertices. `push_mesh` skips an empty channel, so
+  such a shape yields a `Primitive` with **no attributes at all**, and
+  `export/gltf.rs::to_primitive` refuses the whole document ("a primitive without
+  a POSITION attribute cannot be exported to glTF") because glTF mandates
+  POSITION. The reader drops the representation in `build_node` (`geometry.vertices
+  .is_empty()` → `continue`): the node stays, no mesh is made — same policy as the
+  layer filters and the coarse LOD tiers. `JtGltfMesh.cpp` instead appends
+  zero-length accessors; deliberate deviation. Counts for that sample: nodes 2158,
+  **meshes 105** (was 106), materials 23, triangles 124154 — pinned in
+  `tests/model.rs` and `tests/test_ferrojt.py`. None of the five reference samples
+  has an empty representation, which is why no test caught it. Keep the POSITION
+  check in the writer: it is the guard for hand-built models.
 - `pyo3` 0.30 cannot express a tri-state keyword: nested
   `Option<Option<&str>>` is ambiguous (`SomeWrap<T>` matches both `T` and
   `Option<T>`, E0283). Model it as two parameters — the Python API is

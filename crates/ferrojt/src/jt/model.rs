@@ -862,6 +862,17 @@ fn build_node(
         let level = lod.level();
         for load in node.late_loads() {
             if let Some(geometry) = graph.geometry_for(load) {
+                if geometry.vertices.is_empty() {
+                    // A file may declare a representation with no vertices at
+                    // all — `SampleJT_Server.jt` does for 36 of its shapes. The
+                    // node stays, there is simply nothing to draw, and a
+                    // primitive without positions is not expressible in glTF.
+                    tracing::debug!(
+                        node = node.name(),
+                        "a representation declares no vertices and is left out"
+                    );
+                    continue;
+                }
                 let mesh = push_mesh(model, geometry, material, name.clone(), level);
                 out.instances.push(model::Instance {
                     mesh,
@@ -1448,5 +1459,27 @@ mod tests {
             0.0, 0.0, 0.0, 1.0,
         ];
         assert_eq!(decompose(&identity).rotation, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn a_representation_without_vertices_keeps_its_node_but_has_no_mesh() {
+        // `SampleJT_Server.jt` declares shapes that carry no vertices at all.
+        // Such a representation cannot become a glTF primitive — that format
+        // needs a POSITION attribute in every one — so it is left out while the
+        // node that holds it stays where the scene graph put it.
+        let mut file = fixture(None, None);
+        for loaded in &mut file.lsg.as_mut().unwrap().loaded {
+            if loaded.property_id == 14 {
+                loaded.element = Element::ShapeLodVertex(ShapeLodVertex::default());
+            }
+        }
+
+        let model = file.to_model();
+        assert_eq!(model.meshes.len(), 1);
+        assert_eq!(model.meshes[0].name.as_deref(), Some("tagged.part"));
+
+        let plain = node_index(&model, "plain.part");
+        assert!(model.nodes[plain].instances.is_empty());
+        assert_eq!(model.nodes[plain].kind.as_deref(), Some("Part"));
     }
 }

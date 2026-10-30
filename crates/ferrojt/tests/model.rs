@@ -113,6 +113,85 @@ fn only_the_finest_level_of_detail_is_exported() {
 }
 
 #[test]
+fn every_sample_exports_to_gltf() {
+    // glTF requires a POSITION attribute in every primitive, so a
+    // representation that declares no vertices at all must never reach the
+    // writer. `SampleJT_Server.jt` carries 36 such shapes and used to abort the
+    // whole document with "a primitive without a POSITION attribute".
+    for path in samples() {
+        let name = path
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        let file = ferrojt::jt::JtFile::open(&path)
+            .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        let model = file.to_model();
+
+        for mesh in &model.meshes {
+            assert!(
+                !mesh.primitives.is_empty(),
+                "{name}: the mesh {:?} holds no primitive",
+                mesh.name
+            );
+            for primitive in &mesh.primitives {
+                let positions = primitive
+                    .attributes
+                    .iter()
+                    .map(|handle| &model.accessors.attributes[*handle])
+                    .find(|attribute| attribute.name == "POSITION");
+                let positions = positions.unwrap_or_else(|| {
+                    panic!("{name}: the mesh {:?} has no POSITION attribute", mesh.name)
+                });
+                assert!(
+                    positions.count > 0,
+                    "{name}: the mesh {:?} has an empty POSITION attribute",
+                    mesh.name
+                );
+            }
+        }
+
+        ferrojt::export::to_format(ferrojt::Format::Glb, &model)
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+    }
+}
+
+#[test]
+fn a_sample_with_empty_representations_still_exports_its_graph() {
+    // `SampleJT_Server.jt` is the odd one out of the samples: it has no
+    // reference dump, its shapes are mostly empty, and it is the file that
+    // showed the POSITION failure. Its counts are pinned so that a change in
+    // how empty representations are handled becomes visible.
+    let file = sample("SampleJT_Server.jt");
+    let model = file.to_model();
+
+    assert_eq!(model.nodes.len(), 2_158, "nodes");
+    assert_eq!(model.meshes.len(), 105, "meshes");
+    assert_eq!(model.materials.len(), 23, "materials");
+    assert_eq!(model.triangle_count(), 124_154, "triangles");
+
+    // The empty shapes keep their node — dropping geometry never drops a node —
+    // so there are more shape nodes than there are meshes.
+    let shapes = model
+        .nodes
+        .iter()
+        .filter(|node| node.kind.as_deref() == Some("Shape"))
+        .count();
+    assert!(
+        shapes > model.meshes.len(),
+        "the empty shapes vanished instead of keeping their node: {shapes} shape \
+         nodes for {} meshes",
+        model.meshes.len()
+    );
+    let drawn = model
+        .nodes
+        .iter()
+        .filter(|node| !node.instances.is_empty())
+        .count();
+    assert_eq!(drawn, model.meshes.len(), "a mesh lost its node");
+}
+
+#[test]
 fn every_node_of_the_scene_graph_survives() {
     // Dropping a tier must not drop the node that holds it: the graph keeps
     // its shape so that viewers can still switch levels of detail themselves.

@@ -36,7 +36,12 @@ Submodules:
    `children` in file order.
 3. Geometry appended to `Model::accessors` as `BufferBlock` bytes plus one
    `Attribute` per channel, named `POSITION` and `NORMAL`.
-   `Primitive::attributes` holds the returned handles.
+   `Primitive::attributes` holds the returned handles. A representation that
+   declares no vertices at all contributes no mesh: glTF needs a `POSITION`
+   attribute in every primitive, so there is nothing to write. The node that
+   holds it is kept, exactly as for a filtered part or a coarse tier — the graph
+   keeps its shape, only the drawing is skipped. `SampleJT_Server.jt` declares
+   36 such empty shapes out of 850 representations.
 4. Only the finest level of detail of a range LOD. A `RangeLOD` lists its
    children from the finest tier down and JT does not store that tier, so it is
    counted while walking: the first group below a `RangeLOD` is tier 0, the next
@@ -146,15 +151,17 @@ change.
 * `crates/ferrojt/tests/model.rs` — a converted model holds one mesh per range
   LOD, tagged `lod_level: Some(0)`, keeps every node of the graph, keeps the
   subtree of every `Instance` and lets two instances share one, applies the
-  layer filters the samples declare without losing a part of them, and carries
-  the diffuse colours of the file — both in the model and in the exported
-  glTF — as one material per distinct colour.
+  layer filters the samples declare without losing a part of them, carries the
+  diffuse colours of the file — both in the model and in the exported glTF — as
+  one material per distinct colour, and exports to glTF for every sample: each
+  primitive of each one has a non-empty `POSITION` attribute, which is what
+  `SampleJT_Server.jt` and its 36 empty representations used to break.
 * `crates/ferrojt/tests/dump.rs` — every sample with a reference dump under
   `data/Reference` matches it semantically, and every dump is valid JSON.
 * Unit tests in `jt/decode` compare the codecs against the reference output byte
   for byte.
 * Unit tests in `jt/model` build a synthetic scene graph, because no sample has
-  a part on a layer its filter rejects.
+  a part on a layer its filter rejects or a representation without vertices.
 * `tests/test_ferrojt.py` — the same reference dumps through the python bindings.
 * `tests/test_visual.py` — the export of every sample — the three
   `example_block` versions and the two `opening_protection_plate1` ones — is
