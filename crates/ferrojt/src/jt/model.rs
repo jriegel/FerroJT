@@ -1023,9 +1023,15 @@ const METALLIC_FACTOR: f32 = 0.2;
 /// under the default lighting of a viewer.
 const ROUGHNESS_FACTOR: f32 = 0.8;
 
-/// Split a row-major 4x4 matrix into translation, rotation and scale.
+/// Split a column-major 4x4 matrix into translation, rotation and scale.
+///
+/// JT stores the matrix **column major**: the translation lives in the last
+/// *column*, at flat indices 12..14, and the element of row `r`, column `c`
+/// is at `matrix[4 * c + r]`. Reading the array row major instead yields the
+/// transpose, i.e. the inverse rotation — which is why positions still look
+/// right while every rotated part spins the wrong way.
 fn decompose(matrix: &[f64; 16]) -> Transform {
-    let column = |axis: usize| [matrix[axis], matrix[4 + axis], matrix[8 + axis]];
+    let column = |axis: usize| [matrix[4 * axis], matrix[4 * axis + 1], matrix[4 * axis + 2]];
     let length = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
 
     let scales = [length(column(0)), length(column(1)), length(column(2))];
@@ -1432,11 +1438,13 @@ mod tests {
 
     #[test]
     fn a_transform_attribute_yields_a_unit_quaternion() {
-        // A quarter turn about Z: the quaternion has to be normalised, or the
-        // glTF writer scales the geometry it rotates.
+        // A quarter turn about Z, stored column major: the first three groups of
+        // four are the matrix *columns*, and the translation is the last column.
+        // The quaternion has to be normalised, or the glTF writer scales the
+        // geometry it rotates.
         let matrix = [
-            0.0, -1.0, 0.0, 0.0, //
-            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            -1.0, 0.0, 0.0, 0.0, //
             0.0, 0.0, 1.0, 0.0, //
             4.0, 5.0, 6.0, 1.0,
         ];
@@ -1459,6 +1467,87 @@ mod tests {
             0.0, 0.0, 0.0, 1.0,
         ];
         assert_eq!(decompose(&identity).rotation, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn a_column_major_matrix_is_not_read_as_its_transpose() {
+        // A quarter turn about X is asymmetric, so it tells a matrix apart from
+        // its transpose — the symmetric cases above cannot. Reading JT's flat
+        // array row major would return the inverse rotation here and every
+        // rotated part in `SampleJT_Server.jt` spins the wrong way.
+        //
+        // R = rot_x(90) = [[1,0,0],[0,0,-1],[0,1,0]] stored as its columns.
+        let matrix = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, -1.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let transform = decompose(&matrix);
+        let [x, y, z, w] = transform.rotation;
+        let half_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+        let flipped = -half_sqrt2;
+        assert!(
+            (x - half_sqrt2).abs() < 1e-6,
+            "wrong sine about X: {x} (a transposed read gives {flipped})"
+        );
+        assert!((w - half_sqrt2).abs() < 1e-6, "wrong cosine: {w}");
+        assert!(y.abs() < 1e-6 && z.abs() < 1e-6, "off axis: {y} {z}");
+
+        // The screw placement of `opening_protection_plate1_jt9.5.json` verbatim:
+        // an unrotated instance moved to y = -25. The translation is the last
+        // column, so this also pins the offset the transpose bug leaves intact.
+        let screw = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, -25.0, 15.0, 1.0,
+        ];
+        let transform = decompose(&screw);
+        assert_eq!(transform.translation, [0.0, -25.0, 15.0]);
+        assert_eq!(transform.rotation, [0.0, 0.0, 0.0, 1.0]);
+
+        // A quarter turn about Y, again asymmetric: the columns are the images
+        // of the axes, so the first column is +X rotated into +Z.
+        let turned = [
+            0.0, 0.0, -1.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let transform = decompose(&turned);
+        let [x, y, z, w] = transform.rotation;
+        assert!(x.abs() < 1e-6 && z.abs() < 1e-6, "off axis: {x} {z}");
+        assert!((y - half_sqrt2).abs() < 1e-6, "wrong sine about Y: {y}");
+        assert!((w - half_sqrt2).abs() < 1e-6, "wrong cosine: {w}");
+    }
+
+    #[test]
+    fn a_scaled_transform_scales_its_columns_not_its_rows() {
+        // The inch-to-millimetre assemblies of `SampleJT_Server.jt` combine a
+        // uniform scale with a rotation; the scale has to come off the column
+        // lengths so the rotation stays orthogonal.
+        let scale = 1.0 / 25.4;
+        let matrix = [
+            0.0, scale, 0.0, 0.0, //
+            -scale, 0.0, 0.0, 0.0, //
+            0.0, 0.0, scale, 0.0, //
+            1.0, 2.0, 3.0, 1.0,
+        ];
+        let transform = decompose(&matrix);
+        for axis in 0..3 {
+            assert!(
+                (transform.scale[axis] - scale as f32).abs() < 1e-6,
+                "wrong scale: {:?}",
+                transform.scale
+            );
+        }
+        assert_eq!(transform.translation, [1.0, 2.0, 3.0]);
+        let [x, y, z, w] = transform.rotation;
+        let half_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((z - half_sqrt2).abs() < 1e-6, "wrong sine: {z}");
+        assert!((w - half_sqrt2).abs() < 1e-6, "wrong cosine: {w}");
+        assert!(x.abs() < 1e-6 && y.abs() < 1e-6, "off axis: {x} {y}");
     }
 
     #[test]

@@ -667,7 +667,10 @@ fn read_attribute_base(cursor: &mut Cursor<'_>) -> Result<u32> {
 pub struct GeometricTransform {
     /// Version of the attribute.
     pub version: u32,
-    /// Row-major matrix; unset slots hold the identity.
+    /// Column-major matrix; unset slots hold the identity.
+    ///
+    /// The element of row `r`, column `c` is at index `4 * c + r`, so the
+    /// translation is the last column, at indices 12..14.
     pub matrix: [f64; 16],
 }
 

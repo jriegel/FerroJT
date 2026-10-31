@@ -119,6 +119,28 @@ Upload with `python -m twine upload dist\*`.
   `s = 0.5 / sqrt(trace + 1)`, `w = 0.25 / s` (the `0.5 / s` version gave `w = 2`
   for the identity). glTF normalises, so the bug only shows as a scaled mesh when
   the model is consumed directly.
+- **A JT transform matrix is column major.** `GeometricTransform::matrix` is flat
+  column major: element (row, col) is `matrix[4 * col + row]`, the translation is
+  the last **column** at 12..14, and the scale is the length of each **column**.
+  `jt/model.rs::decompose` walked it row major, which returns `Rᵀ` — the inverse
+  rotation. Translation is identical under both readings, so positions looked
+  right and only rotated parts were mis-oriented: `SampleJT_Server.jt` showed the
+  captive screws / knobs / casters spun the wrong way in both `test_viewer.py`
+  (via glTF) and `ferrojt-viewer` (via `Model`), which is why the fix is in the
+  library, not the viewer. Citations: `JtAttribute_GeometricTransform.hxx:35`
+  (`Eigen::Map<const Eigen::Matrix4d>`, "translation in the last column"),
+  `JtGltfMesh.cpp:601-616` (`actTrsf(row, col) = GetTrsf()[4 * col + row]`),
+  `JTData_SceneGraph.cxx:347` (`aMatrix(aX, aY) = GetTrsf()[aY * 4 + aX]`).
+  **Every test matrix before this was identity, symmetric or a pure translation,
+  where a transposition is invisible** — determinant is 1 either way, so it cannot
+  discriminate either. `tests/model.rs` now round-trips all 1218 non-identity
+  transforms of the server sample (`every_transform_of_a_sample_survives_the_decomposition`)
+  and pins the screw rotation (`a_rotated_instance_keeps_the_rotation_of_the_file`).
+  Composition is parent-relative and correct (`JTVis_ScenegraphTasks.cxx:78`
+  composes `myTransform *= node.Transform()`); `JtGltfMesh.cpp` instead replaces
+  the matrix and bakes it into vertices — deliberate deviation. After the fix the
+  `SampleJT_Server.png` reference had to be regenerated (1.26 % of pixels changed,
+  all on the front panel edges and the lower knobs/casters).
 - **JT colours *are* exported — `test_visual.py` forces flat grey on purpose.**
   A "the colour is missing" report is almost always the viewer or the grey
   oracle, not the writer. The mapping is `diffuse → baseColorFactor`,

@@ -191,6 +191,169 @@ fn a_sample_with_empty_representations_still_exports_its_graph() {
     assert_eq!(drawn, model.meshes.len(), "a mesh lost its node");
 }
 
+/// Rebuild the column-major 4x4 that a decomposed [`ferrojt::model::Transform`]
+/// stands for.
+///
+/// JT stores the matrix **column major**: the element of row `r`, column `c`
+/// sits at flat index `4 * c + r`, so the translation is the last column. The
+/// reference confirms it twice over — `JtAttribute_GeometricTransform.hxx` maps
+/// the array with `Eigen::Map` (column major by default) and documents the
+/// translation as being "in the last column", and `JtGltfMesh.cpp` assigns
+/// `actTrsf(row, col) = GetTrsf()[4 * col + row]`.
+fn matrix_of(transform: ferrojt::model::Transform) -> [f64; 16] {
+    let [x, y, z, w] = transform.rotation.map(f64::from);
+    let scales = transform.scale.map(f64::from);
+    let rotation = [
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+        ],
+        [
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+        ],
+        [
+            2.0 * (x * z - y * w),
+            2.0 * (y * z + x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+    ];
+
+    let mut matrix = [0.0f64; 16];
+    for column in 0..3 {
+        for row in 0..3 {
+            matrix[4 * column + row] = rotation[row][column] * scales[column];
+        }
+    }
+    for row in 0..3 {
+        matrix[12 + row] = f64::from(transform.translation[row]);
+    }
+    matrix[15] = 1.0;
+    matrix
+}
+
+/// `true` when a stored matrix leaves coordinates unchanged.
+fn is_identity(matrix: &[f64; 16]) -> bool {
+    matrix.iter().enumerate().all(|(index, value)| {
+        let row = index % 4;
+        let column = index / 4;
+        *value == if row == column { 1.0 } else { 0.0 }
+    })
+}
+
+/// `true` when two matrices agree to within the precision of the model.
+fn close(a: &[f64; 16], b: &[f64; 16]) -> bool {
+    a.iter()
+        .zip(b)
+        .all(|(left, right)| (left - right).abs() < 1e-3)
+}
+
+#[test]
+fn every_transform_of_a_sample_survives_the_decomposition() {
+    // The reader splits a JT transform into translation, rotation and scale, and
+    // every consumer composes those back into a matrix. Rebuilding the matrix
+    // from the three parts therefore has to give what the file stored.
+    //
+    // This is pinned against the server sample because it is the only one whose
+    // transforms actually rotate: the others are plain translations, whose flat
+    // array reads the same either way, so a transposed layout is invisible in
+    // them and the rotated parts of this file spin the wrong way.
+    let file = sample("SampleJT_Server.jt");
+    let graph = file.lsg.as_ref().expect("the sample has a scene graph");
+    let model = file.to_model();
+
+    let stored: Vec<[f64; 16]> = graph
+        .nodes
+        .iter()
+        .filter_map(|stored| {
+            graph
+                .attributes_of(&stored.node)
+                .into_iter()
+                .find_map(|attribute| match attribute {
+                    ferrojt::jt::Attribute::GeometricTransform(attribute) => Some(attribute.matrix),
+                    _ => None,
+                })
+        })
+        .filter(|matrix| !is_identity(matrix))
+        .collect();
+    assert!(
+        stored.len() > 100,
+        "the sample lost its rotations: {} non-identity transforms",
+        stored.len()
+    );
+
+    let rebuilt: Vec<[f64; 16]> = model
+        .nodes
+        .iter()
+        .filter(|node| !node.transform.is_identity())
+        .map(|node| matrix_of(node.transform))
+        .collect();
+
+    let mut unmatched = rebuilt;
+    let mut matched = 0usize;
+    for matrix in &stored {
+        let Some(position) = unmatched.iter().position(|other| close(matrix, other)) else {
+            let closest = unmatched
+                .iter()
+                .map(|other| {
+                    (
+                        other
+                            .iter()
+                            .zip(matrix)
+                            .map(|(left, right)| (left - right).abs())
+                            .fold(0.0f64, f64::max),
+                        other,
+                    )
+                })
+                .min_by(|left, right| left.0.total_cmp(&right.0));
+            panic!(
+                "no model transform reproduces the stored matrix {matrix:?}; the closest is \
+                 {closest:?}"
+            );
+        };
+        unmatched.swap_remove(position);
+        matched += 1;
+    }
+    assert_eq!(
+        matched,
+        stored.len(),
+        "a transform of the scene graph did not survive into the model"
+    );
+}
+
+#[test]
+fn a_rotated_instance_keeps_the_rotation_of_the_file() {
+    // The captive screws of `SampleJT_Server.jt` are turned 93 degrees about an
+    // axis in the XZ plane. The first column of a rotation is the image of the
+    // X axis, and the file says that image is (0.884254, 0, 0.467006). Reading
+    // the flat array row major puts the first *row* there instead — the inverse
+    // rotation — which is the bug that left the screws mis-oriented in the
+    // front plate while leaving their positions untouched.
+    let file = sample("SampleJT_Server.jt");
+    let model = file.to_model();
+
+    let node = model
+        .nodes
+        .iter()
+        .find(|node| {
+            let [x, y, z] = node.transform.translation;
+            (x - 0.7).abs() < 1e-3 && (y - 30.1).abs() < 1e-3 && (z - 53.3).abs() < 1e-3
+        })
+        .expect("the screw instance placed at (0.7, 30.1, 53.3)");
+
+    let matrix = matrix_of(node.transform);
+    let image_of_x = [matrix[0], matrix[1], matrix[2]];
+    let expected = [0.884254, 0.0, 0.467006];
+    for (actual, want) in image_of_x.iter().zip(expected) {
+        assert!(
+            (actual - want).abs() < 1e-3,
+            "the image of the X axis is {image_of_x:?}, the file says {expected:?}"
+        );
+    }
+}
+
 #[test]
 fn every_node_of_the_scene_graph_survives() {
     // Dropping a tier must not drop the node that holds it: the graph keeps
