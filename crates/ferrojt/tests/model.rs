@@ -113,6 +113,161 @@ fn only_the_finest_level_of_detail_is_exported() {
 }
 
 #[test]
+fn every_level_of_detail_can_be_loaded() {
+    // A screen-size driven viewer needs the coarse tiers to exist, so
+    // `to_model_with_all_lods()` keeps them. The scene graph is unchanged — a
+    // tier is a node of its own in the file — only the meshes multiply, and
+    // each one records which tier it came from.
+    //
+    // What a sample gains is pinned: the block files declare three tiers of one
+    // cube, the plate files four and three tiers per part, and the server
+    // sample declares a single tier for all 584 of its range LODs, so it must
+    // come out identical to `to_model()`.
+    struct All {
+        meshes: usize,
+        triangles: usize,
+        tiers: usize,
+    }
+    const EXTRA: &[(&str, All)] = &[
+        (
+            "example_block_jt10.3.jt",
+            All {
+                meshes: 3,
+                triangles: 36,
+                tiers: 3,
+            },
+        ),
+        (
+            "example_block_jt8.1.jt",
+            All {
+                meshes: 3,
+                triangles: 36,
+                tiers: 3,
+            },
+        ),
+        (
+            "example_block_jt9.5.jt",
+            All {
+                meshes: 3,
+                triangles: 36,
+                tiers: 3,
+            },
+        ),
+        (
+            "opening_protection_plate1_jt8.0.jt",
+            All {
+                meshes: 8,
+                triangles: 1_137,
+                tiers: 4,
+            },
+        ),
+        (
+            "opening_protection_plate1_jt9.5.jt",
+            All {
+                meshes: 6,
+                triangles: 922,
+                tiers: 3,
+            },
+        ),
+        // One tier per part: nothing to add.
+        (
+            "SampleJT_Server.jt",
+            All {
+                meshes: 105,
+                triangles: 124_154,
+                tiers: 1,
+            },
+        ),
+    ];
+
+    let mut checked = 0usize;
+    for path in samples() {
+        let name = path
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        let Some((_, expected)) = EXTRA.iter().find(|(key, _)| *key == name) else {
+            continue;
+        };
+        checked += 1;
+
+        let file = ferrojt::jt::JtFile::open(&path)
+            .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        let finest = file.to_model();
+        let all = file.to_model_with_all_lods();
+
+        assert_eq!(
+            all.meshes.len(),
+            expected.meshes,
+            "{name}: the wrong number of meshes with every tier loaded"
+        );
+        assert_eq!(
+            all.triangle_count(),
+            expected.triangles,
+            "{name}: the wrong number of triangles with every tier loaded"
+        );
+        assert_eq!(
+            all.nodes.len(),
+            finest.nodes.len(),
+            "{name}: loading every tier changed the scene graph"
+        );
+        assert_eq!(
+            all.materials.len(),
+            finest.materials.len(),
+            "{name}: loading every tier changed the materials"
+        );
+
+        // Each tier index appears as often as there are parts, and no tier
+        // beyond what the file declares shows up.
+        let mut histogram: Vec<(u32, usize)> = Vec::new();
+        for mesh in &all.meshes {
+            let tier = mesh
+                .lod_level
+                .unwrap_or_else(|| panic!("{name}: a mesh does not say which tier it is"));
+            assert!(
+                (tier as usize) < expected.tiers,
+                "{name}: tier {tier} is not declared by the file"
+            );
+            match histogram.iter_mut().find(|(t, _)| *t == tier) {
+                Some(entry) => entry.1 += 1,
+                None => histogram.push((tier, 1)),
+            }
+        }
+        histogram.sort();
+        let parts = expected.meshes / expected.tiers;
+        for (tier, count) in &histogram {
+            assert_eq!(
+                *count, parts,
+                "{name}: tier {tier} holds the wrong number of parts"
+            );
+        }
+        assert_eq!(
+            histogram.len(),
+            expected.tiers,
+            "{name}: a declared tier is missing"
+        );
+
+        // The finest tier alone is exactly what `to_model()` produces.
+        let kept: Vec<_> = all
+            .meshes
+            .iter()
+            .filter(|mesh| mesh.lod_level == Some(0))
+            .collect();
+        assert_eq!(
+            kept.len(),
+            finest.meshes.len(),
+            "{name}: the finest tier of the full load does not match the default"
+        );
+    }
+    assert_eq!(
+        checked,
+        EXTRA.len(),
+        "not every expectation was matched by a sample file"
+    );
+}
+
+#[test]
 fn every_sample_exports_to_gltf() {
     // glTF requires a POSITION attribute in every primitive, so a
     // representation that declares no vertices at all must never reach the

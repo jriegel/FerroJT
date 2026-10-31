@@ -353,7 +353,23 @@ impl JtFile {
     /// which parts contribute geometry; see [`JtFile::layer_filter`].
     #[must_use]
     pub fn to_model(&self) -> Model {
-        self.build_model(self.layer_filter(None).ok().flatten().as_ref())
+        self.build_model(self.layer_filter(None).ok().flatten().as_ref(), false)
+    }
+
+    /// Translate the file into a [`Model`] that keeps every level of detail.
+    ///
+    /// A range LOD holds the same shape at several tiers and
+    /// [`JtFile::to_model`] exports only the finest one, because an export
+    /// should not repeat the geometry of a part once per tier. A viewer that
+    /// picks a tier by how large a part appears on screen needs them all, so
+    /// this keeps every tier. The scene graph itself does not change: the tiers
+    /// are the children of the range LOD node exactly as the file lists them,
+    /// and [`Mesh::lod_level`] says which tier a mesh came from.
+    ///
+    /// The layer filters of the file apply as they do to [`JtFile::to_model`].
+    #[must_use]
+    pub fn to_model_with_all_lods(&self) -> Model {
+        self.build_model(self.layer_filter(None).ok().flatten().as_ref(), true)
     }
 
     /// Translate the file into a [`Model`] that contains every part.
@@ -362,7 +378,7 @@ impl JtFile {
     /// shows and what `ferrojt convert --no-layer-filter` writes.
     #[must_use]
     pub fn to_model_unfiltered(&self) -> Model {
-        self.build_model(None)
+        self.build_model(None, false)
     }
 
     /// Translate the file into a [`Model`] with one named layer filter.
@@ -373,7 +389,7 @@ impl JtFile {
     /// file, and the message lists the filters that are available.
     pub fn to_model_with_filter(&self, name: &str) -> Result<Model> {
         let filter = self.layer_filter(Some(name))?;
-        Ok(self.build_model(filter.as_ref()))
+        Ok(self.build_model(filter.as_ref(), false))
     }
 
     /// The filter an export uses, `None` when the file has no layer
@@ -437,9 +453,9 @@ impl JtFile {
     }
 
     /// Walk the scene graph into a [`Model`], drawing only the parts the given
-    /// filter accepts.
+    /// filter accepts and keeping either the finest or every level of detail.
     #[must_use]
-    fn build_model(&self, filter: Option<&LayerFilter>) -> Model {
+    fn build_model(&self, filter: Option<&LayerFilter>, all_lods: bool) -> Model {
         let mut model = Model::new();
         model.source = Some(self.path.display().to_string());
         let mut extras = json!({
@@ -464,7 +480,10 @@ impl JtFile {
             graph,
             &mut model,
             root,
-            &mut Built::default(),
+            &mut Built {
+                all_lods,
+                ..Built::default()
+            },
             LodWalk::ROOT,
             filter,
         );
@@ -820,6 +839,8 @@ struct Built {
     /// subtree reached twice — resolves to the node already under way instead
     /// of recursing forever.
     done: HashMap<usize, usize>,
+    /// Keep every tier of a range LOD instead of only the finest one.
+    all_lods: bool,
 }
 
 /// Recursively translate one graph node into a [`model::Node`].
@@ -858,7 +879,7 @@ fn build_node(
         (Node::Part(_), Some(filter)) => filter.keeps(&graph.layers_of(node)),
         _ => true,
     };
-    if drawn && lod.keeps_geometry() {
+    if drawn && (lod.keeps_geometry() || built.all_lods) {
         let level = lod.level();
         for load in node.late_loads() {
             if let Some(geometry) = graph.geometry_for(load) {
