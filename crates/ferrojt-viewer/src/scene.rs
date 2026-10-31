@@ -389,6 +389,16 @@ impl ViewerScene {
         }
     }
 
+    /// Close every branch at `level` or deeper, leaving the levels above it open.
+    ///
+    /// A freshly loaded file calls this with `1`: the roots and their children are
+    /// on screen, everything below them is one click away. Opening all 4489 rows
+    /// of `SampleJT_Server.jt` shows nothing but a scrollbar, and closing all but
+    /// the roots hides the parts the outliner exists to reach.
+    pub fn collapse_below(&mut self, level: usize) {
+        self.collapsed = collapsed_below(&self.rows, &self.child_rows, level);
+    }
+
     /// Toggle the visibility of a row and, through it, of its whole subtree.
     ///
     /// The kiss3d graph is flat — every row's group hangs off `root` with its
@@ -753,6 +763,19 @@ fn children_of(child_rows: &[Vec<usize>], id: usize) -> &[usize] {
     child_rows.get(id).map_or(&[], |v| v.as_slice())
 }
 
+/// The branches to close so that only the levels up to `level` are open.
+///
+/// A row is closed when it sits at `level` or deeper *and* has child rows —
+/// closing a leaf would be a state the disclosure triangle cannot show. The
+/// child list, not [`Row::has_children`], decides: that flag comes from the
+/// model graph, and a child skipped by the cycle guard is not a row.
+fn collapsed_below(rows: &[Row], child_rows: &[Vec<usize>], level: usize) -> HashSet<usize> {
+    rows.iter()
+        .filter(|row| row.depth >= level && child_rows.get(row.id).is_some_and(|v| !v.is_empty()))
+        .map(|row| row.id)
+        .collect()
+}
+
 /// What drawing the subtree below `row` costs: triangles and world box.
 ///
 /// `owner[row]` is the stack a tier row belongs to. A row that is a tier of a
@@ -992,5 +1015,25 @@ mod tests {
         assert_eq!(drawn_triangle_count(&rows, &visible, &hidden, &counts), 0);
         // The child rows of a stack are still walked for the eye toggle.
         assert_eq!(child_rows[stacks[0].parent], stacks[0].tiers);
+    }
+
+    /// A loaded file opens its first two levels: the roots at depth 0 and their
+    /// children at depth 1 stay visible, and every branch at depth 1 or deeper
+    /// is closed. Leaves are never in the set — there is no triangle to open one.
+    #[test]
+    fn only_the_top_levels_stay_open() {
+        let (rows, child_rows) = stacked_rows(2);
+        // 0: range LOD (depth 0) · 1, 3: tier groups (depth 1) · 2, 4: shapes.
+        assert_eq!(
+            collapsed_below(&rows, &child_rows, 1),
+            [1, 3].into_iter().collect::<HashSet<usize>>()
+        );
+        // One level only: the roots alone.
+        assert_eq!(
+            collapsed_below(&rows, &child_rows, 0),
+            [0, 1, 3].into_iter().collect::<HashSet<usize>>()
+        );
+        // Deeper than the tree: nothing is closed.
+        assert!(collapsed_below(&rows, &child_rows, 9).is_empty());
     }
 }

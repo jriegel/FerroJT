@@ -11,7 +11,7 @@ detail lives in `docs/`.
 | `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `export/` glTF/GLB writer and the USD stub. |
 | `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `ls`. |
 | `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `pyproject.toml` + `python/ferrojt/` + `tests/`. |
-| `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `backdrop.rs` viewport gradient, `picking.rs`, `trihedron.rs`. |
+| `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `backdrop.rs` viewport gradient, `camera.rs` `Camera3d` wrapper that places the backdrop, `picking.rs`, `trihedron.rs`. |
 | `python/ferrojt/` | Pure-Python package re-exporting `_ferrojt` (`__init__.py`, `_ferrojt.pyi`, `py.typed`). |
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
 | `data/Reference/` | Reference JSON dumps from the JT tooling **and** reference PNG pictures — **the oracle**. |
@@ -309,7 +309,8 @@ Upload with `python -m twine upload dist\*`.
   do not bump one without the other. `draw_ui` hands out only `&egui::Context`,
   so its closure cannot touch `window`: collect flags/commands and act after the
   call. Place the panels with `egui::Window`/`Area` + `fixed_pos`/`fixed_size` +
-  `order(Order::Middle)`. The prelude has no `Mat4`; `Rot3` **is** `glam::Quat`;
+  `order(Order::Middle)`. The prelude has no `Mat4` — import `kiss3d::glamx::Mat4`
+  (kiss3d does `pub use glamx;`); `Rot3` **is** `glam::Quat`;
   never call `SceneNode3d::update()` or `world_pose()`. `add_child` panics on an
   already-parented node, so every instance gets fresh nodes; the kiss3d node
   graph is **flat**, so `set_visible` has to be re-applied down the whole row
@@ -341,6 +342,36 @@ Upload with `python -m twine upload dist\*`.
   be a frame of its own or the last move is dropped (`drag_delta` is the
   **per-frame** pointer delta, not the total — move in small steps). Pinned in
   `main.rs::tests`.
+- **kiss3d frame order: anything done between two `render_3d` calls is one frame late.**
+  `render_3d` → `render` → `render_chain` (`window/rendering.rs`) does
+  `handle_events()` and then `render_single_frame()`, which calls
+  `camera.update(&self.canvas)` at `:240` and `scene.data_mut().prepare(..)` at
+  `:597`. Re-placing the backdrop from the app loop (after the previous frame was
+  submitted) used the previous frame's eye, so the gradient **swam during a drag
+  and snapped back when it stopped** — that was the "background moves with a delay"
+  report. Fix: `camera.rs::ViewerCamera` wraps `OrbitCamera3d`, holds the
+  `Backdrop` and calls `backdrop.place(&self.orbit, aspect)` inside
+  `Camera3d::update`, i.e. the same frame. It `Deref`s to `OrbitCamera3d`, so
+  `lod::select`/`picking::pick`/`trihedron::show` are unchanged — but **`fit`
+  assigns `*camera = fresh`, so it must receive `camera.inner_mut()`** or the
+  wrapper (and its backdrop slot) is replaced. Proof: `target\imgcmp.py` on
+  auto-orbit frames — 100 k+ px change across the image while a 100×60 gradient
+  patch has **0 px changed, max delta 0**.
+- **FPS is measured in the app loop, not by kiss3d.** `Window::render_timings`
+  reports CPU/GPU cost *inside* a frame, never the interval between frames. The
+  `FpsMeter` in `main.rs` counts ticks over a `FPS_WINDOW` (0.5 s) window,
+  divides `frames - 1` intervals by the span, and **restarts the window when a gap
+  exceeds `STALLED_FRAME` (0.25 s)** — otherwise a blocked frame reads as a
+  collapse. `fps_text` prints `-- fps` until the first window closes. Reserve
+  `FPS_RESERVE` (58 pt) in the toolbar's right-to-left strip next to
+  `ABOUT_RESERVE`.
+- **A newly opened file opens only the top levels of the outliner**
+  (`TREE_OPEN_LEVEL = 1` → `ViewerScene::collapse_below`). A server assembly has
+  thousands of rows and twenty levels, so expanding everything shows nothing but a
+  scrollbar. The pure `collapsed_below(rows, child_rows, level)` seeds `collapsed`
+  with every branch at `depth >= level`; it keys on **child rows**, not
+  `Row::has_children`, because a child skipped by the path cycle guard is not a
+  row. Pinned in `scene.rs::tests::only_the_top_levels_stay_open`.
 - **The viewport gradient is a scene quad, not a background** (`backdrop.rs`).
   `Window::set_background_color` is a flat clear colour; the skybox is
   equirectangular so its image rows follow **world Y** (the band rotates with the
@@ -399,12 +430,17 @@ Upload with `python -m twine upload dist\*`.
   `Stop-Process -Name ferrojt-viewer -Force` first. `close_key` defaults to
   `None`, so `Exit` calls `window.close()`. Against the JT WARN flood use
   `RUST_LOG=error`; `ferrojt-cli info` prints bounds only with `--json`.
+  To compare two captures, use `\.venv\Scripts\python.exe target\imgcmp.py a.png
+  b.png … [--patch X Y W H]` (numpy/open3d — PIL is not installed); the PowerShell
+  pixel-diff scripts silently produce empty arrays and false "0 px changed".
 
 ## Language / platform gotchas hit before
 
 - Rust byte literals treat `\020` as octal — write `\x00`.
 - `Path::with_extension()` truncates at the first dot of a multi-dot stem.
 - `Select-String -Path dir\*.rs` does not recurse; use `Get-ChildItem -Recurse`.
+- `egui::Label` has no `on_hover_text` — put it on the `Response` from `ui.add(..)`.
+- `std::time::Instant` has no `as_secs_f32`; use `now.duration_since(start).as_secs_f32()`.
 
 ## Toolchain baseline
 

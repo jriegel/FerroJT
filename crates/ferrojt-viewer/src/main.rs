@@ -12,6 +12,7 @@
 //! selecting a row and selecting a shape are the same operation.
 
 mod backdrop;
+mod camera;
 mod lod;
 mod meshes;
 mod picking;
@@ -20,6 +21,7 @@ mod tree;
 mod trihedron;
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use egui::{
     Align, CursorIcon, Frame, Id, Label, LayerId, Layout, Margin, Order, Pos2, Rect, RichText,
@@ -34,6 +36,7 @@ use kiss3d::light::Light;
 use kiss3d::prelude::{Vec2, Vec3};
 use kiss3d::window::Window;
 
+use crate::camera::ViewerCamera;
 use crate::scene::ViewerScene;
 
 /// Height of the toolbar strip, in logical points.
@@ -69,6 +72,28 @@ const PROJECT_URL: &str = "https://github.com/jriegel/FerroJT";
 /// so the bar needs a fixed allowance for it — egui 0.36 has no way to measure
 /// a button before laying it out.
 const ABOUT_RESERVE: f32 = 78.0;
+
+/// Width the frame-rate readout is given in the toolbar.
+///
+/// Like the About button it gets a slot of its own: a long file name must not be
+/// able to push the number away, and the slot is wide enough for the widest
+/// reading (`"1000 fps"`).
+const FPS_RESERVE: f32 = 58.0;
+
+/// How long a frame-rate window is, in seconds.
+///
+/// Half a second is short enough that the number reacts to a change of view
+/// within a blink and long enough that a single late frame — decoding a file,
+/// resizing the window — does not read as a collapse.
+const FPS_WINDOW: f32 = 0.5;
+
+/// How many tree levels a freshly loaded file leaves open.
+///
+/// `1` shows the roots and their children: enough to orient oneself in the
+/// assembly without scrolling through thousands of rows. `SampleJT_Server.jt`
+/// has 4489 rows and nests 20 levels deep, so opening all of it shows nothing
+/// but a scrollbar.
+const TREE_OPEN_LEVEL: usize = 1;
 
 /// Near plane of the fitted frustum, as a fraction of the model radius.
 ///
@@ -132,8 +157,8 @@ struct App {
     /// Width of the outliner column, in logical points. The user drags the
     /// divider between the column and the viewport to change it.
     tree_width: f32,
-    /// The gradient behind the model, re-oriented to face the camera each frame.
-    backdrop: Option<backdrop::Backdrop>,
+    /// Frame rate of the render loop, shown in the toolbar.
+    fps: FpsMeter,
     /// Aspect ratio of the 3D viewport, kept up to date each frame.
     viewport: Viewport,
 }
@@ -152,7 +177,7 @@ impl Default for App {
             lod_status: String::new(),
             show_lod: false,
             tree_width: tree::DEFAULT_WIDTH,
-            backdrop: None,
+            fps: FpsMeter::default(),
             viewport: Viewport {
                 left: tree::DEFAULT_WIDTH,
                 top: TOOLBAR + MARGIN,
@@ -165,9 +190,75 @@ impl Default for App {
     }
 }
 
+/// Frame rate of the render loop, counted over a sliding window.
+///
+/// kiss3d exposes `Window::render_timings`, but those are the CPU and GPU costs
+/// *inside* one frame — never the interval between frames, which is what a frame
+/// rate is. So the loop times its own iterations here.
+///
+/// Counting frames over a window rather than averaging per-frame periods matters
+/// for the same reason a hitch is invisible: one frame that took 300 ms while a
+/// file decoded would otherwise be reported as 3 fps.
+#[derive(Debug, Default)]
+struct FpsMeter {
+    /// When the previous frame was handed over.
+    last: Option<Instant>,
+    /// Frames counted since `window_start`.
+    frames: u32,
+    /// Start of the current window.
+    window_start: Option<Instant>,
+    /// Reading of the last completed window.
+    fps: f32,
+}
+
+/// A frame longer than this is a stall, not a slow frame.
+const STALLED_FRAME: f32 = 0.25;
+
+impl FpsMeter {
+    /// Account for one rendered frame, advancing the window when it closes.
+    fn tick(&mut self, now: Instant) {
+        self.frames += 1;
+        let (Some(last), Some(start)) = (self.last, self.window_start) else {
+            self.last = Some(now);
+            self.window_start = Some(now);
+            return;
+        };
+        // The first frame after a stall is not evidence about the frame rate:
+        // `last` can be seconds old, because the loop was blocked decoding a
+        // file or the window was iconified. Restart the window rather than
+        // dividing by that gap, which would report a fraction of a frame/s.
+        if now > last + Duration::from_secs_f32(STALLED_FRAME) {
+            self.window_start = Some(now);
+            self.frames = 1;
+        } else if now >= start + Duration::from_secs_f32(FPS_WINDOW) {
+            let span = now.duration_since(start).as_secs_f32();
+            if span > 0.0 {
+                // The frame that closes the window is the first of the next one,
+                // so the rate is the number of *intervals* in the span. Counting
+                // both endpoints would report 62 for a steady 60.
+                self.fps = self.frames.saturating_sub(1) as f32 / span;
+            }
+            self.window_start = Some(now);
+            self.frames = 1;
+        }
+        self.last = Some(now);
+    }
+}
+
+/// The toolbar reading of a frame rate.
+///
+/// Zero means "not measured yet" — the first window has not closed at startup —
+/// and is shown as a dash, because `0 fps` would read as a frozen view.
+fn fps_text(fps: f32) -> String {
+    if fps <= 0.0 {
+        return "-- fps".to_string();
+    }
+    format!("{fps:.0} fps")
+}
+
 impl App {
     /// Read `path` and rebuild the scene, the outliner and the camera fit.
-    fn load(&mut self, path: &Path, camera: &mut OrbitCamera3d) {
+    fn load(&mut self, path: &Path, camera: &mut ViewerCamera) {
         // Every level of detail is loaded, not just the finest one: the viewer
         // picks a tier per part from the area it covers on screen, which needs
         // the coarse tiers to exist. `ferrojt::open` would keep only tier 0.
@@ -196,14 +287,17 @@ impl App {
             .root_mut()
             .add_light(Light::directional(Vec3::new(0.35, 0.5, -1.0).normalize()));
         // The gradient is an ordinary scene node, so unlike a skybox it stays out
-        // of the outliner, the picker, the LOD stacks and the scene bounds.
+        // of the outliner, the picker, the LOD stacks and the scene bounds. It
+        // lives on the camera, which is what moves it — see [`ViewerCamera`].
         let backdrop = backdrop::Backdrop::new(viewer.root_mut());
 
         self.path = Some(path.to_path_buf());
         self.model = Some(model);
         self.decoded = decoded;
-        self.backdrop = Some(backdrop);
         self.viewer = viewer;
+        // Only the top levels start open: a server assembly has thousands of rows
+        // and twenty levels, and opening all of them shows nothing but a scrollbar.
+        self.viewer.collapse_below(TREE_OPEN_LEVEL);
         self.filter.clear();
         self.renaming = None;
         self.show_lod = !self.viewer.lod_groups().is_empty();
@@ -215,7 +309,8 @@ impl App {
         );
         self.lod_status = lod_summary(&self.viewer, self.viewer.total_triangle_count());
 
-        fit(camera, &self.viewer, self.viewport, self.up);
+        camera.set_backdrop(Some(backdrop));
+        fit(camera.inner_mut(), &self.viewer, self.viewport, self.up);
     }
 
     /// Refresh the level-of-detail line of the toolbar.
@@ -391,14 +486,15 @@ async fn main() {
     window.set_ambient(0.35);
 
     // Placeholder frustum: `fit` rebuilds the camera with planes sized to the
-    // model as soon as a file is loaded.
-    let mut camera = OrbitCamera3d::new_with_frustum(
+    // model as soon as a file is loaded. The wrapper is what keeps the gradient
+    // backdrop locked to the view — see [`ViewerCamera`].
+    let mut camera = ViewerCamera::new(OrbitCamera3d::new_with_frustum(
         std::f32::consts::FRAC_PI_4,
         0.1,
         1.0e3,
         Vec3::new(3.0, 3.0, 3.0),
         Vec3::ZERO,
-    );
+    ));
     camera.set_up_axis(Vec3::Z);
 
     // The first `fit` happens inside `load`, so the viewport has to be known
@@ -413,6 +509,7 @@ async fn main() {
 
     while window.render_3d(app.viewer.root_mut(), &mut camera).await {
         app.viewport = Viewport::of(&window, app.tree_width);
+        app.fps.tick(Instant::now());
 
         // --- input events -------------------------------------------------
         let mut fit_requested = false;
@@ -464,14 +561,6 @@ async fn main() {
         );
         app.refresh_lod_status();
 
-        // Keep the gradient square facing the camera and large enough to cover
-        // the frustum, so it reads as a backdrop rather than as a card in the
-        // scene.
-        if let Some(backdrop) = app.backdrop.as_mut() {
-            let aspect = size.x as f32 / (size.y.max(1) as f32);
-            backdrop.place(&camera, aspect);
-        }
-
         // --- egui: toolbar, outliner, trihedron ---------------------------
         let mut commands = Commands::default();
         window.draw_ui(|ctx| {
@@ -519,11 +608,11 @@ async fn main() {
                             }
                         }
                         ui.separator();
-                        // The status text must give way to the About button
-                        // instead of pushing it off the right end of the bar, so
-                        // the labels get a box of what is left after an
-                        // allowance for the button and truncate inside it.
-                        let room = (ui.available_width() - ABOUT_RESERVE).max(0.0);
+                        // The status text must give way to the frame rate and the
+                        // About button instead of pushing them off the right end
+                        // of the bar, so the labels get a box of what is left
+                        // after an allowance for both and truncate inside it.
+                        let room = (ui.available_width() - ABOUT_RESERVE - FPS_RESERVE).max(0.0);
                         let height = ui.spacing().interact_size.y;
                         ui.allocate_ui_with_layout(
                             vec2(room, height),
@@ -536,9 +625,10 @@ async fn main() {
                                 ui.add(Label::new(RichText::new(&app.status).weak()).truncate());
                             },
                         );
-                        // About sits hard against the right end of the bar: the
-                        // reverse layout consumes whatever the labels left over,
-                        // so it stays right-justified at any bar width.
+                        // Frame rate and About share the right end: the reverse
+                        // layout consumes whatever the labels left over, so both
+                        // stay right-justified at any bar width. The number is
+                        // monospaced so it does not jitter as the digits change.
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui
                                 .button("About")
@@ -547,6 +637,10 @@ async fn main() {
                             {
                                 commands.about = true;
                             }
+                            ui.separator();
+                            let fps = fps_text(app.fps.fps);
+                            ui.add(Label::new(RichText::new(fps).weak().monospace()).truncate())
+                                .on_hover_text("Frames rendered per second by the viewer");
                         });
                     });
                 });
@@ -578,7 +672,9 @@ async fn main() {
         // --- window actions, now that `draw_ui` has released the window ----
         if commands.fit || fit_requested {
             let up = app.up;
-            fit(&mut camera, &app.viewer, app.viewport, up);
+            // `fit` replaces the camera outright, so it needs the orbit camera
+            // itself rather than the wrapper around it.
+            fit(camera.inner_mut(), &app.viewer, app.viewport, up);
         }
         if commands.lod {
             // Turning the selection off restores the finest tier everywhere.
@@ -779,5 +875,52 @@ mod tests {
             dragged_width(320.0, 999.0, 320.0),
             screen().width() * MAX_TREE_SHARE
         );
+    }
+
+    /// Feeds a meter `frames` ticks spaced `step` apart and returns the last
+    /// reading. A synthetic clock keeps the expectation exact: the meter only
+    /// ever compares instants, it never sleeps.
+    fn meter_reading(frames: u32, step: Duration) -> f32 {
+        let base = Instant::now();
+        let mut meter = FpsMeter::default();
+        for frame in 0..frames {
+            meter.tick(base + step * frame);
+        }
+        meter.fps
+    }
+
+    #[test]
+    fn the_frame_rate_is_counted_over_a_window() {
+        // 60 fps: 100 frames a sixtieth of a second apart. The window closes
+        // every half second, so the reading is frames-per-window over that span
+        // rather than an average of per-frame periods.
+        let got = meter_reading(100, Duration::from_secs_f32(1.0 / 60.0));
+        assert!((got - 60.0).abs() < 1.0, "got {got}");
+    }
+
+    #[test]
+    fn a_stall_does_not_read_as_a_collapse() {
+        let base = Instant::now();
+        let step = Duration::from_secs_f32(1.0 / 60.0);
+        let mut meter = FpsMeter::default();
+        for frame in 0..40 {
+            meter.tick(base + step * frame);
+        }
+        let steady = meter.fps;
+        // The window was iconified, or a file was decoding: three seconds with
+        // no frame at all. The next frame must not report a third of a frame per
+        // second, which is what dividing by that gap would give.
+        for frame in 0..40 {
+            meter.tick(base + Duration::from_secs(3) + step * frame);
+        }
+        assert!(steady > 55.0, "steady reading {steady}");
+        assert!(meter.fps > 55.0, "after the stall: {}", meter.fps);
+    }
+
+    #[test]
+    fn an_unmeasured_frame_rate_is_a_dash() {
+        assert_eq!(fps_text(0.0), "-- fps");
+        assert_eq!(fps_text(59.6), "60 fps");
+        assert_eq!(fps_text(144.4), "144 fps");
     }
 }
