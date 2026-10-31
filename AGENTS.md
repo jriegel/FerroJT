@@ -11,7 +11,7 @@ detail lives in `docs/`.
 | `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `export/` glTF/GLB writer and the USD stub. |
 | `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `ls`. |
 | `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `pyproject.toml` + `python/ferrojt/` + `tests/`. |
-| `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms, `tree.rs` outliner, `picking.rs`, `trihedron.rs`. |
+| `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `picking.rs`, `trihedron.rs`. |
 | `python/ferrojt/` | Pure-Python package re-exporting `_ferrojt` (`__init__.py`, `_ferrojt.pyi`, `py.typed`). |
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
 | `data/Reference/` | Reference JSON dumps from the JT tooling **and** reference PNG pictures — **the oracle**. |
@@ -106,6 +106,38 @@ Upload with `python -m twine upload dist\*`.
 - Pinned LOD0 counts (`crates/ferrojt/tests/model.rs`): block 8.1/9.5/10.3 →
   1 mesh / 12 triangles; plate1-8.0 → 2 / 617; plate1-9.5 → 2 / 486.
   `tests/test_ferrojt.py` asserts `mesh_count == 1`, `triangle_count == 12`.
+- **`JtFile::to_model_with_all_lods()` keeps every tier** (viewer only; `to_model()`
+  is unchanged by construction). Pinned in `every_level_of_detail_can_be_loaded()`:
+  block 8.1/9.5/10.3 → 3 meshes / 36 tris / 3 tiers; plate1-8.0 → 8 / 1137 / 4;
+  plate1-9.5 → 6 / 922 / 3; `SampleJT_Server.jt` → 105 / 124154 / **1** — its 584
+  `RangeLOD`s each have exactly one `Group` child, so screen-area LOD switching is
+  a **no-op there** and the toolbar checkbox is hidden. Use block/plate to demo it.
+- **The viewer row tree is a tree, not the graph.** `ViewerScene::new` walks the
+  model graph with a *path* cycle guard, so a node reachable from several parents
+  becomes one row **per path**: `SampleJT_Server.jt` has 2158 model nodes but
+  **4489 rows** (198 shared nodes, max 54 visits). That is why the toolbar counts
+  triangles **per attachment** on both sides of the fraction —
+  `ViewerScene::total_triangle_count()` (sum of `Slot::triangles`) and
+  `drawn_triangle_count()` share that basis, and `Model::triangle_count()`
+  (unique meshes, 124154) does **not**: mixing them printed
+  `1016789 of 124154 triangles`. `meshes::triangle_count` was deleted for this.
+- **`ViewerScene` cannot be built in a test.** `SceneNode3d::mesh()` needs the
+  kiss3d `WINDOW_CACHE` thread-local (`window_cache.rs:13`, `texture_manager.rs:392`
+  `unwrap()` on `None`) until a window exists. So the LOD logic in `scene.rs` lives
+  in **pure free functions** over the row tree (`detect_stacks`, `measure_stacks`,
+  `hidden_tiers`, `clamp_tier`, `row_drawn`, `drawn_triangle_count`,
+  `subtree_cost`) and the tests build `Vec<Row>`/`Vec<Vec<usize>>` fixtures instead.
+  `row_drawn` must walk the **whole ancestor chain** — the kiss3d graph is flat, so
+  hiding a tier does not hide its Shape children by itself.
+- **Screen-area LOD (`lod.rs`).** One step per frame (`step`), finer when
+  `tris[current] < pixels * TRIANGLES_PER_PIXEL` (1.5), coarser only when the finer
+  tier would cost `>= budget * HYSTERESIS` (1.6) — that asymmetry is what stops
+  flapping. `projected_area` must **not** use `Camera3d::project`: it divides by
+  `w` and returns finite mirrored pixels for geometry behind the eye
+  (`camera3d.rs:158`), so `!point.is_finite()` never fires. Use
+  `camera.transformation()` and classify corners by `clip.w <= 0.0`: all behind →
+  `None` (pick the coarsest tier), some behind or a span over `4 * size` →
+  `f32::MAX` (pick the finest).
 - **An `Instance` shares its subtree, it is not copied.** The plate samples hold
   one screw and instantiate it twice (`y = -25` and `y = +25`). `build_node`
   memoises by graph position in `Built { done: HashMap<usize, usize> }`, recorded
@@ -290,6 +322,15 @@ Upload with `python -m twine upload dist\*`.
   `set_at` by `view.inverse_transform_vector(Vec3::X/Y)` to re-centre the model
   in the visible part. `Model::bounds` is **never set** by the JT reader
   (`info --json` → `"bounds": null`) — compute bounds from the slots.
+- **Re-fit the depth range in `fit()` or you get Z-fighting.** kiss3d 0.47 has no
+  near/far setter and no polygon offset, so `fit` rebuilds the camera with
+  `OrbitCamera3d::new_with_frustum(fov, radius*NEAR, dist + radius*FAR, eye, at)`
+  (`NEAR 1e-3`, `FAR 1e2`, `MIN_DIST 2e-2`) and assigns it. The default
+  `1e-3 .. 1e6` on the 82.6 mm server model gave a depth resolution of ~0.12 mm at
+  the centre (`z²/(near·2²⁴)`, `Depth32Float`, `CompareFunction::Less`, no bias)
+  and 44 genuinely coplanar AABB pairs (< 0.02 mm) plus 79/105 instances thinner
+  than 0.6 mm hatched. Call `set_min_dist`/`set_max_dist` **before**
+  `set_up_axis`, and set `set_at`/`set_dist` after constructing.
 - **Viewer transform composition: a JT `Transform` is `T·R·S`.** kiss3d keeps
   `world_scale` separate from `world_transform` (`do_propagate_transforms`) and
   glamx `Pose3 * Pose3` ignores scale, so a parent's scale never reaches a

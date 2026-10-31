@@ -11,6 +11,7 @@
 //! [`SceneNode3d`](kiss3d::scene::SceneNode3d) groups ([`scene`]) so that
 //! selecting a row and selecting a shape are the same operation.
 
+mod lod;
 mod meshes;
 mod picking;
 mod scene;
@@ -21,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{Frame, Margin, Pos2, Rect, RichText, Stroke, vec2};
 use ferrojt::Model;
+use ferrojt::jt::JtFile;
 use kiss3d::camera::{Camera3d, OrbitCamera3d};
 use kiss3d::color::Color;
 use kiss3d::event::{Action as EventAction, Key, MouseButton, WindowEvent};
@@ -33,6 +35,28 @@ use crate::scene::ViewerScene;
 /// Height of the toolbar strip, in logical points.
 const TOOLBAR: f32 = 34.0;
 
+/// Near plane of the fitted frustum, as a fraction of the model radius.
+///
+/// The clip planes are what makes or breaks a CAD model: JT parts sit flush
+/// against each other by design — `SampleJT_Server.jt` has 44 pairs of node
+/// boxes closer than 0.02 mm and 79 of its 105 instances thinner than 0.6 mm —
+/// and the depth buffer is a `Depth32Float`, whose spacing at distance `z` is
+/// about `z² / (near · 2²⁴)`. With the wide frustum this viewer used to start
+/// from (`1e-3 .. 1e6` on an 82 mm model) that is 0.12 mm at the centre of the
+/// model, coarser than the gaps it has to separate, so coplanar faces trade
+/// the depth test pixel by pixel: the diagonal hatching of Z-fighting.
+/// `near = r / 1000` brings the spacing down to a few micrometres.
+const NEAR: f32 = 1.0e-3;
+
+/// Far plane and largest orbit distance, as a multiple of the model radius.
+const FAR: f32 = 1.0e2;
+
+/// Closest orbit distance, as a fraction of the model radius.
+///
+/// It has to stay beyond [`NEAR`], otherwise zooming in pushes the near plane
+/// through the camera and the model disappears instead of growing.
+const MIN_DIST: f32 = 2.0e-2;
+
 /// What the toolbar asked for. The buttons cannot act on the window directly:
 /// [`Window::draw_ui`] borrows the window while the closure runs.
 #[derive(Default)]
@@ -40,6 +64,8 @@ struct Commands {
     open: bool,
     fit: bool,
     exit: bool,
+    /// The LOD toggle was clicked, so the scene has to be re-measured.
+    lod: bool,
 }
 
 /// Everything that survives a frame.
@@ -60,6 +86,12 @@ struct App {
     up: Vec3,
     /// One-line summary shown in the toolbar.
     status: String,
+    /// Level-of-detail summary shown next to the toggle: what is on screen and
+    /// what the file would allow.
+    lod_status: String,
+    /// `true` while the toolbar shows the level-of-detail toggle. A file with a
+    /// single tier per part has nothing to switch, so the control is left out.
+    show_lod: bool,
     /// Aspect ratio of the 3D viewport, kept up to date each frame.
     viewport: Viewport,
 }
@@ -75,6 +107,8 @@ impl Default for App {
             renaming: None,
             up: Vec3::Z,
             status: String::from("Drag and drop a .jt file, or press Open."),
+            lod_status: String::new(),
+            show_lod: false,
             viewport: Viewport {
                 left: tree::WIDTH,
                 top: TOOLBAR,
@@ -90,7 +124,10 @@ impl Default for App {
 impl App {
     /// Read `path` and rebuild the scene, the outliner and the camera fit.
     fn load(&mut self, path: &Path, camera: &mut OrbitCamera3d) {
-        let model = match ferrojt::open(path) {
+        // Every level of detail is loaded, not just the finest one: the viewer
+        // picks a tier per part from the area it covers on screen, which needs
+        // the coarse tiers to exist. `ferrojt::open` would keep only tier 0.
+        let model = match JtFile::open(path).map(|file| file.to_model_with_all_lods()) {
             Ok(model) => model,
             Err(err) => {
                 self.status = format!("{}: {err}", path.display());
@@ -105,7 +142,6 @@ impl App {
         camera.set_up_axis(up);
 
         let decoded = meshes::build(&model);
-        let triangles = meshes::triangle_count(&decoded);
         let nodes = model.nodes.len();
         let meshes = model.meshes.len();
 
@@ -122,15 +158,52 @@ impl App {
         self.viewer = viewer;
         self.filter.clear();
         self.renaming = None;
+        self.show_lod = !self.viewer.lod_groups().is_empty();
         self.status = format!(
-            "{} · {nodes} nodes · {meshes} meshes · {triangles} triangles",
+            "{} · {nodes} nodes · {meshes} meshes",
             path.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string())
         );
+        self.lod_status = lod_summary(&self.viewer, self.viewer.total_triangle_count());
 
-        fit(camera, &self.viewer, self.viewport);
+        fit(camera, &self.viewer, self.viewport, self.up);
     }
+
+    /// Refresh the level-of-detail line of the toolbar.
+    fn refresh_lod_status(&mut self) {
+        let loaded = self.viewer.total_triangle_count();
+        self.lod_status = lod_summary(&self.viewer, loaded);
+    }
+}
+
+/// What is on screen and what the file declares, e.g.
+/// `LOD 1/3 · 486 of 1492 triangles`. The tiers of the samples all have the
+/// same depth, so one number pair describes the file; a mixed graph shows the
+/// range instead. A file with a single tier per part has nothing to switch, so
+/// it only reports what is drawn.
+fn lod_summary(viewer: &ViewerScene, loaded: usize) -> String {
+    let triangles = viewer.drawn_triangle_count();
+    let groups = viewer.lod_groups();
+    let Some(deepest) = groups.iter().map(|group| group.tiers.len()).max() else {
+        return if triangles == loaded {
+            format!("{triangles} triangles")
+        } else {
+            format!("{triangles} of {loaded} triangles")
+        };
+    };
+    let shallowest = groups
+        .iter()
+        .map(|group| group.tiers.len())
+        .min()
+        .unwrap_or(0);
+    let depth = if deepest == shallowest {
+        deepest.to_string()
+    } else {
+        format!("{shallowest}..{deepest}")
+    };
+    let tier = groups.iter().map(|group| group.tier).max().unwrap_or(0) + 1;
+    format!("LOD {tier}/{depth} · {triangles} of {loaded} triangles")
 }
 
 /// Frame the whole scene: focus on its centre and back off until it fits.
@@ -139,7 +212,12 @@ impl App {
 /// rectangle — so the outliner and toolbar are simply painted over the image.
 /// `fit` therefore sizes the model against the free rectangle and pushes the
 /// focus point sideways to move the model out from under the outliner.
-fn fit(camera: &mut OrbitCamera3d, viewer: &ViewerScene, vp: Viewport) {
+///
+/// The clip planes are re-fitted with the model. Kiss3d 0.47 exposes no setter
+/// for them — [`OrbitCamera3d::new_with_frustum`] is the only way in — so the
+/// camera is rebuilt from the state just computed and the orbit angles, focus
+/// point and zoom limits are carried over.
+fn fit(camera: &mut OrbitCamera3d, viewer: &ViewerScene, vp: Viewport, up: Vec3) {
     let Some((min, max)) = viewer.world_bounds_all() else {
         return;
     };
@@ -148,8 +226,10 @@ fn fit(camera: &mut OrbitCamera3d, viewer: &ViewerScene, vp: Viewport) {
 
     // The orbit camera clamps `dist` to [min_dist, max_dist], so widen those
     // before moving the camera — a 2 m bracket and a 2 km frame share this code.
-    camera.set_min_dist(radius * 1.0e-4);
-    camera.set_max_dist(radius * 1.0e4);
+    let min_dist = radius * MIN_DIST;
+    let max_dist = radius * FAR;
+    camera.set_min_dist(min_dist);
+    camera.set_max_dist(max_dist);
     camera.set_at(center);
 
     // `fov` is the vertical angle over the whole window height, so the world
@@ -172,9 +252,34 @@ fn fit(camera: &mut OrbitCamera3d, viewer: &ViewerScene, vp: Viewport) {
         // The view transform maps world → view space, so its inverse rotation
         // gives the world directions of the screen axes.
         let right = view.inverse_transform_vector(Vec3::X);
-        let up = view.inverse_transform_vector(Vec3::Y);
-        camera.set_at(center - right * (dx * per_point) + up * (dy * per_point));
+        let screen_up = view.inverse_transform_vector(Vec3::Y);
+        camera.set_at(center - right * (dx * per_point) + screen_up * (dy * per_point));
     }
+
+    // Re-fit the clip planes: the orbit distance is now within a factor of two
+    // of the model radius, so the depth range can be too — see [`NEAR`].
+    // Kiss3d 0.47 has no setter for them, so the camera is rebuilt and its
+    // state carried over.
+    let at = camera.at();
+    let eye = camera.eye();
+    let mut fresh = OrbitCamera3d::new_with_frustum(
+        camera.fov(),
+        (radius * NEAR).max(1.0e-6),
+        dist + radius * FAR,
+        eye,
+        at,
+    );
+    // The constructor starts with a +Y up axis and its own zoom limits, and its
+    // `look_at` clamps the distance to those; put everything back the way the
+    // loaded model and the fit want it. The limits go first because
+    // `set_up_axis` re-derives yaw and pitch through `look_at`, which clamps
+    // against them.
+    fresh.set_min_dist(min_dist);
+    fresh.set_max_dist(max_dist);
+    fresh.set_up_axis(up);
+    fresh.set_at(at);
+    fresh.set_dist(dist);
+    *camera = fresh;
 }
 
 /// The up direction of the loaded model, `+Z` unless the source says otherwise.
@@ -236,10 +341,12 @@ async fn main() {
     window.set_background_color(Color::new(0.13, 0.14, 0.16, 1.0));
     window.set_ambient(0.35);
 
+    // Placeholder frustum: `fit` rebuilds the camera with planes sized to the
+    // model as soon as a file is loaded.
     let mut camera = OrbitCamera3d::new_with_frustum(
         std::f32::consts::FRAC_PI_4,
-        1.0e-3,
-        1.0e6,
+        0.1,
+        1.0e3,
         Vec3::new(3.0, 3.0, 3.0),
         Vec3::ZERO,
     );
@@ -298,6 +405,16 @@ async fn main() {
             app.load(&path, &mut camera);
         }
 
+        // Pick a tier per part from the area it covers on screen. This runs
+        // before the widgets so the toolbar reports what this frame draws.
+        let size = window.size();
+        lod::select(
+            &camera,
+            &mut app.viewer,
+            Vec2::new(size.x as f32, size.y as f32),
+        );
+        app.refresh_lod_status();
+
         // --- egui: toolbar, outliner, trihedron ---------------------------
         let mut commands = Commands::default();
         window.draw_ui(|ctx| {
@@ -328,6 +445,23 @@ async fn main() {
                         if ui.button("Exit").clicked() {
                             commands.exit = true;
                         }
+                        if app.show_lod {
+                            ui.separator();
+                            let mut auto = app.viewer.auto_lod();
+                            if ui
+                                .checkbox(&mut auto, "LOD by screen size")
+                                .on_hover_text(
+                                    "Choose the level of detail of each \
+                                                 part from the area it covers",
+                                )
+                                .clicked()
+                            {
+                                app.viewer.set_auto_lod(auto);
+                                commands.lod = true;
+                            }
+                        }
+                        ui.separator();
+                        ui.label(RichText::new(&app.lod_status).weak());
                         ui.separator();
                         ui.label(RichText::new(&app.status).weak());
                     });
@@ -356,7 +490,12 @@ async fn main() {
 
         // --- window actions, now that `draw_ui` has released the window ----
         if commands.fit || fit_requested {
-            fit(&mut camera, &app.viewer, app.viewport);
+            let up = app.up;
+            fit(&mut camera, &app.viewer, app.viewport, up);
+        }
+        if commands.lod {
+            // Turning the selection off restores the finest tier everywhere.
+            app.refresh_lod_status();
         }
         if commands.open {
             if let Some(path) = pick_file() {

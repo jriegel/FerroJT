@@ -40,15 +40,6 @@ pub fn build(model: &Model) -> Vec<Vec<Decoded>> {
         .collect()
 }
 
-/// Number of triangles a decoded model would draw.
-pub fn triangle_count(decoded: &[Vec<Decoded>]) -> usize {
-    decoded
-        .iter()
-        .flat_map(|primitives| primitives.iter())
-        .map(|entry| entry.mesh.borrow().num_indices() as usize / 3)
-        .sum()
-}
-
 fn decode(model: &Model, primitive: &Primitive) -> Option<Decoded> {
     let positions = attribute_floats(model, primitive, "POSITION")?;
     if positions.is_empty() {

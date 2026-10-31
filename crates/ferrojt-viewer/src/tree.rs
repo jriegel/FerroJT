@@ -216,13 +216,17 @@ fn draw_row(
     // A node reached twice — an `Instance` sharing its subtree — says how often,
     // which is why one screw shows up in two places.
     let mut name_right = eye_rect.min.x - 4.0;
-    if instances > 1 {
+    let badge = scene
+        .lod_stack_at(id)
+        .map(|entry| format!("LOD {}/{}", entry.tier + 1, entry.tiers.len()));
+    let badge = badge.or_else(|| (instances > 1).then(|| format!("\u{d7}{instances}")));
+    if let Some(badge) = badge {
         let right = eye_rect.min.x - 4.0;
-        name_right = right - 26.0;
+        name_right = right - 52.0;
         ui.painter().text(
             pos2(right, mid),
             egui::Align2::RIGHT_CENTER,
-            format!("\u{d7}{instances}"),
+            badge,
             egui::FontId::proportional(icon * 0.9),
             Color32::from_gray(150),
         );
