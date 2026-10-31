@@ -11,7 +11,7 @@ detail lives in `docs/`.
 | `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `export/` glTF/GLB writer and the USD stub. |
 | `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `ls`. |
 | `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `pyproject.toml` + `python/ferrojt/` + `tests/`. |
-| `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `picking.rs`, `trihedron.rs`. |
+| `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `backdrop.rs` viewport gradient, `picking.rs`, `trihedron.rs`. |
 | `python/ferrojt/` | Pure-Python package re-exporting `_ferrojt` (`__init__.py`, `_ferrojt.pyi`, `py.typed`). |
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
 | `data/Reference/` | Reference JSON dumps from the JT tooling **and** reference PNG pictures — **the oracle**. |
@@ -315,6 +315,56 @@ Upload with `python -m twine upload dist\*`.
   graph is **flat**, so `set_visible` has to be re-applied down the whole row
   tree. `project`/`unproject` take **physical pixels** while egui works in
   points — multiply by `pixels_per_point`.
+- **An egui `Area`/`Window` is as big as its contents, not as big as you asked.**
+  `Area::end` stores `state.size = content_ui.min_size()` (`area.rs:668`) and
+  `Resize::end` does the same for a non-resizable `Window` (`resize.rs:352-360`);
+  `fixed_size`/`default_size` only seed the first frame. Two consequences, both
+  hit here: an **empty** area collapses to a point after frame 1, which is why the
+  divider handle was dead until `outliner_resize` pins it with
+  `Ui::set_min_size(strip.size())`; and **overflowing children widen the panel**,
+  which is why `SampleJT_Server.jt` (rows at depth 19–20, `depth · spacing().indent`
+  = 360 pt in a 302 pt column) pushed the outliner to 402 pt past its own divider.
+  `tree::indent_step` clamps the per-level indent to
+  `(available_width − left − right) / deepest`. Labels already `truncate()`, so the
+  culprit was indentation, not long names — measure before guessing.
+- **Outliner width is runtime state.** `tree::DEFAULT_WIDTH` seeds
+  `App::tree_width`, and four places must agree: `Viewport::of`, `App::default`,
+  `outliner_rect()` and `tree::show`'s frame. `outliner_resize` returns the new
+  width (clamped to `MIN_TREE_WIDTH` .. `screen.width() * MAX_TREE_SHARE`) and
+  sets `fit`, because the free rectangle changed shape.
+- **Driving egui from a test works.** `ctx.run_ui(RawInput { screen_rect, events,
+  focused, ..})` + `output.drop_without_applying_deltas()`; send
+  `Event::PointerMoved` / `PointerButton`. Two gotchas: hit testing uses the
+  widget rects of the **previous** pass and an area is not interactable during
+  its first (sizing) pass, so **two warm-up frames** must precede the press; and
+  egui clears `dragged` the moment the release event is seen, so the release must
+  be a frame of its own or the last move is dropped (`drag_delta` is the
+  **per-frame** pointer delta, not the total — move in small steps). Pinned in
+  `main.rs::tests`.
+- **The viewport gradient is a scene quad, not a background** (`backdrop.rs`).
+  `Window::set_background_color` is a flat clear colour; the skybox is
+  equirectangular so its image rows follow **world Y** (the band rotates with the
+  camera) and it forces IBL with no way to disable it; a `PostProcessingEffect`
+  cannot work because the ping-pong targets carry their own depth, not the scene
+  depth. So: a unit quad with `emissive = white × emissive_map` (an 8 px
+  `RgbaImage` added via `TextureManager::add_image` — linear filter, no mipmaps),
+  black albedo and `set_light_layers(0)` so it is unlit, `DEPTH 0.9` / `COVER
+  1.05`, re-placed against the camera every frame. It spans the **whole canvas**
+  (measured: a solid-red quad covers x 9..1008, y 38..787) — the panels merely
+  occlude it. `OrbitCamera3d::view_transform()` is the **world→view** pose. The
+  tone map darkens sRGB bytes by ~20 levels, so `TOP [132,138,150]` renders as
+  ~(114,121,134). Being a plain scene node it is not an outliner row, not picked,
+  not an LOD candidate and not in `world_bounds_all`.
+- **egui's `OpenUrl` output is never read by kiss3d 0.47**, so the About button
+  calls `webbrowser::open` **after** `draw_ui` returns. `ABOUT_RESERVE` exists
+  because egui 0.36 has no text-measurement API — the status row has to leave the
+  right-hand strip free for the right-to-left `Layout`.
+- While the pointer is on the divider strip egui owns the mouse and kiss3d drops
+  the events (`events.rs` consults `is_egui_capturing_mouse`), so dragging the
+  divider does not also orbit the camera.
+- **Never `eprintln!` per outliner row.** 4489 lines per frame starves the app so
+  much that `PrintWindow` captures a frame with **no egui panels at all** — it
+  looks like a catastrophic rendering regression but is only the log flood.
 - **Viewer camera fit: `fov` is VERTICAL over the FULL canvas** (kiss3d
   `orbit3d.rs:457-461` computes `aspect = framebuffer.x / framebuffer.y`), and
   0.47 has no render-area API, so the egui panels only occlude. `fit` therefore
@@ -364,7 +414,8 @@ git 2.50.1. Pinned deps in the root
 `Cargo.toml`: thiserror 2.0, serde 1.0, serde_json 1.0, flate2 1.1, half 2.7,
 bytemuck 1.25, tracing 0.1, rayon 1.12, gltf-json 1.4, gltf 1.4 (dev), base64 0.22,
 lzma-rs 0.3, clap 4.6, anyhow 1.0, tracing-subscriber 0.3, indicatif 0.18,
-kiss3d 0.47 (`egui` feature) + egui 0.36 + rfd 0.17,
+kiss3d 0.47 (`egui` feature) + egui 0.36 + rfd 0.17 + image 0.25 (no features) +
+webbrowser 1.2,
 pyo3 0.30 (`abi3-py310`). No USD crate chosen yet.
 
 ## Open work

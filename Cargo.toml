@@ -49,6 +49,10 @@ indicatif = "0.18"
 kiss3d = { version = "0.47", features = ["egui"] }
 egui = "0.36"
 rfd = "0.17"
+# No codec is needed: the viewport backdrop is generated in memory, and kiss3d
+# already pulls `image` in, so this only names the type the viewer uses.
+image = { version = "0.25", default-features = false }
+webbrowser = "1.2"
 
 # python bindings
 pyo3 = { version = "0.30", features = ["abi3-py310"] }

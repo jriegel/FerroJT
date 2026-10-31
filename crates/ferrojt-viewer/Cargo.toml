@@ -21,3 +21,5 @@ tracing-subscriber = { workspace = true }
 kiss3d = { workspace = true }
 egui = { workspace = true }
 rfd = { workspace = true }
+image = { workspace = true }
+webbrowser = { workspace = true }

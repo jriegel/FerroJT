@@ -14,8 +14,11 @@ use egui::{
 
 use crate::scene::ViewerScene;
 
-/// Width of the outliner column, in points.
-pub const WIDTH: f32 = 320.0;
+/// Starting width of the outliner column, in points.
+///
+/// Only a starting point: the column is resizable, so the width actually drawn
+/// comes from the `viewport` rect the caller passes in.
+pub const DEFAULT_WIDTH: f32 = 320.0;
 
 /// A rename in progress: the row being edited and the text typed so far.
 pub struct Rename {
@@ -32,8 +35,8 @@ pub struct Action {
     pub renamed: Option<(usize, String)>,
 }
 
-/// Draw the outliner anchored at `viewport.min`, [`WIDTH`] wide and as tall as
-/// the window.
+/// Draw the outliner at `viewport`: its left edge, width and height all come
+/// from that rect, so dragging the divider (see `main.rs`) resizes the column.
 pub fn show(
     ctx: &egui::Context,
     scene: &mut ViewerScene,
@@ -53,7 +56,7 @@ pub fn show(
 
     Window::new("Scene Outliner")
         .fixed_pos(viewport.min)
-        .fixed_size(vec2(WIDTH, viewport.height()))
+        .fixed_size(viewport.size())
         .movable(false)
         .resizable(false)
         .collapsible(false)
@@ -68,19 +71,24 @@ pub fn show(
             ui.separator();
 
             let filtered = !filter.trim().is_empty();
+            // The filter box takes the whole width: the column can be dragged
+            // narrower, and squeezing the field against two buttons wastes the
+            // little room a narrow column has.
             let changed = ui
                 .add(
                     egui::TextEdit::singleline(filter)
                         .hint_text("Filter nodes")
-                        .desired_width((ui.available_width() - 96.0).max(40.0)),
+                        .desired_width(ui.available_width()),
                 )
                 .changed();
-            if ui.button("Expand").clicked() {
-                open = Some(true);
-            }
-            if ui.button("Collapse").clicked() {
-                open = Some(false);
-            }
+            ui.horizontal(|ui| {
+                if ui.button("Expand").clicked() {
+                    open = Some(true);
+                }
+                if ui.button("Collapse").clicked() {
+                    open = Some(false);
+                }
+            });
             if changed && filtered {
                 // A filter shows branches that are closed, so open them all.
                 scene.set_rows_open(true);
@@ -96,8 +104,10 @@ pub fn show(
             ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    // Inside the scroll area, so the width excludes its scrollbar.
+                    let step = indent_step(ui, &shown, scene);
                     for &id in &shown {
-                        draw_row(ui, scene, id, filtered, renaming, &mut action);
+                        draw_row(ui, scene, id, filtered, step, renaming, &mut action);
                     }
                 });
         });
@@ -131,11 +141,49 @@ fn filtered_rows(scene: &ViewerScene, filter: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Width reserved for the `LOD n/m` / `×n` badge at the right of a row.
+const BADGE: f32 = 52.0;
+
+/// Points of indentation per nesting level.
+///
+/// The default is shrunk when the file nests deeper than the column allows. An
+/// unclamped `depth · spacing().indent` starts a deep row beyond the right edge,
+/// and egui does not clip that — it *grows the window* to make room, because a
+/// container is always as wide as its contents (`Resize::end` takes
+/// `Ui::min_size`, and `Window::fixed_size` only seeds the default). The outliner
+/// would then sit past the divider the user dragged, with a strip of viewport
+/// inside it. `SampleJT_Server.jt` reaches 20 levels, which at the default 18 pt
+/// is 360 pt of indent in a 302 pt column.
+///
+/// `rows` is what is about to be drawn, so filtering narrows the range and lets
+/// the step grow back.
+fn indent_step(ui: &Ui, rows: &[usize], scene: &ViewerScene) -> f32 {
+    let default = ui.spacing().indent;
+    let deepest = rows
+        .iter()
+        .filter_map(|&id| scene.row(id))
+        .map(|row| row.depth)
+        .max()
+        .unwrap_or(0);
+    if deepest <= 1 {
+        return default;
+    }
+    // What a row spends before its first indent: the disclosure triangle and the
+    // kind glyph on the left, the badge and the eye toggle on the right.
+    let icon = ui.spacing().icon_width;
+    let height = ui.spacing().interact_size.y;
+    let left = 2.0 + height + 2.0 + icon + 4.0;
+    let right = BADGE + 4.0 + icon + 4.0;
+    let room = (ui.available_width() - left - right).max(0.0);
+    (room / deepest as f32).clamp(1.0, default)
+}
+
 fn draw_row(
     ui: &mut Ui,
     scene: &mut ViewerScene,
     id: usize,
     filtering: bool,
+    step: f32,
     renaming: &mut Option<Rename>,
     action: &mut Action,
 ) {
@@ -174,7 +222,7 @@ fn draw_row(
 
     let icon = ui.spacing().icon_width;
     let indent = if filtering { 0 } else { depth };
-    let mut x = rect.min.x + 2.0 + indent as f32 * ui.spacing().indent;
+    let mut x = rect.min.x + 2.0 + indent as f32 * step;
     let mid = rect.center().y;
 
     // Disclosure triangle.
@@ -222,7 +270,7 @@ fn draw_row(
     let badge = badge.or_else(|| (instances > 1).then(|| format!("\u{d7}{instances}")));
     if let Some(badge) = badge {
         let right = eye_rect.min.x - 4.0;
-        name_right = right - 52.0;
+        name_right = right - BADGE;
         ui.painter().text(
             pos2(right, mid),
             egui::Align2::RIGHT_CENTER,
