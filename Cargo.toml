@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/ferrojt", "crates/ferrojt-cli", "crates/ferrojt-python"]
+members = [
+    "crates/ferrojt",
+    "crates/ferrojt-cli",
+    "crates/ferrojt-python",
+    "crates/ferrojt-viewer",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -38,6 +43,12 @@ clap = { version = "4.6", features = ["derive", "env"] }
 anyhow = "1.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = "0.18"
+
+# viewer — kiss3d 0.47 pins egui 0.36; a direct egui dep MUST stay on 0.36 or
+# `Window::draw_ui` gets a second, incompatible egui.
+kiss3d = { version = "0.47", features = ["egui"] }
+egui = "0.36"
+rfd = "0.17"
 
 # python bindings
 pyo3 = { version = "0.30", features = ["abi3-py310"] }

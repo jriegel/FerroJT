@@ -1,0 +1,23 @@
+[package]
+name = "ferrojt-viewer"
+description = "Interactive JT viewer: egui outliner plus a kiss3d viewport rendering JT meshes directly."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ferrojt-viewer"
+path = "src/main.rs"
+
+[dependencies]
+ferrojt = { workspace = true }
+anyhow = { workspace = true }
+half = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+kiss3d = { workspace = true }
+egui = { workspace = true }
+rfd = { workspace = true }

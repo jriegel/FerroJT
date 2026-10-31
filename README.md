@@ -4,13 +4,14 @@ Read [OpenJT](https://www.jt-open.com/) (`.jt`) CAD files and convert them to
 [glTF 2.0](https://www.khronos.org/gltf/) (`.gltf` / `.glb`) and
 [USD](https://openusd.org/) (`.usda`).
 
-FerroJT is a Rust workspace with three parts:
+FerroJT is a Rust workspace with four parts:
 
 | Crate | Purpose |
 | --- | --- |
 | [`crates/ferrojt`](crates/ferrojt) | The library: the neutral `Model` graph, binary codecs, the JT reader and the glTF/USD writers. |
 | [`crates/ferrojt-cli`](crates/ferrojt-cli) | The `ferrojt` command line tool (`info`, `inspect`, `dump`, `convert`, `ls`). |
 | [`crates/ferrojt-python`](crates/ferrojt-python) | `pyo3` bindings, published as the Python package `ferrojt`. |
+| [`crates/ferrojt-viewer`](crates/ferrojt-viewer) | The `ferrojt-viewer` desktop app: an egui outliner next to a kiss3d viewport. |
 
 ## Status
 
@@ -27,6 +28,7 @@ FerroJT is a Rust workspace with three parts:
 | Python bindings | done (packaged with `maturin`) |
 | Visual regression (rendered export vs. reference picture) | done (`tests/test_visual.py`, Open3D) |
 | Interactive viewer (drag and drop, fly camera) | done (`tests/test_viewer.py`, Open3D) |
+| Interactive 3D viewer (outliner, picking, gizmo) | done (`crates/ferrojt-viewer`, egui + kiss3d) |
 
 The reader covers the versions found in `data/ExampleFiles`: JT 8.0, 8.1, 9.5
 and 10.3. Every sample with a reference dump under `data/Reference` is compared
@@ -48,6 +50,7 @@ crates/
       error.rs  lib.rs
   ferrojt-cli/             `ferrojt` binary
   ferrojt-python/          pyo3 extension module `_ferrojt`
+  ferrojt-viewer/          egui + kiss3d viewer application
 python/ferrojt/            pure python package that re-exports _ferrojt
 tests/                     pytest suite for the python package (incl. the visual
                            regression test and its diff pictures) plus the
@@ -92,6 +95,35 @@ one JSON array. A dump is never filtered by layer.
 `convert` applies the layer filter the file declares as active, or its first
 filter when the file leaves that unset: `--layer-filter NAME` picks another one
 of the declared filters, and `--no-layer-filter` exports every part.
+
+## Rust viewer
+
+```sh
+cargo run -p ferrojt-viewer -- data/ExampleFiles/example_block_jt9.5.jt
+```
+
+A native window with the logical scene graph on the left and the model on the
+right. The geometry is built straight from the JT meshes — the `Model` is turned
+into `kiss3d` GPU meshes in memory, nothing goes through glTF — so the viewer
+also shows what the reader decoded rather than what the writer emitted. Materials
+come from the JT attributes: `diffuse` becomes the base colour, `emission` the
+emissive term, and a mesh without an attribute renders grey.
+
+| Input | Action |
+| --- | --- |
+| `Open`, or drag a `.jt` file onto the window | load it, refit the camera |
+| `View All`, or `F` | frame the whole visible model |
+| `Exit` | close the window |
+| click a row / click the model | select — both views highlight it |
+| eye icon | show or hide a node and its subtree |
+| double-click a row | rename it |
+| `Filter nodes`, `Expand`, `Collapse` | narrow or open the tree |
+| drag in the top-left gizmo | orbit; click its ball for the standard views |
+| left drag / wheel in the viewport | orbit / dolly |
+
+Hiding a node or filtering the tree never removes it from the graph: a hidden
+subtree keeps its rows, its place in the tree and its selection, and `View All`
+frames only what is drawn.
 
 ## Python
 

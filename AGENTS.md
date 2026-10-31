@@ -11,6 +11,7 @@ detail lives in `docs/`.
 | `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `export/` glTF/GLB writer and the USD stub. |
 | `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `ls`. |
 | `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `pyproject.toml` + `python/ferrojt/` + `tests/`. |
+| `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms, `tree.rs` outliner, `picking.rs`, `trihedron.rs`. |
 | `python/ferrojt/` | Pure-Python package re-exporting `_ferrojt` (`__init__.py`, `_ferrojt.pyi`, `py.typed`). |
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
 | `data/Reference/` | Reference JSON dumps from the JT tooling **and** reference PNG pictures — **the oracle**. |
@@ -51,6 +52,12 @@ is named `test_*`, so pytest still collects 53 tests):
 
 ```powershell
 .\.venv\Scripts\python.exe tests\test_viewer.py data\ExampleFiles\example_block_jt9.5.jt
+```
+
+Rust viewer (native window, no Python):
+
+```powershell
+cargo run -p ferrojt-viewer -- data\ExampleFiles\example_block_jt9.5.jt
 ```
 
 Wheels for PyPI: `build-wheel.bat [windows|linux|sdist]` (default all) → `dist/`.
@@ -244,6 +251,41 @@ Upload with `python -m twine upload dist\*`.
   messages never reach open3d (raw input); `SendMessageW` from a tick callback
   crashes. Exiting aborts in `~VulkanFboCache:72` (exit `0xC0000409`) — that is
   isl-org/Open3D#7593, expected, `main()` still returns 0.
+- **`crates/ferrojt-viewer` (egui + kiss3d).** kiss3d 0.47 pins **egui 0.36** —
+  do not bump one without the other. `draw_ui` hands out only `&egui::Context`,
+  so its closure cannot touch `window`: collect flags/commands and act after the
+  call. Place the panels with `egui::Window`/`Area` + `fixed_pos`/`fixed_size` +
+  `order(Order::Middle)`. The prelude has no `Mat4`; `Rot3` **is** `glam::Quat`;
+  never call `SceneNode3d::update()` or `world_pose()`. `add_child` panics on an
+  already-parented node, so every instance gets fresh nodes; the kiss3d node
+  graph is **flat**, so `set_visible` has to be re-applied down the whole row
+  tree. `project`/`unproject` take **physical pixels** while egui works in
+  points — multiply by `pixels_per_point`.
+- **Viewer camera fit: `fov` is VERTICAL over the FULL canvas** (kiss3d
+  `orbit3d.rs:457-461` computes `aspect = framebuffer.x / framebuffer.y`), and
+  0.47 has no render-area API, so the egui panels only occlude. `fit` therefore
+  sizes against the free rect left by the outliner/toolbar and then shifts
+  `set_at` by `view.inverse_transform_vector(Vec3::X/Y)` to re-centre the model
+  in the visible part. `Model::bounds` is **never set** by the JT reader
+  (`info --json` → `"bounds": null`) — compute bounds from the slots.
+- **Viewer transform composition: a JT `Transform` is `T·R·S`.** kiss3d keeps
+  `world_scale` separate from `world_transform` (`do_propagate_transforms`) and
+  glamx `Pose3 * Pose3` ignores scale, so a parent's scale never reaches a
+  child's translation. Compose as
+  `Pose3::from_parts(parent_scale * child_translation, child_rotation)` and put
+  the accumulated scale on the **drawable** (`SceneNode3d::mesh(mesh, scale)`),
+  never on the group. `SampleJT_Server.jt` has nine assembly nodes at scale
+  1/25.4 (inch→mm); the split composition inflated the fit AABB ~25× (557 mm
+  against 48 mm) and the model framed tiny. The viewer AABB must match
+  `target/glb_bounds.py <export.glb>` — that script composes the GLB chain and
+  is the cross-check.
+- **Viewer probes:** the display DPI is 1.25, so a screenshot harness must call
+  `SetProcessDpiAwarenessContext(-4)` or the capture is cropped to 800×600.
+  `window.size()` is physical px, `scale_factor() -> f64`, egui `screen_rect` is
+  in points. A **running viewer blocks `cargo build`** (os error 5 on the exe) —
+  `Stop-Process -Name ferrojt-viewer -Force` first. `close_key` defaults to
+  `None`, so `Exit` calls `window.close()`. Against the JT WARN flood use
+  `RUST_LOG=error`; `ferrojt-cli info` prints bounds only with `--json`.
 
 ## Language / platform gotchas hit before
 
@@ -259,6 +301,7 @@ git 2.50.1. Pinned deps in the root
 `Cargo.toml`: thiserror 2.0, serde 1.0, serde_json 1.0, flate2 1.1, half 2.7,
 bytemuck 1.25, tracing 0.1, rayon 1.12, gltf-json 1.4, gltf 1.4 (dev), base64 0.22,
 lzma-rs 0.3, clap 4.6, anyhow 1.0, tracing-subscriber 0.3, indicatif 0.18,
+kiss3d 0.47 (`egui` feature) + egui 0.36 + rfd 0.17,
 pyo3 0.30 (`abi3-py310`). No USD crate chosen yet.
 
 ## Open work

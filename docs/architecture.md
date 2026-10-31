@@ -13,11 +13,13 @@ flowchart LR
   CLI --> JN
   PY[python ferrojt] --> M
   PY --> JN
+  VIEWER[ferrojt-viewer] --> M
 ```
 
 Everything flows through one neutral structure, [`Model`](../crates/ferrojt/src/model/scene.rs).
-Readers produce it, writers consume it, and the CLI and Python bindings are thin
-wrappers over `ferrojt::open` plus `ferrojt::export::*`.
+Readers produce it, writers consume it, and the CLI, the Python bindings and the
+viewer are thin consumers: the viewer turns the `Model` straight into GPU meshes
+rather than going through a file format, so it shows what the reader decoded.
 
 JT is read twice over. `jt::JtFile` keeps the format's own shape — header, TOC
 table and a handle based `SceneGraph` — because `ferrojt dump` and
