@@ -121,6 +121,17 @@ emissive term, and a mesh without an attribute renders grey.
 | `Filter nodes`, `Expand`, `Collapse` | narrow or open the tree |
 | drag in the top-left gizmo | orbit; click its ball for the standard views |
 | left drag / wheel in the viewport | orbit / dolly |
+| middle drag in the viewport | pan (the right button is free for a context menu) |
+| drag the vertical divider | resize the outliner column |
+| drag the horizontal divider | resize the detail pane |
+
+The outliner column is split: the tree of the logical scene graph on top and a
+key/value detail pane below, reporting what the selected row carries — its class
+and name, transform, world box, meshes with triangle counts, materials and LOD
+tier, and the raw properties a JT file stores in the meta data stream of that
+node (`Name::`, `CAD_MASS::`, `LAYER::` and the rest). Those properties are read
+by the library and kept in `Node::extras`; neither the glTF nor the USD writer
+emits them, so the detail pane is their only exit.
 
 Hiding a node or filtering the tree never removes it from the graph: a hidden
 subtree keeps its rows, its place in the tree and its selection, and `View All`

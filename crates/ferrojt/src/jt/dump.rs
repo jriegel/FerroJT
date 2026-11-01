@@ -377,6 +377,37 @@ pub fn scan_for_layer_filter(stream: &[u8]) -> LayerInfo {
     info
 }
 
+/// Every key/value pair of a meta data stream, in file order.
+///
+/// This is the whole content of the stream: the `LAYER::` and
+/// `LAYERFILTERnnn::` keys that [`scan_for_layer`] and
+/// [`scan_for_layer_filter`] pick out, and everything else a CAD system left
+/// behind — `Name::`, `CAD_MASS::`, `Translation Date::` and so on. Keys and
+/// values are not UTF-8 guaranteed, so they are decoded lossily, and a key
+/// whose value is missing at the end of a truncated stream is dropped.
+#[must_use]
+pub fn key_value_pairs(stream: &[u8]) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut at = 0;
+    while at < stream.len() {
+        let key_end = skip_field(stream, at);
+        let key = &stream[at..key_end];
+        let after_key = skip_nul(stream, key_end);
+        if after_key == key_end {
+            // The key is not terminated: the stream is truncated.
+            break;
+        }
+        let value_end = skip_field(stream, after_key);
+        let after_value = skip_nul(stream, value_end);
+        pairs.push((
+            String::from_utf8_lossy(key).into_owned(),
+            String::from_utf8_lossy(&stream[after_key..value_end]).into_owned(),
+        ));
+        at = after_value;
+    }
+    pairs
+}
+
 /// Is `key` present at `at` and terminated by a NUL?
 fn key_at(stream: &[u8], at: usize, key: &[u8]) -> bool {
     stream[at..].starts_with(key) && stream.get(at + key.len()) == Some(&0)
@@ -811,6 +842,29 @@ mod tests {
         assert_eq!(keys, ["ALL", "LAYCUR"]);
         assert_eq!(info.filters["ALL"], vec![1, 2, 256]);
         assert_eq!(info.filters["LAYCUR"], vec![20]);
+    }
+
+    #[test]
+    fn reads_every_pair_of_a_stream() {
+        let stream = b"Name::\x00block\x00LAYER::\x0020\x00CAD_MASS::\x000.257580\x00";
+        let pairs = key_value_pairs(stream);
+        let keys: Vec<&str> = pairs.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, ["Name::", "LAYER::", "CAD_MASS::"]);
+        assert_eq!(pairs[1].1, "20");
+        assert_eq!(pairs[2].1, "0.257580");
+    }
+
+    #[test]
+    fn keeps_an_empty_value_and_drops_a_truncated_key() {
+        let pairs = key_value_pairs(b"A::\x00\x00B::\x001\x00CUT");
+        assert_eq!(
+            pairs,
+            [
+                ("A::".to_string(), String::new()),
+                ("B::".to_string(), "1".to_string())
+            ]
+        );
+        assert!(key_value_pairs(b"").is_empty());
     }
 
     #[test]

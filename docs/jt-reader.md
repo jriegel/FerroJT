@@ -64,6 +64,13 @@ Submodules:
    the file declares any; see below.
 9. One `Material` per distinct appearance, reached from
    `Primitive::material`; see the materials section below.
+10. `Node::extras["properties"]` holding every key/value pair of the meta data
+    stream the node's late loads point at — `Name::`, `CAD_MASS::`,
+    `Translation Date::`, `LAYER::`, the `LAYERFILTERnnn::` records and
+    whatever else the CAD system wrote. The pairs come from
+    `jt::key_value_pairs`, are stored as a sorted map, and stay `None` when the
+    stream is empty. Neither exporter emits them, so they are there for a
+    consumer that wants them — the viewer's detail pane shows them.
 
 ## Materials and colours
 

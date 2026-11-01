@@ -19,7 +19,7 @@
 use std::ops::{Deref, DerefMut};
 
 use kiss3d::camera::{Camera3d, OrbitCamera3d};
-use kiss3d::event::WindowEvent;
+use kiss3d::event::{MouseButton, WindowEvent};
 use kiss3d::glamx::Mat4;
 use kiss3d::prelude::{Pose3, Vec3};
 use kiss3d::window::Canvas;
@@ -61,6 +61,28 @@ impl ViewerCamera {
     pub fn inner_mut(&mut self) -> &mut OrbitCamera3d {
         &mut self.orbit
     }
+
+    /// Point the pan at the middle mouse button, see [`rebind_pan`].
+    pub fn rebind_pan(&mut self) {
+        rebind_pan(&mut self.orbit);
+    }
+}
+
+/// Move the built-in pan from the right to the **middle** mouse button.
+///
+/// Kiss3d's orbit camera pans on [`kiss3d::event::MouseButton::Button2`],
+/// which is the right button — and the right button is the one a context menu
+/// needs. The middle (wheel) button has no built-in binding at all, so moving
+/// the pan there costs nothing: `Canvas::get_mouse_button` tracks every button
+/// (`wgpu_canvas.rs:1359`), and the pan fires from the `CursorPos` handler
+/// whenever `drag_button` is held (`orbit3d.rs:549`), so no custom event code is
+/// involved. Rotation stays on the left button.
+///
+/// This has to be re-applied whenever the camera is **rebuilt**: [`fit`](crate::fit)
+/// replaces it through [`OrbitCamera3d::new_with_frustum`] to re-fit the clip
+/// planes, and a fresh camera starts with the default `Button2` again.
+pub fn rebind_pan(camera: &mut OrbitCamera3d) {
+    camera.rebind_drag_button(Some(MouseButton::Button3));
 }
 
 impl Deref for ViewerCamera {
@@ -188,5 +210,24 @@ mod tests {
         let fresh = orbit();
         assert_eq!(camera.eye(), fresh.eye());
         assert_eq!(camera.clip_planes(), fresh.clip_planes());
+        // A rebuilt camera is a fresh one, bindings included — which is exactly
+        // why `fit` has to re-apply the pan.
+        rebind_pan(camera.inner_mut());
+        assert_eq!(camera.drag_button(), Some(MouseButton::Button3));
+    }
+
+    /// The right button has to be free for the context menu, so the pan lives on
+    /// the middle button and rotation stays where it was.
+    #[test]
+    fn the_middle_button_pans_and_the_right_one_is_free() {
+        let mut camera = ViewerCamera::new(orbit());
+        assert_eq!(
+            camera.drag_button(),
+            Some(MouseButton::Button2),
+            "kiss3d pans on the right button until told otherwise"
+        );
+        camera.rebind_pan();
+        assert_eq!(camera.drag_button(), Some(MouseButton::Button3));
+        assert_eq!(camera.rotate_button(), Some(MouseButton::Button1));
     }
 }

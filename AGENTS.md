@@ -11,7 +11,7 @@ design detail lives in `docs/`.
 | `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `export/` glTF/GLB writer and the ASCII USD writer. |
 | `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `ls`. |
 | `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `pyproject.toml` + `python/ferrojt/` + `tests/`. |
-| `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `backdrop.rs` viewport gradient, `camera.rs` `Camera3d` wrapper that places the backdrop, `picking.rs`, `trihedron.rs`. |
+| `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `details.rs` key/value pane for the selected row, `backdrop.rs` viewport gradient, `camera.rs` `Camera3d` wrapper that places the backdrop, `picking.rs`, `trihedron.rs`. |
 | `python/ferrojt/` | Pure-Python package re-exporting `_ferrojt` (`__init__.py`, `_ferrojt.pyi`, `py.typed`). |
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
 | `data/Reference/` | Reference JSON dumps from the JT tooling **and** reference PNG pictures — **the oracle**. |
@@ -365,6 +365,44 @@ Upload with `python -m twine upload dist\*`.
   `outliner_rect()` and `tree::show`'s frame. `outliner_resize` returns the new
   width (clamped to `MIN_TREE_WIDTH` .. `screen.width() * MAX_TREE_SHARE`) and
   sets `fit`, because the free rectangle changed shape.
+- **The outliner column has a second runtime height.** `details::DEFAULT_HEIGHT`
+  (210) seeds `App::details_height`; `tree_rect`/`details_rect`/`split_y`/
+  `outliner_split` must agree, and `MIN_DETAILS_HEIGHT` (90) ..
+  `outliner.height() * MAX_DETAILS_SHARE` (0.6) are the clamps. Each half is its
+  own `egui::Window`, so both are placed from a rect and the split line is shared
+  (`tree.max.y == details.min.y`). `outliner_split` must **not** set
+  `commands.fit` — the free viewport rectangle is unchanged when the column is
+  split taller — while `outliner_resize` must. Dragging **up** grows the detail
+  pane, so the delta is subtracted from the height.
+- **kiss3d pans on the RIGHT button by default.** `OrbitCamera3d` starts with
+  `rotate_button: Some(Button1)` and `drag_button: Some(MouseButton::Button2)`
+  (right); winit maps Middle → `Button3`, Right → `Button2`
+  (`wgpu_canvas.rs:1979`/`2200`), and pan fires from the `CursorPos` handler when
+  `drag_button` is held (`orbit3d.rs:549`). `camera.rs::rebind_pan` sets it to
+  `Button3` so the right button stays free for a context menu. **`fit()` rebuilds
+  the camera with `new_with_frustum`, which restores `Button2`** — call
+  `camera::rebind_pan(&mut fresh)` inside `fit()` *and* `camera.rebind_pan()`
+  once in `main()`.
+- **JT key/value properties live in the late-load meta data stream**, not the LSG
+  property table (which only carries `JT_PROP_NAME` + the late loads). Read them
+  with `jt::key_value_pairs(&handle_late_loads_meta(graph, node.late_loads()))` —
+  that is the *whole* stream, `LAYER::`/`LAYERFILTERnnn::` plus `Name::`,
+  `CAD_MASS::`, `Translation Date::` and whatever else the CAD system wrote.
+  `jt/model.rs::node_properties` stores it as `Node::extras["properties"]` (a
+  sorted map, `None` when empty so plain nodes and existing fixtures are
+  unchanged). Neither exporter emits node extras (glTF `to_node` sets
+  `extras: None`, USD reads only `model.extras["layer_filter"]`), so pinned
+  counts are unchanged and the viewer's detail pane is their only exit. The
+  parity test `the_key_value_properties_of_a_sample_reach_its_nodes()` must
+  **sort and dedup both sides**: `jt::dump` expands an instanced subtree once per
+  instance (plate1-9.5 → 6 `properties` objects) while the model keeps **one
+  shared node**, and each map is paired with the node class so a set cannot be
+  credited to the wrong node.
+- **`ferrojt-viewer` now depends on `serde_json`** (workspace) — the detail pane
+  walks `Node::extras`. `Painter::hline(x_range, y, stroke)` takes the **x range
+  first**, and a `format!` placeholder cannot contain a call expression, so the
+  `details.rs` number helpers return `String`s that go into locals before
+  interpolation.
 - **Driving egui from a test works.** `ctx.run_ui(RawInput { screen_rect, events,
   focused, ..})` + `output.drop_without_applying_deltas()`; send
   `Event::PointerMoved` / `PointerButton`. Two gotchas: hit testing uses the

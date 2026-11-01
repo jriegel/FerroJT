@@ -13,6 +13,7 @@
 
 mod backdrop;
 mod camera;
+mod details;
 mod lod;
 mod meshes;
 mod picking;
@@ -62,6 +63,19 @@ const MAX_TREE_SHARE: f32 = 0.6;
 /// be hit deliberately; the divider itself is drawn one point wide in the middle
 /// of it.
 const DIVIDER_GRAB: f32 = 3.0;
+
+/// Smallest the detail pane at the foot of the outliner can be dragged to.
+///
+/// Below this the pane is a title bar with a single row in it, which is not a
+/// pane the user can read anything in.
+const MIN_DETAILS_HEIGHT: f32 = 90.0;
+
+/// Largest share of the outliner column the detail pane may take.
+///
+/// The tree has to stay usable: the split is only worth having while both halves
+/// show something, and a detail pane that fills the column leaves no tree to
+/// select a row with.
+const MAX_DETAILS_SHARE: f32 = 0.6;
 
 /// The project page the toolbar's About button opens.
 const PROJECT_URL: &str = "https://github.com/jriegel/FerroJT";
@@ -157,6 +171,9 @@ struct App {
     /// Width of the outliner column, in logical points. The user drags the
     /// divider between the column and the viewport to change it.
     tree_width: f32,
+    /// Height of the detail pane at the foot of the outliner, in points. The
+    /// user drags the divider between it and the tree to change it.
+    details_height: f32,
     /// Frame rate of the render loop, shown in the toolbar.
     fps: FpsMeter,
     /// Aspect ratio of the 3D viewport, kept up to date each frame.
@@ -177,6 +194,7 @@ impl Default for App {
             lod_status: String::new(),
             show_lod: false,
             tree_width: tree::DEFAULT_WIDTH,
+            details_height: details::DEFAULT_HEIGHT,
             fps: FpsMeter::default(),
             viewport: Viewport {
                 left: tree::DEFAULT_WIDTH,
@@ -422,6 +440,9 @@ fn fit(camera: &mut OrbitCamera3d, viewer: &ViewerScene, vp: Viewport, up: Vec3)
     fresh.set_up_axis(up);
     fresh.set_at(at);
     fresh.set_dist(dist);
+    // A rebuilt camera also resets its mouse bindings to the kiss3d defaults,
+    // which pan on the right button — see [`camera::rebind_pan`].
+    camera::rebind_pan(&mut fresh);
     *camera = fresh;
 }
 
@@ -496,6 +517,8 @@ async fn main() {
         Vec3::ZERO,
     ));
     camera.set_up_axis(Vec3::Z);
+    // Pan on the middle button, so the right one stays free for a context menu.
+    camera.rebind_pan();
 
     // The first `fit` happens inside `load`, so the viewport has to be known
     // before it.
@@ -649,15 +672,24 @@ async fn main() {
             tree::show(
                 ctx,
                 &mut app.viewer,
-                outliner,
+                tree_rect(outliner, app.details_height),
                 &mut app.filter,
                 &mut app.renaming,
+            );
+            details::show(
+                ctx,
+                app.model.as_ref(),
+                &app.viewer,
+                details_rect(outliner, app.details_height),
             );
 
             if let Some(width) = outliner_resize(ctx, screen, outliner, app.tree_width) {
                 app.tree_width = width;
                 // The free rectangle changed shape, so re-frame the model.
                 commands.fit = true;
+            }
+            if let Some(height) = outliner_split(ctx, outliner, app.details_height) {
+                app.details_height = height;
             }
 
             let up = app.up;
@@ -712,6 +744,83 @@ fn outliner_rect(screen: Rect, width: f32) -> Rect {
         Pos2::new(screen.min.x, screen.min.y + TOOLBAR + MARGIN),
         Pos2::new(screen.min.x + width, screen.max.y),
     )
+}
+
+/// The tree half of the outliner column: everything above the detail pane.
+///
+/// The column is split rather than stacked by egui because each half is its own
+/// [`egui::Window`] with its own title bar and scroll area, and a window has to
+/// be placed from a rect — the same reason the column itself is placed from
+/// [`outliner_rect`].
+fn tree_rect(outliner: Rect, details_height: f32) -> Rect {
+    let split = split_y(outliner, details_height);
+    Rect::from_min_max(outliner.min, Pos2::new(outliner.max.x, split))
+}
+
+/// The detail half of the outliner column: everything below the tree.
+fn details_rect(outliner: Rect, details_height: f32) -> Rect {
+    let split = split_y(outliner, details_height);
+    Rect::from_min_max(Pos2::new(outliner.min.x, split), outliner.max)
+}
+
+/// Where the divider sits: `details_height` points above the bottom edge, never
+/// above the top of the column.
+fn split_y(outliner: Rect, details_height: f32) -> f32 {
+    (outliner.max.y - details_height).max(outliner.min.y)
+}
+
+/// The divider between the tree and the detail pane, and what dragging it does.
+///
+/// The same construction as [`outliner_resize`] turned a quarter turn: an
+/// [`egui::Area`] pinned to a strip that spans the width of the column, with
+/// `Ui::set_min_size` keeping it from collapsing to its (empty) contents, in
+/// [`Order::Foreground`] so it draws over both panels.
+///
+/// Returns the new height of the detail pane when the divider moved, `None`
+/// otherwise. Dragging it does **not** ask for a re-fit: the split happens
+/// inside the outliner column, so the free rectangle the camera is framed
+/// against is unchanged — unlike [`outliner_resize`], which changes its width.
+fn outliner_split(ctx: &egui::Context, outliner: Rect, height: f32) -> Option<f32> {
+    let id = Id::new("ferrojt.outliner.split");
+    let split = split_y(outliner, height);
+    let strip = Rect::from_min_max(
+        Pos2::new(outliner.min.x, split - DIVIDER_GRAB),
+        Pos2::new(outliner.max.x, split + DIVIDER_GRAB),
+    );
+    let response = egui::Area::new(id)
+        .fixed_pos(strip.min)
+        .default_size(strip.size())
+        .sense(Sense::drag())
+        .order(Order::Foreground)
+        .show(ctx, |ui| {
+            ui.set_min_size(strip.size());
+        })
+        .response;
+
+    if response.hovered() || response.dragged() {
+        ctx.set_cursor_icon(CursorIcon::ResizeVertical);
+    }
+
+    let style = ctx.style_of(ctx.theme());
+    let color = if response.dragged() {
+        style.visuals.widgets.active.fg_stroke.color
+    } else if response.hovered() {
+        style.visuals.widgets.hovered.fg_stroke.color
+    } else {
+        style.visuals.widgets.noninteractive.bg_stroke.color
+    };
+    ctx.layer_painter(LayerId::new(Order::Foreground, id))
+        .hline(outliner.x_range(), split, Stroke::new(1.0, color));
+
+    if !response.dragged() {
+        return None;
+    }
+    // Dragging up grows the detail pane, so the pointer delta is subtracted. The
+    // pane may never be shorter than a few readable rows nor taller than most of
+    // the column, or there is no tree left to pick a row with.
+    let tallest = (outliner.height() * MAX_DETAILS_SHARE).max(MIN_DETAILS_HEIGHT);
+    let next = (height - response.drag_delta().y).clamp(MIN_DETAILS_HEIGHT, tallest);
+    (next != height).then_some(next)
 }
 
 /// The divider between the outliner and the viewport, and what dragging it does.
@@ -799,6 +908,31 @@ mod tests {
         assert_eq!(rect.max.y, 700.0);
     }
 
+    #[test]
+    fn the_detail_pane_sits_below_the_tree_without_a_gap() {
+        let outliner = outliner_rect(screen(), 320.0);
+        let tree = tree_rect(outliner, 210.0);
+        let details = details_rect(outliner, 210.0);
+
+        // The two halves tile the column: they meet on one line and together are
+        // exactly the column, so no panel floats and none is clipped.
+        assert_eq!(tree.max.y, details.min.y);
+        assert_eq!(tree.min, outliner.min);
+        assert_eq!(details.max, outliner.max);
+        assert_eq!(tree.max.x, outliner.max.x);
+        assert_eq!(details.min.x, outliner.min.x);
+        assert_eq!(details.height(), 210.0);
+    }
+
+    #[test]
+    fn a_details_height_beyond_the_column_leaves_the_tree_nothing() {
+        // The clamp keeps the split inside the column: a huge pane cannot push
+        // the tree off the top of the window, it simply empties it.
+        let outliner = outliner_rect(screen(), 320.0);
+        assert_eq!(split_y(outliner, 10_000.0), outliner.min.y);
+        assert!(tree_rect(outliner, 10_000.0).height() <= 0.0);
+    }
+
     /// Drives the divider with synthetic pointer events — the same events the
     /// window forwards — and returns the width after the drag.
     ///
@@ -874,6 +1008,89 @@ mod tests {
         assert_eq!(
             dragged_width(320.0, 999.0, 320.0),
             screen().width() * MAX_TREE_SHARE
+        );
+    }
+
+    /// Drives the horizontal divider the way [`dragged_width`] drives the
+    /// vertical one, and returns the height of the detail pane afterwards. The
+    /// pointer starts on the divider itself.
+    fn dragged_height(grab: f32, to: f32, start: f32) -> f32 {
+        let ctx = egui::Context::default();
+        let screen = screen();
+        let outliner = outliner_rect(screen, 320.0);
+        let mut height = start;
+        let mut frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                if let Some(next) = outliner_split(ui.ctx(), outliner, height) {
+                    height = next;
+                }
+            });
+            output.drop_without_applying_deltas();
+        };
+
+        // Two warm-up frames before the press, for the same reason as the
+        // vertical divider: hit testing uses the rects of the previous pass.
+        for _ in 0..2 {
+            frame(vec![egui::Event::PointerMoved(Pos2::new(160.0, grab))]);
+        }
+
+        let steps = 20;
+        for step in 0..=steps {
+            let y = grab + (to - grab) * (step as f32 / steps as f32);
+            let at = Pos2::new(160.0, y);
+            let mut events = vec![egui::Event::PointerMoved(at)];
+            if step == 0 {
+                events.push(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                });
+            }
+            frame(events);
+        }
+        frame(vec![egui::Event::PointerButton {
+            pos: Pos2::new(160.0, to),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+        height
+    }
+
+    #[test]
+    fn dragging_the_split_up_grows_the_detail_pane() {
+        let outliner = outliner_rect(screen(), 320.0);
+        let start = 210.0;
+        let grab = split_y(outliner, start);
+        // Pulled 100 points up: the detail pane takes the space the tree lost.
+        let up = dragged_height(grab, grab - 100.0, start);
+        assert!((up - 310.0).abs() < 1.0, "got {up}");
+        // And pushed back down again.
+        let down = dragged_height(grab, grab + 60.0, start);
+        assert!((down - 150.0).abs() < 1.0, "got {down}");
+    }
+
+    #[test]
+    fn the_split_stops_at_its_clamps() {
+        let outliner = outliner_rect(screen(), 320.0);
+        let start = 210.0;
+        let grab = split_y(outliner, start);
+        // Never shorter than a title bar and a few rows, never so tall that no
+        // tree is left to pick a row in.
+        assert_eq!(
+            dragged_height(grab, outliner.max.y, start),
+            MIN_DETAILS_HEIGHT
+        );
+        assert_eq!(
+            dragged_height(grab, outliner.min.y, start),
+            outliner.height() * MAX_DETAILS_SHARE
         );
     }
 

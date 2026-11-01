@@ -66,7 +66,7 @@ pub fn show(
         .show(ctx, |ui| {
             ui.label(
                 "Drag and drop a JT file to open it · click a row to select it · \
-                 click the eye icon to toggle visibility.",
+                 click the eye icon to toggle visibility · middle-drag the view to pan.",
             );
             ui.separator();
 

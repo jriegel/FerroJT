@@ -40,8 +40,9 @@ pub use decode::{
 };
 pub use dump::{
     DUMP_ALL, DUMP_LOD0, DUMP_MESH, DUMP_TOC, LayerInfo, dump, format_g, handle_all_children_json,
-    handle_attributes_json, handle_late_loads_meta, recurse_down_the_tree, scan_for_layer,
-    scan_for_layer_filter, write_key_value_stream, write_meshes_without_lsg, write_model,
+    handle_attributes_json, handle_late_loads_meta, key_value_pairs, recurse_down_the_tree,
+    scan_for_layer, scan_for_layer_filter, write_key_value_stream, write_meshes_without_lsg,
+    write_model,
 };
 pub use guid::Guid;
 pub use model::{

@@ -2,6 +2,7 @@
 //! of a range LOD. The coarser tiers of the same part must not appear as extra
 //! meshes, and every mesh has to say which tier it came from.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// What a sample exports once the coarse tiers are dropped.
@@ -939,6 +940,117 @@ fn no_sample_loses_a_part_to_its_own_filter() {
             "{name}: the applied filter is not recorded"
         );
     }
+}
+
+#[test]
+fn the_key_value_properties_of_a_sample_reach_its_nodes() {
+    // A JT file keeps its metadata in the NUL-separated key/value stream behind
+    // a node's late loads — the same stream `jt::dump` prints as `properties`.
+    // The viewer shows it per node, so it has to travel in `Node::extras` rather
+    // than be re-read from the file. The reference dumps are the oracle.
+    for (name, _, _) in FILTERS {
+        let file = sample(name);
+        let model = file.to_model();
+        let wanted = reference_properties(name);
+
+        let mut got: Vec<(String, BTreeMap<String, String>)> = model
+            .nodes
+            .iter()
+            .filter_map(|node| Some((node.kind.clone()?, node.extras.as_ref()?)))
+            .filter_map(|(kind, extras)| Some((kind, extras.get("properties")?)))
+            .map(|(kind, properties)| {
+                let pairs = properties
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{name}: properties is not an object"))
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            value
+                                .as_str()
+                                .unwrap_or_else(|| {
+                                    panic!("{name}: the value of {key} is not a string")
+                                })
+                                .to_owned(),
+                        )
+                    })
+                    .collect();
+                (kind, pairs)
+            })
+            .collect();
+        got.sort();
+        got.dedup();
+
+        // The dump expands an instanced subtree once per instance while the
+        // model keeps one shared node for it (plate1-9.5 instantiates its screw
+        // twice), so the comparison is over the *distinct* property sets: every
+        // stream the file declares must be present, and the model must not
+        // invent one the dump does not show.
+        assert_eq!(
+            got.len(),
+            wanted.len(),
+            "{name}: a node lost or gained its key/value stream"
+        );
+        for (actual, expected) in got.iter().zip(&wanted) {
+            assert_eq!(actual, expected, "{name}: the properties differ");
+        }
+    }
+}
+
+/// Every `properties` object of the reference dump of a sample, paired with the
+/// `jt_type` of the node carrying it, sorted and deduplicated. The dump prints
+/// them under the node they belong to, so walking the whole JSON for that key is
+/// enough — and pairing with the class also proves the reader attached each
+/// stream to a node of the right kind instead of merging them somewhere else.
+fn reference_properties(name: &str) -> Vec<(String, BTreeMap<String, String>)> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("the workspace root")
+        .join("data")
+        .join("Reference")
+        .join(Path::new(name).with_extension("json"));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()));
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned();
+    let value: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|err| panic!("{name}: {err}"));
+
+    let mut found = Vec::new();
+    let mut stack = vec![&value];
+    while let Some(current) = stack.pop() {
+        match current {
+            serde_json::Value::Object(map) => {
+                let kind = map
+                    .get("jt_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                for (key, item) in map {
+                    if key == "properties" {
+                        let object = item
+                            .as_object()
+                            .unwrap_or_else(|| panic!("{name}: properties is not an object"));
+                        let pairs = object
+                            .iter()
+                            .map(|(key, value)| {
+                                (key.clone(), value.as_str().unwrap_or("").to_owned())
+                            })
+                            .collect::<BTreeMap<_, _>>();
+                        if !pairs.is_empty() {
+                            found.push((kind.clone(), pairs));
+                        }
+                    }
+                    stack.push(item);
+                }
+            }
+            serde_json::Value::Array(items) => stack.extend(items),
+            _ => {}
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
 }
 
 #[test]

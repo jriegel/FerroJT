@@ -437,6 +437,14 @@ impl ViewerScene {
         row_drawn(id, &self.rows, &self.visible, &self.lod_hidden)
     }
 
+    /// Triangles attached at a row, not counting its children.
+    ///
+    /// The detail pane reports this per attachment, the same basis
+    /// [`ViewerScene::total_triangle_count`] uses, so the two add up.
+    pub fn row_triangles(&self, id: usize) -> usize {
+        self.slots.get(id).map_or(0, |slot| slot.triangles)
+    }
+
     /// The level-of-detail stacks of the scene, finest tier first.
     pub fn lod_groups(&self) -> &[LodGroup] {
         &self.lod_groups

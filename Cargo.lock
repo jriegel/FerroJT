@@ -1057,6 +1057,7 @@ dependencies = [
  "image",
  "kiss3d",
  "rfd",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "webbrowser",

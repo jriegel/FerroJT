@@ -6,13 +6,15 @@
 //! table tying the two together. Representation data lives in other segments
 //! and is pulled in through late-load properties.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
 use crate::error::{Error, Result};
-use crate::jt::dump::{LayerInfo, handle_late_loads_meta, scan_for_layer, scan_for_layer_filter};
+use crate::jt::dump::{
+    LayerInfo, handle_late_loads_meta, key_value_pairs, scan_for_layer, scan_for_layer_filter,
+};
 use crate::jt::guid::Guid;
 use crate::jt::object::{
     Attribute, Class, Element, LateLoad, LodGeometry, Material, Node, Property, class_of,
@@ -875,6 +877,13 @@ fn build_node(
         ..model::Node::default()
     };
 
+    // The key/value stream the late loads of a node point at is where a JT
+    // file keeps its metadata: `Name::`, `CAD_MASS::`, `LAYER::`, the layer
+    // filters and whatever else the CAD system wrote. `jt::dump` prints that
+    // object for parts and meta data only; the viewer shows it for every node,
+    // so it travels in `extras` and no exporter emits it.
+    out.extras = node_properties(graph, node);
+
     let drawn = match (node, filter) {
         (Node::Part(_), Some(filter)) => filter.keeps(&graph.layers_of(node)),
         _ => true,
@@ -929,6 +938,25 @@ fn build_node(
     }
     model.nodes[index].children = children;
     index
+}
+
+/// The key/value metadata of a node, as `{"properties": {…}}`.
+///
+/// A node without late loads — or whose late loads point at PMI or shape
+/// segments rather than meta data — has no properties at all and yields `None`,
+/// which keeps the extras of the many plain nodes of a large assembly empty.
+/// The pairs are sorted by key so that the same file always produces the same
+/// document; `serde_json` is built without `preserve_order` anyway.
+fn node_properties(graph: &SceneGraph, node: &Node) -> Option<serde_json::Value> {
+    if node.late_loads().is_empty() {
+        return None;
+    }
+    let pairs = key_value_pairs(&handle_late_loads_meta(graph, node.late_loads()));
+    if pairs.is_empty() {
+        return None;
+    }
+    let properties: BTreeMap<String, String> = pairs.into_iter().collect();
+    Some(json!({ "properties": properties }))
 }
 
 /// Where a node sits in the level of detail stack of a range LOD.
@@ -1454,6 +1482,34 @@ mod tests {
             graph
                 .layers_of(graph.node_at(3).expect("the untagged part"))
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_nodes_key_value_stream_travels_in_its_extras() {
+        let file = fixture(Some(FILTERS), Some(TAG));
+        let model = file.to_model();
+
+        let meta = node_index(&model, "MetaData");
+        let extras = model.nodes[meta].extras.as_ref().expect("meta data extras");
+        let properties = &extras["properties"];
+        assert_eq!(properties["LAYERFILTER001::"], "ALL=1,2,256");
+        assert_eq!(properties["LAYERFILTER000::"], "LAYCUR=20");
+        assert_eq!(properties["ACTIVELAYERFILTER::"], "");
+
+        let tagged = node_index(&model, "tagged.part");
+        let extras = model.nodes[tagged]
+            .extras
+            .as_ref()
+            .expect("the tagged part extras");
+        assert_eq!(extras["properties"]["LAYER::"], "1");
+
+        // A node whose only late load is a shape has no metadata to report.
+        let plain = node_index(&model, "plain.part");
+        assert!(model.nodes[plain].extras.is_none());
+        assert!(
+            model.nodes[0].extras.is_none(),
+            "the root has no late loads"
         );
     }
 
