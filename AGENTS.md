@@ -305,6 +305,38 @@ Upload with `python -m twine upload dist\*`.
   messages never reach open3d (raw input); `SendMessageW` from a tick callback
   crashes. Exiting aborts in `~VulkanFboCache:72` (exit `0xC0000409`) — that is
   isl-org/Open3D#7593, expected, `main()` still returns 0.
+- **File→Open is the Win32 shell dialog on both sides.** The Rust viewer already
+  gets it: `rfd 0.17` selects the `win_cid` backend (the Common Item Dialog,
+  `IFileOpenDialog`) on Windows, so `pick_file()` in `main.rs` needs no change.
+  The Python viewer used `open3d.visualization.gui.FileDialog`, which is a widget
+  Open3D draws inside its own window — no favourites, libraries, network places,
+  pinned folders or type-ahead — so it now calls `comdlg32.GetOpenFileNameW`
+  through ctypes (`_win32_open_dialog`), with the Open3D widget kept as the
+  non-Windows fallback. It returns `(available, path)`, and the caller **must**
+  use that pair: `(True, None)` is a cancel and must not pop a second dialog,
+  `(False, None)` is "no Win32 here" and falls back. Pass `self._hwnd` (grab it
+  first) as `hwndOwner` or the dialog is not modal to the viewer. ctypes details:
+  `sizeof(OPENFILENAMEW)` is **152** on x64 and `lStructSize` must be that; the
+  field is `nFilterIndex`, **not** `nCustFilter`; an `LPWSTR` field rejects a
+  `create_unicode_buffer` outright (`TypeError: incompatible types,
+  c_wchar_Array_N`) and needs `ctypes.cast(buffer, ctypes.c_wchar_p)`; keep every
+  buffer in a named local so it outlives the call. Flags: `OFN_PATHMUSTEXIST`
+  `0x800` and `OFN_FILEMUSTEXIST` `0x1000` (**not** `0x8`/`0x10`),
+  `OFN_EXPLORER` `0x80000` (modern dialog), `OFN_NOCHANGEDIR` `0x8`,
+  `OFN_ENABLESIZING` `0x800000`. The filter is one double-NUL-terminated run of
+  `"desc\0*.ext\0"` pairs.
+- **A real shell dialog cannot be driven from a background process.** Probing the
+  dialog works read-only — find it by class `#32770` + pid, `EnumChildWindows`
+  shows the name edit as `ComboBoxEx32`/`ComboBox`/`Edit` all with id `1148`
+  (`cmb13`), the type combo `1136`, OK `1`, Cancel `2` — and `WM_CLOSE` gives a
+  clean cancel. But `SetForegroundWindow` from a non-foreground process fails with
+  `ERROR_ACCESS_DENIED` (5), so `SendInput` (which needs `sizeof(INPUT) == 40` on
+  x64 — pad the union to 32 bytes or it returns 0) injects into nothing, and
+  `SetDlgItemTextW`/`BM_CLICK`/`WM_COMMAND`+`IDOK` are all ignored by the modern
+  dialog. Verify the *select* path deterministically instead: stub
+  `ctypes.windll.comdlg32` with an object whose `GetOpenFileNameW` writes into
+  `lpstrFile` and returns 1, then read back `lStructSize`, `nMaxFile`, `Flags`,
+  the filter pairs and the returned path.
 - **`crates/ferrojt-viewer` (egui + kiss3d).** kiss3d 0.47 pins **egui 0.36** —
   do not bump one without the other. `draw_ui` hands out only `&egui::Context`,
   so its closure cannot touch `window`: collect flags/commands and act after the

@@ -34,6 +34,14 @@ Notes
   ``comctl32.SetWindowSubclass()`` and handles ``WM_DROPFILES`` itself (best
   effort; ``File -> Open`` always works). A plain
   ``SetWindowLongPtrW(GWLP_WNDPROC)`` subclass is never called on that window.
+* ``File -> Open`` uses the **Win32 file dialog**
+  (``comdlg32.GetOpenFileNameW``, i.e. the same ``IFileOpenDialog`` common
+  dialog every Windows application shows) rather than
+  ``open3d.visualization.gui.FileDialog``: that one is a widget Open3D draws
+  inside its own window, with no shell integration — no favourites, no
+  libraries, no network places, no pinned folders, no type-ahead. On any other
+  platform the Open3D widget stays in use, because there the native dialog is
+  not available and the widget is the better fallback.
 * On exit Open3D aborts with
   ``Postcondition in ~VulkanFboCache:72 ... Please explicitly call terminate()``
   (isl-org/Open3D#7593). Nothing in the Python API can prevent it, so the
@@ -257,6 +265,114 @@ def _find_window_handle(title):
         return found or fallback
     except Exception:  # pragma: no cover - platform specific
         return 0
+
+
+# How much room ``GetOpenFileNameW`` gets for the path. It has to hold a full
+# UNC path; 4096 characters is well past any real one, and the function reports
+# ``OFNERR_BUFFERTOOSMALL`` rather than truncating silently.
+_PATH_BUFFER = 4096
+
+
+def _win32_open_dialog(hwnd, title, initial_dir, extension, description):
+    """Show the Win32 open file dialog, returning ``(available, path)``.
+
+    This is ``comdlg32.GetOpenFileNameW`` — the shell's common item dialog, the
+    same one every Windows application shows, with the favourites bar, the
+    libraries, network places and the type-ahead that a hand-drawn widget has to
+    re-implement badly. ``hwnd`` makes it modal to the viewer window and keeps it
+    in front of that window rather than floating loose.
+
+    ``available`` is what lets the caller tell a cancel from an absent dialog:
+    ``(False, None)`` means this platform has no Win32 dialog and the Open3D
+    widget should be used instead, while ``(True, None)`` means the user pressed
+    Cancel and nothing should be asked again. Never raises.
+    """
+    if sys.platform != "win32":
+        return False, None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        comdlg32 = ctypes.windll.comdlg32
+
+        # The ``OPENFILENAME`` flags, as in the SDK headers.
+        OFN_HIDEREADONLY = 0x0004
+        OFN_NOCHANGEDIR = 0x0008
+        OFN_PATHMUSTEXIST = 0x0800
+        OFN_FILEMUSTEXIST = 0x1000
+        OFN_EXPLORER = 0x00080000
+        OFN_ENABLESIZING = 0x00800000
+
+        class OPENFILENAMEW(ctypes.Structure):
+            _fields_ = [
+                ("lStructSize", wintypes.DWORD),
+                ("hwndOwner", wintypes.HWND),
+                ("hInstance", wintypes.HINSTANCE),
+                ("lpstrFilter", wintypes.LPWSTR),
+                ("lpstrCustomFilter", wintypes.LPWSTR),
+                ("nMaxCustFilter", wintypes.DWORD),
+                ("nFilterIndex", wintypes.DWORD),
+                ("lpstrFile", wintypes.LPWSTR),
+                ("nMaxFile", wintypes.DWORD),
+                ("lpstrFileTitle", wintypes.LPWSTR),
+                ("nMaxFileTitle", wintypes.DWORD),
+                ("lpstrInitialDir", wintypes.LPWSTR),
+                ("lpstrTitle", wintypes.LPWSTR),
+                ("Flags", wintypes.DWORD),
+                ("nFileOffset", wintypes.WORD),
+                ("nFileExtension", wintypes.WORD),
+                ("lpstrDefExt", wintypes.LPWSTR),
+                ("lCustData", wintypes.LPARAM),
+                ("lpfnHook", ctypes.c_void_p),
+                ("lpTemplateName", wintypes.LPWSTR),
+                ("pvReserved", ctypes.c_void_p),
+                ("dwReserved", wintypes.DWORD),
+                ("FlagsEx", wintypes.DWORD),
+            ]
+
+        # The filter is a double-NUL-terminated run of "description\0pattern\0"
+        # pairs. Every buffer handed to the API has to outlive the call, so each
+        # is a named local; and the ``LPWSTR`` fields are pointer typed, so a
+        # ``create_unicode_buffer`` only assigns through an explicit cast.
+        pairs = [f"{description}\0*.{extension}", "All files\0*"]
+        filter_buffer = ctypes.create_unicode_buffer("\0".join(pairs) + "\0\0")
+        file_buffer = ctypes.create_unicode_buffer(_PATH_BUFFER)
+        title_buffer = ctypes.create_unicode_buffer(title)
+        dir_buffer = ctypes.create_unicode_buffer(str(initial_dir))
+        ext_buffer = ctypes.create_unicode_buffer(extension)
+
+        dialog = OPENFILENAMEW()
+        dialog.lStructSize = ctypes.sizeof(OPENFILENAMEW)
+        dialog.hwndOwner = hwnd or None
+        dialog.lpstrFilter = ctypes.cast(filter_buffer, ctypes.c_wchar_p)
+        dialog.lpstrFile = ctypes.cast(file_buffer, ctypes.c_wchar_p)
+        dialog.nMaxFile = _PATH_BUFFER
+        dialog.lpstrInitialDir = ctypes.cast(dir_buffer, ctypes.c_wchar_p)
+        dialog.lpstrTitle = ctypes.cast(title_buffer, ctypes.c_wchar_p)
+        dialog.lpstrDefExt = ctypes.cast(ext_buffer, ctypes.c_wchar_p)
+        # ``OFN_EXPLORER`` is what makes it the modern dialog instead of the
+        # classic one; ``OFN_NOCHANGEDIR`` leaves the process working directory
+        # alone, which the Open3D widget does not.
+        dialog.Flags = (
+            OFN_FILEMUSTEXIST
+            | OFN_PATHMUSTEXIST
+            | OFN_HIDEREADONLY
+            | OFN_NOCHANGEDIR
+            | OFN_EXPLORER
+            | OFN_ENABLESIZING
+        )
+
+        comdlg32.GetOpenFileNameW.argtypes = [ctypes.POINTER(OPENFILENAMEW)]
+        comdlg32.GetOpenFileNameW.restype = wintypes.BOOL
+        if not comdlg32.GetOpenFileNameW(ctypes.byref(dialog)):
+            # FALSE only says the user cancelled; ``ComDlgExtendedError`` would
+            # tell whether the buffer was too small, and there is nothing to do
+            # about either beyond not loading a file.
+            return True, None
+        return True, file_buffer.value or None
+    except Exception as exc:  # pragma: no cover - platform specific
+        print(f"[viewer] the Windows file dialog failed: {exc}")
+        return False, None
 
 
 # --------------------------------------------------------------------------- #
@@ -524,6 +640,21 @@ class Viewer:
 
     # -- menus and loading -------------------------------------------------- #
     def _on_menu_open(self):
+        # On Windows the shell's own dialog is used: it is modal to the viewer
+        # window and carries the favourites, libraries and network places that
+        # the Open3D widget leaves out. Elsewhere that widget is the fallback.
+        if self._hwnd == 0:
+            self._grab_window_handle()
+        available, path = _win32_open_dialog(
+            self._hwnd, "Open JT file", self._last_dir, "jt", "JT files"
+        )
+        if available:
+            if path:
+                self.load(path)
+            return
+        self._show_open3d_dialog()
+
+    def _show_open3d_dialog(self):
         dialog = gui.FileDialog(gui.FileDialog.OPEN, "Open JT file", self._window.theme)
         dialog.add_filter(".jt", "JT files (.jt)")
         dialog.add_filter("", "All files")
