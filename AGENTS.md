@@ -1,14 +1,14 @@
 # FerroJT — agent notes
 
 Rust cargo workspace plus a Python wrapper that reads OpenJT (`.jt`) and exports
-glTF 2.0 / GLB and (planned) USD. Read this before changing code; the design
-detail lives in `docs/`.
+glTF 2.0 / GLB and ASCII USD (`.usda`). Read this before changing code; the
+design detail lives in `docs/`.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `export/` glTF/GLB writer and the USD stub. |
+| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `export/` glTF/GLB writer and the ASCII USD writer. |
 | `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `ls`. |
 | `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `pyproject.toml` + `python/ferrojt/` + `tests/`. |
 | `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `backdrop.rs` viewport gradient, `camera.rs` `Camera3d` wrapper that places the backdrop, `picking.rs`, `trihedron.rs`. |
@@ -465,6 +465,58 @@ Upload with `python -m twine upload dist\*`.
   To compare two captures, use `\.venv\Scripts\python.exe target\imgcmp.py a.png
   b.png … [--patch X Y W H]` (numpy/open3d — PIL is not installed); the PowerShell
   pixel-diff scripts silently produce empty arrays and false "0 px changed".
+- **USD (`export/usd.rs`) is hand-written ASCII — the grammar is strict.** No USD
+  dependency (`#![forbid(unsafe_code)]` rules out an FFI binding), so `.usda` is
+  emitted with `format!` and checked against `usd-core` in a scratch venv
+  (`target\_usdvenv`, gitignored — **not** a project dependency; `target\usd_check.py
+  <file.usda> <MESHES> <TRIS> <MATERIALS>` reports `OK` per sample). Parse traps:
+  `prepend apiSchemas = ["MaterialBindingAPI"]` is **prim metadata** and must sit in
+  the parenthesised block after the prim name (in the body it is a parse error); a
+  property's metadata block opens on the line that closes its array — `] (` … `)`, a
+  `(` on its own line is a parse error (that is where `interpolation = "vertex"`
+  goes); `quatf xformOp:orient = (w, x, y, z)` is **real first** while JT is `x,y,z,w`;
+  identifiers are `[A-Za-z_][A-Za-z0-9_]*` so JT dots become `_`.
+- **USD: the sibling-name `BTreeSet` is created once per parent, not per child.**
+  `Plan::assign` hoists `let mut sibling: BTreeSet<String>` above the child loop; a
+  per-child set lets two prims land on one path (`Duplicate prim 'shcs_asm'` →
+  `Failed to open layer`) — the plate samples instantiate one part twice under one
+  parent and both children carry the same name.
+- **USD: references target the per-mesh *group*, and that group is not instanceable.**
+  Consumers `prepend references = [</FerroJT_Geometry/GEOMETRY_n>]` because that group
+  is where `rel material:binding` sits (a reference only carries what the referenced
+  prim states). Making the group `instanceable` turns every consumer into an instance
+  proxy and any later write fails with "authoring to an instance proxy is not
+  allowed" — only the inner `def Mesh` carries `instanceable = true`. A node reached
+  from several parents gets a thin wrapper that `prepend references` the shared path
+  and **authors no ops of its own** (its `doc` says `JT <kind>: shared subtree`). The
+  library `Xform` is a **sibling** of the default prim with `token visibility =
+  "invisible"`.
+- **USD counts are pinned in `crates/ferrojt/tests/usd.rs`** — meshes / triangles /
+  materials / shared wrappers: block 8.1, 9.5, 10.3 → 1 / 12 / 1 / 0;
+  plate1-8.0 → 2 / 617 / 2 / 1; plate1-9.5 → 2 / 486 / 2 / 1;
+  `SampleJT_Server.jt` → 105 / 124154 / 23 / **529**. Materials collapse by
+  **shading values** (diffuse, opacity, metallic, roughness, emissive, `doubleSided`)
+  — not name — so `def Material "Material_` count ≤ `Model::materials.len()`; the test's
+  `shading()` key is `[u32;10]` and must mirror `UsdMaterial::same_shading` exactly.
+  `number()` uses Rust's shortest round-trip form, so asserts expect
+  `translate = (1, 2, 3)` and `extent = [(0, 0, 0), (1, 1, 0)]`, **not** `25.0`.
+- **JT 8.x samples and `SampleJT_Server.jt` declare NO layer filters**, so their layers
+  record no `ferrojt:layer_filter` in `customLayerData` (that is how a consumer tells
+  "unfiltered" from "filtered by a file with no layers"). block-9.5/10.3 and plate1-9.5
+  declare `ALL` (+ `LAYCUR`); plate1-9.5 tags its parts `LAYER:: = 20`. Recorded via
+  `Model::extras["layer_filter"]` → `ferrojt:layer_filter` / `int[] ferrojt:layers`.
+- **usd-core 26.11 Python API** (for `target\usd_*.py` probes): no
+  `Stage.GetCustomLayerData` — read `stage.GetRootLayer().customLayerData`; `Prim` has
+  no `GetCompositionErrors` (only `Stage`); `Relationship::GetTargets()`, not
+  `GetResolvedPath`; `prim.GetMetadata("references")` returns an `Sdf.ReferenceListOp`
+  which is **not iterable** — use `GetAppliedItems()`, because a `prepend` leaves
+  `addedItems`/`explicitItems` empty; a reference's path is `.primPath`; `Sdf.Path` has
+  no `startswith`; `UsdValidation.ValidationContext` takes validators, not a `Stage`.
+- **`tests/test_visual.py` is flaky by 1–2 random samples per run** (similarity ≈0.13,
+  "100% of the pixels differ") from the documented Open3D blank-frame issue —
+  `shoot` retries `MAX_FRAMES` but still loses occasionally, and a re-run picks a
+  different sample. Re-run before investigating; `pytest tests\test_ferrojt.py` alone
+  is the stable check.
 
 ## Language / platform gotchas hit before
 
@@ -484,11 +536,10 @@ bytemuck 1.25, tracing 0.1, rayon 1.12, gltf-json 1.4, gltf 1.4 (dev), base64 0.
 lzma-rs 0.3, clap 4.6, anyhow 1.0, tracing-subscriber 0.3, indicatif 0.18,
 kiss3d 0.47 (`egui` feature) + egui 0.36 + rfd 0.17 + image 0.25 (no features) +
 webbrowser 1.2,
-pyo3 0.30 (`abi3-py310`). No USD crate chosen yet.
+pyo3 0.30 (`abi3-py310`). No USD crate — `export/usd.rs` writes `.usda` by hand.
 
 ## Open work
 
-The USD writer is still a stub returning `Error::NotImplemented`
-(`crates/ferrojt/src/export/usd.rs`); `docs/usd-writer.md` holds the mapping and
-the two candidate implementations, and a test asserts `NotImplementedError` for
-`.usda`. macOS and ARM wheels need CI (`maturin generate-ci github`).
+USD: `.usdc` (binary) and `.usdz` (packaged) output, and JT textures into the
+`UsdPreviewSurface` — `docs/usd-writer.md` holds the mapping and the open work.
+macOS and ARM wheels need CI (`maturin generate-ci github`).

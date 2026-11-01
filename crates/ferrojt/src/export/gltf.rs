@@ -228,7 +228,7 @@ fn build(model: &Model) -> Result<Document> {
 }
 
 /// Depth first ordering of every node reachable from a scene root.
-fn depth_first(model: &Model) -> Vec<usize> {
+pub(crate) fn depth_first(model: &Model) -> Vec<usize> {
     let mut order = Vec::with_capacity(model.nodes.len());
     for root in model.scenes.iter().flat_map(|s| s.roots.iter().copied()) {
         visit(root, model, &mut order);
@@ -302,7 +302,7 @@ fn to_node(
     }
 }
 
-fn normalize_quaternion(q: [f32; 4]) -> [f32; 4] {
+pub(crate) fn normalize_quaternion(q: [f32; 4]) -> [f32; 4] {
     let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
     if len < f32::EPSILON {
         return [0.0, 0.0, 0.0, 1.0];
@@ -391,7 +391,7 @@ fn semantic(name: &str) -> Result<mesh::Semantic> {
 }
 
 /// `"TEXCOORD_0"` -> `("TEXCOORD", 0)`; an unsuffixed name keeps set `0`.
-fn split_suffix(name: &str) -> (&str, u32) {
+pub(crate) fn split_suffix(name: &str) -> (&str, u32) {
     match name.rfind(|c: char| c.is_ascii_digit()) {
         Some(pos) if pos > 0 => match name[pos..].parse::<u32>() {
             Ok(set) => (name[..pos].trim_end_matches('_'), set),
@@ -690,7 +690,7 @@ fn array(values: &[f64]) -> Result<gltf_json::Value> {
 }
 
 /// Decode one little endian component as `f64`.
-fn read_component(component: ComponentType, bytes: &[u8]) -> Result<f64> {
+pub(crate) fn read_component(component: ComponentType, bytes: &[u8]) -> Result<f64> {
     let need = |n: usize| -> Result<&[u8]> {
         if bytes.len() < n {
             return Err(Error::invalid(0, "truncated attribute component"));

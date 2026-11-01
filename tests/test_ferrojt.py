@@ -218,9 +218,35 @@ def test_jt_file_model_is_exportable(tmp_path) -> None:
     model.save(str(out))
     assert json.loads(out.read_text(encoding="utf-8"))["meshes"]
 
-    # USD export is a planned feature, not a implemented one.
-    with pytest.raises(NotImplementedError):
-        model.save(str(tmp_path / "model.usda"))
+    usd = model.to_bytes("usd").decode("utf-8")
+    assert usd.startswith("#usda 1.0\n(")
+    assert "metersPerUnit = 0.001" in usd
+    assert 'upAxis = "Z"' in usd
+
+    usd_file = tmp_path / "model.usda"
+    model.save(str(usd_file))
+    text = usd_file.read_text(encoding="utf-8")
+    # Each mesh is authored once in an invisible library and referenced by the
+    # node that draws it.
+    assert 'def Xform "FerroJT_Geometry"' in text
+    assert 'token visibility = "invisible"' in text
+    assert "point3f[] points" in text
+    assert "prepend references = [</FerroJT_Geometry/GEOMETRY_0>]" in text
+    assert text.count("point3f[] points") == model.mesh_count
+
+
+@needs_sample
+def test_usd_export_reuses_materials(tmp_path) -> None:
+    """Two parts, two appearances: the plate file keeps both, the block file
+    collapses its repeated colour attribute into one material."""
+    for name, materials in (("example_block_jt9.5.jt", 1), ("opening_protection_plate1_jt9.5.jt", 2)):
+        model = ferrojt.open(str(SAMPLES / name))
+        text = model.to_bytes("usd").decode("utf-8")
+        assert text.count('def Material "Material_') == materials
+        assert text.count("def Xform \"GEOMETRY_") == model.mesh_count
+        out = tmp_path / f"{name}.usda"
+        model.save(str(out))
+        assert out.read_text(encoding="utf-8") == text
 
 
 #: The diffuse colours a sample paints its parts with, sorted, as its

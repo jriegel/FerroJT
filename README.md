@@ -23,7 +23,7 @@ FerroJT is a Rust workspace with four parts:
 | JT JSON dump (the layout the JT tooling uses) | done — byte for byte against the reference dumps in `data/Reference` |
 | JT decode codecs (Huffman, range/CDP, vertex and mesh coders) | done |
 | glTF 2.0 / GLB writer | done |
-| USD writer | stub — returns `NotImplemented` |
+| USD writer (ASCII `.usda`) | done — each mesh written once and referenced, materials deduplicated by value |
 | CLI | done |
 | Python bindings | done (packaged with `maturin`) |
 | Visual regression (rendered export vs. reference picture) | done (`tests/test_visual.py`, Open3D) |
@@ -46,7 +46,7 @@ crates/
       codec/               endian, bit reader, compression
       jt/                  OpenJT reader, segment/TOC table, element objects,
                            decode codecs and the JSON dump writer
-      export/              gltf/glb writer, glb framing, usd stub
+      export/              gltf/glb writer, glb framing, ascii usd writer
       error.rs  lib.rs
   ferrojt-cli/             `ferrojt` binary
   ferrojt-python/          pyo3 extension module `_ferrojt`
@@ -83,6 +83,7 @@ cargo run -p ferrojt-cli -- ls      gear.jt
 cargo run -p ferrojt-cli -- inspect gear.jt --pretty
 cargo run -p ferrojt-cli -- dump    gear.jt -o gear.json
 cargo run -p ferrojt-cli -- convert gear.jt -f glb -o gear.glb
+cargo run -p ferrojt-cli -- convert gear.jt -f usd -o gear.usda
 cargo run -p ferrojt-cli -- convert gear.jt --layer-filter LAYCUR -o gear.glb
 cargo run -p ferrojt-cli -- convert gear.jt --no-layer-filter -o gear.glb
 ```
@@ -146,6 +147,8 @@ import ferrojt
 model = ferrojt.open("gear.jt")
 print(model)                       # Model(nodes=..., meshes=..., ...)
 model.save("gear.glb")             # format inferred from the extension
+model.save("gear.usda")            # ASCII USD
+model.to_bytes("usd")              # the same layer as bytes
 glb_bytes = model.to_bytes("glb")
 ```
 
@@ -282,6 +285,11 @@ matrix instead.
   geometry of a part whose layers the active filter does not accept, but keeps
   every node of the scene graph. A file without layer information exports all of
   its parts, and a dump always shows everything.
+* **USD references, it does not copy.** Every mesh is authored once in an
+  invisible geometry library and `prepend references` by each consumer, and a
+  node reached from several parents is referenced rather than duplicated; the
+  layer records which layer filter produced it. Materials are collapsed by their
+  shading values, so a part repeated a dozen times costs one material prim.
 * **`#![forbid(unsafe_code)]`** in the core library.
 
 The reasoning behind these choices is in [`docs/`](docs): the neutral model and

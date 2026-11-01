@@ -56,7 +56,7 @@ impl Format {
 
     /// `true` if [`crate::export`] can write this format today.
     pub fn is_writable(self) -> bool {
-        matches!(self, Format::Gltf | Format::Glb)
+        matches!(self, Format::Gltf | Format::Glb | Format::Usd)
     }
 }
 

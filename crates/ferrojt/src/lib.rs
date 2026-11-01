@@ -8,8 +8,8 @@
 //!   DEFLATE) shared by format readers.
 //! - [`jt`] &mdash; the OpenJT reader. This is the insertion point for a JT
 //!   implementation: everything below it is already wired to consume it.
-//! - [`export`] &mdash; writers for the target formats (glTF/GLB today, USD
-//!   reserved).
+//! - [`export`] &mdash; writers for the target formats: glTF/GLB and ASCII
+//!   USD (`.usda`).
 //!
 //! ```no_run
 //! use ferrojt::Format;

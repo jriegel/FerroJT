@@ -127,7 +127,7 @@ pub enum TargetFormat {
     Glb,
     /// glTF 2.0 JSON with a data URI buffer.
     Gltf,
-    /// Universal Scene Description (not implemented yet).
+    /// Universal Scene Description, ASCII `.usda`.
     Usd,
 }
 

@@ -91,7 +91,9 @@ contracts that bound the workspace.
   that buffer as a base64 data URI.
 * `export/glb.rs` does the GLB framing that `gltf-json` does not provide: header,
   JSON chunk padded with `0x20`, BIN chunk padded with `0x00`.
-* `export/usd.rs` is a documented stub; see [usd-writer.md](usd-writer.md).
+* `export/usd.rs` writes an ASCII `.usda` layer by hand: every mesh is authored
+  once in an invisible geometry library and referenced by its consumers, and
+  materials are collapsed by shading value. See [usd-writer.md](usd-writer.md).
 
 ## Error handling
 
