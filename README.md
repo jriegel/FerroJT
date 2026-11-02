@@ -4,6 +4,52 @@ Read [OpenJT](https://www.jt-open.com/) (`.jt`) CAD files and convert them to
 [glTF 2.0](https://www.khronos.org/gltf/) (`.gltf` / `.glb`) and
 [USD](https://openusd.org/) (`.usda`).
 
+![The FerroJT viewer showing an opening protection plate](docs/viewer.png)
+
+*`ferrojt-viewer` on `opening_protection_plate1_jt9.5.jt`: the logical scene
+graph in the outliner, the decoded geometry in the viewport, and a key/value
+detail pane under the tree that reports what the selected node carries.*
+
+## Why this exists
+
+JT is the lightweight 3D format the Siemens CAD world produces. A `.jt` file
+carries the whole product structure of an assembly — parts, instances,
+transforms, levels of detail, colours, layers, metadata — as a compressed binary
+scene graph, which makes it the common denominator for exchanging large
+assemblies between CAD systems. It is also rarely readable outside them: the
+tooling around it is proprietary, and the open reference implementation is a
+C++ code base from the last decade.
+
+FerroJT is a Rust reader and exporter for it, written against the OpenJT
+specification with the reference tooling used only as an oracle — its sources are
+never linked or copied. It opens a `.jt` file, decodes the scene graph and its
+LOD geometry, and hands you a neutral `Model` of nodes, meshes, attributes and
+materials. Two writers turn that into the formats the rest of the pipeline
+consumes: glTF 2.0 for engines and the web, ASCII USD for stage tools. The same
+library is also a command line tool, a Python package and a desktop viewer, and
+the core crate is `#![forbid(unsafe_code)]` with no native dependencies.
+
+Correctness is measured, not assumed. The JSON dump the library writes is
+compared **byte for byte** with the reference dumps of the JT tooling, and the
+glTF export is compared as a **rendered picture** with committed reference PNGs.
+Every sample in `data/ExampleFiles` — JT 8.0, 8.1, 9.5 and 10.3 — is in both
+suites, so a regression in the decoder fails a test rather than turning up as a
+broken model downstream.
+
+## Try it
+
+```sh
+cargo run -p ferrojt-cli -- convert data/ExampleFiles/example_block_jt9.5.jt -o block.glb
+cargo run -p ferrojt-viewer -- data/ExampleFiles/example_block_jt9.5.jt
+```
+
+```python
+import ferrojt
+
+model = ferrojt.open("data/ExampleFiles/example_block_jt9.5.jt")
+model.save("block.glb")          # or "block.usda" for ASCII USD
+```
+
 FerroJT is a Rust workspace with four parts:
 
 | Crate | Purpose |
