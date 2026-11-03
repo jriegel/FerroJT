@@ -920,21 +920,13 @@ fn build_node(
     }
 
     let mut children = Vec::new();
-    let mut walk = if matches!(node, Node::RangeLod(_)) {
-        LodWalk::FIRST
-    } else {
-        lod
-    };
-    for child in graph.children_of(node).into_iter().flatten() {
+    let range_lod = matches!(node, Node::RangeLod(_));
+    for (tier, child) in graph.children_of(node).into_iter().flatten().enumerate() {
+        let walk = if range_lod { LodWalk::tier(tier) } else { lod };
         children.push(build_node(graph, model, child, built, walk, filter));
-        let class_name = graph
-            .nodes
-            .get(child)
-            .map_or("", |stored| stored.node.class_name());
-        walk.next_tier(class_name);
     }
     if let Some(target) = graph.instance_target(node) {
-        children.push(build_node(graph, model, target, built, walk, filter));
+        children.push(build_node(graph, model, target, built, lod, filter));
     }
     model.nodes[index].children = children;
     index
@@ -962,10 +954,11 @@ fn node_properties(graph: &SceneGraph, node: &Node) -> Option<serde_json::Value>
 /// Where a node sits in the level of detail stack of a range LOD.
 ///
 /// JT does not store the tier of a representation: a range LOD simply lists
-/// its children from the finest to the coarsest one. The reference glTF
-/// writer numbers them while walking, starting at zero and moving on at every
-/// group of that subtree, and drops the shape of anything that is not tier
-/// zero. This mirrors that, so the same file exports the same mesh.
+/// its children from the finest to the coarsest one, and every child is one
+/// tier, whatever its class. Writers differ in what they put there: the plate
+/// samples wrap each tier in a group, the NIST parts list the shapes of the
+/// finer tiers directly. Everything below a child belongs to its tier, and the
+/// shapes of anything that is not tier zero are dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LodWalk {
     /// Set below a range LOD, where the tier of a branch matters.
@@ -981,11 +974,13 @@ impl LodWalk {
         level: 0,
     };
 
-    /// The first child of a range LOD.
-    const FIRST: Self = Self {
-        inside: true,
-        level: 0,
-    };
+    /// The child of a range LOD at position `tier`.
+    fn tier(tier: usize) -> Self {
+        Self {
+            inside: true,
+            level: u32::try_from(tier).unwrap_or(u32::MAX),
+        }
+    }
 
     /// `true` when the representations of this branch belong in the model.
     #[must_use]
@@ -997,14 +992,6 @@ impl LodWalk {
     #[must_use]
     fn level(self) -> Option<u32> {
         self.inside.then_some(self.level)
-    }
-
-    /// Move past a child of a range LOD. Only a group counts as a tier, and a
-    /// group nested in a group moves on too, as it does in the reference.
-    fn next_tier(&mut self, class_name: &str) {
-        if self.inside && class_name == "Group" {
-            self.level += 1;
-        }
     }
 }
 

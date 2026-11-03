@@ -1095,3 +1095,39 @@ fn a_move_to_front_package_decodes() {
         model.triangle_count()
     );
 }
+
+#[test]
+fn every_child_of_a_range_lod_is_a_tier() {
+    // The NIST parts list the shapes of their finer tiers directly under the
+    // range LOD (`Shape`, `Shape`, `Group { Shape }`) instead of wrapping each
+    // tier in a group. Every child is a tier all the same, so only the first
+    // shape is exported; counting groups alone exported all three stacked.
+    // The triangle counts are the ones Aspose.3D 26.10 reports for these files.
+    const NIST: &[(&str, usize)] = &[
+        ("nist-ctc-01-part.jt", 1_350),
+        ("nist-ctc-02-part.jt", 6_842),
+        ("nist-ctc-03-part.jt", 1_536),
+        ("nist-ctc-05-part.jt", 2_272),
+        ("nist-ftc-11-part.jt", 1_936),
+        ("nist-htc-part.jt", 3_050),
+        ("nist-mtc-cover.jt", 4_248),
+        ("nist-mtc-plate.jt", 4_412),
+        ("nist-socket-head-cap-screw.jt", 6_450),
+    ];
+    for (name, triangles) in NIST {
+        let file = sample(&format!("NIST/{name}"));
+        let model = file.to_model();
+        assert_eq!(model.meshes.len(), 1, "{name}: meshes");
+        assert_eq!(model.triangle_count(), *triangles, "{name}: triangles");
+        assert_eq!(model.meshes[0].lod_level, Some(0), "{name}: tier");
+
+        let all = file.to_model_with_all_lods();
+        let mut tiers: Vec<_> = all.meshes.iter().map(|mesh| mesh.lod_level).collect();
+        tiers.sort_unstable();
+        tiers.dedup();
+        assert!(
+            tiers.len() >= 3 && tiers.iter().all(Option::is_some),
+            "{name}: tiers {tiers:?}"
+        );
+    }
+}
