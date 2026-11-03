@@ -108,6 +108,10 @@ pub struct ConvertArgs {
     /// Replace the output file if it exists.
     #[arg(short = 'y', long)]
     pub force: bool,
+
+    /// Fail without writing the output when no mesh was read.
+    #[arg(long)]
+    pub require_geometry: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -268,6 +272,7 @@ pub fn convert(args: &ConvertArgs) -> Result<()> {
     if output.exists() && !args.force {
         bail!("{} exists; pass --force to overwrite", output.display());
     }
+    check_geometry(&model, &args.input, args.require_geometry)?;
 
     let bar = spinner(&format.to_string());
     ferrojt::export::write_to_file(format, &model, &output)
@@ -280,6 +285,21 @@ pub fn convert(args: &ConvertArgs) -> Result<()> {
         args.input.display(),
         output.display(),
         format
+    );
+    Ok(())
+}
+
+/// Warn when the model has no mesh, or fail when the caller asked for one.
+fn check_geometry(model: &Model, input: &Path, required: bool) -> Result<()> {
+    if !model.meshes.is_empty() {
+        return Ok(());
+    }
+    if required {
+        bail!("no geometry was read from {}", input.display());
+    }
+    eprintln!(
+        "warning: no geometry was read from {}; the output has no meshes",
+        input.display()
     );
     Ok(())
 }
@@ -477,6 +497,20 @@ mod tests {
         let args = parse_convert(&["ferrojt", "convert", "gear.jt", "--no-layer-filter"]);
         assert_eq!(args.layer_filter, None);
         assert!(args.no_layer_filter);
+    }
+
+    #[test]
+    fn convert_can_require_geometry() {
+        let args = parse_convert(&["ferrojt", "convert", "gear.jt"]);
+        assert!(!args.require_geometry);
+        let args = parse_convert(&["ferrojt", "convert", "gear.jt", "--require-geometry"]);
+        assert!(args.require_geometry);
+
+        let empty = Model::default();
+        let input = Path::new("empty.jt");
+        assert!(check_geometry(&empty, input, false).is_ok());
+        let error = check_geometry(&empty, input, true).expect_err("no meshes were read");
+        assert_eq!(error.to_string(), "no geometry was read from empty.jt");
     }
 
     #[test]
