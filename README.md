@@ -132,6 +132,7 @@ cargo run -p ferrojt-cli -- convert gear.jt -f glb -o gear.glb
 cargo run -p ferrojt-cli -- convert gear.jt -f usd -o gear.usda
 cargo run -p ferrojt-cli -- convert gear.jt --layer-filter LAYCUR -o gear.glb
 cargo run -p ferrojt-cli -- convert gear.jt --no-layer-filter -o gear.glb
+cargo run -p ferrojt-cli -- convert gear.jt --require-geometry -o gear.glb
 ```
 
 `dump` writes the same JSON the reference JT dump tool produces: the header, the
@@ -142,6 +143,8 @@ one JSON array. A dump is never filtered by layer.
 `convert` applies the layer filter the file declares as active, or its first
 filter when the file leaves that unset: `--layer-filter NAME` picks another one
 of the declared filters, and `--no-layer-filter` exports every part.
+A file that yields no mesh is still written, with a warning;
+`--require-geometry` makes that an error and writes nothing.
 
 ## Rust viewer
 
