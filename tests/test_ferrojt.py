@@ -450,7 +450,8 @@ def test_shapes_without_vertices_are_left_out_of_the_export() -> None:
     assert model.triangle_count == 129067
 
     document = glb_json(model.to_bytes("glb"))
-    assert len(document["nodes"]) == model.node_count
+    # Instanced subtrees are written once per path: glTF allows one parent.
+    assert len(document["nodes"]) > model.node_count
     assert len(document["meshes"]) == model.mesh_count
     for mesh in document["meshes"]:
         for primitive in mesh["primitives"]:

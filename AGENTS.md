@@ -147,9 +147,12 @@ Upload with `python -m twine upload dist\*`.
   one screw and instantiate it twice (`y = -25` and `y = +25`). `build_node`
   memoises by graph position in `Built { done: HashMap<usize, usize> }`, recorded
   *before* the children are walked, so a second visit returns the node already
-  built and both instances point at the same model index — valid glTF (one node,
-  two parents), and it keeps the pinned counts and `every_node_of_the_scene_graph_survives`
-  green. The old `expanded: HashSet` returned a *fresh, childless* node on the
+  built and both instances point at the same model index, which keeps the pinned
+  counts and `every_node_of_the_scene_graph_survives` green. glTF does **not**
+  allow a node two parents (the Khronos validator reports `NODE_PARENT_OVERRIDE`,
+  and three.js re-parents the node, so one instance vanishes): `export/gltf.rs`
+  writes such a subtree once per path (`push_node_tree`), the copies sharing the
+  mesh. USD keeps one shared prim and references it. The old `expanded: HashSet` returned a *fresh, childless* node on the
   second visit, which is why one screw vanished in the viewer. `done` doubles as
   the cycle guard; there is no separate path set.
 - `to_quaternion` must return a **unit** quaternion: the trace branch is

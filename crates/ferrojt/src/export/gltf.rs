@@ -175,48 +175,24 @@ fn build(model: &Model) -> Result<Document> {
     }
 
     // --- nodes -------------------------------------------------------------
-    let order = depth_first(model);
-    let mut node_of = vec![usize::MAX; model.nodes.len()];
-    for (position, model_index) in order.iter().enumerate() {
-        node_of[*model_index] = position;
-    }
-    for model_index in &order {
-        let node = &model.nodes[*model_index];
-        let children: Vec<Index<scene::Node>> = node
-            .children
-            .iter()
-            .map(|child| {
-                node_of
-                    .get(*child)
-                    .copied()
-                    .filter(|position| *position != usize::MAX)
-                    .map(|position| Index::new(position as u32))
-                    .ok_or_else(|| {
-                        Error::invalid(
-                            *child as u64,
-                            "scene graph child is not reachable from a scene root",
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mesh_index = node_mesh(model, node, &mesh_of)?;
-        root.nodes.push(to_node(node, children, mesh_index));
+    // glTF needs the nodes to form strict trees, so a model node reached along
+    // several paths (an instanced subtree) is written once per path. The
+    // copies share their meshes.
+    let mut roots = Vec::new();
+    for index in model.scenes.iter().flat_map(|s| s.roots.iter().copied()) {
+        if index >= model.nodes.len() {
+            return Err(Error::invalid(index as u64, "scene root is out of range"));
+        }
+        roots.push(push_node_tree(
+            &mut root,
+            model,
+            index,
+            &mesh_of,
+            &mut Vec::new(),
+        )?);
     }
 
     // --- scene -------------------------------------------------------------
-    let roots = model
-        .scenes
-        .iter()
-        .flat_map(|s| s.roots.iter().copied())
-        .map(|index| {
-            node_of
-                .get(index)
-                .copied()
-                .filter(|position| *position != usize::MAX)
-                .map(|position| Index::new(position as u32))
-                .ok_or_else(|| Error::invalid(index as u64, "scene root is out of range"))
-        })
-        .collect::<Result<Vec<_>>>()?;
     let scene_index = root.push(scene::Scene {
         name: model
             .scenes
@@ -230,6 +206,36 @@ fn build(model: &Model) -> Result<Document> {
     root.scene = Some(scene_index);
 
     Ok(Document { root, bin })
+}
+
+/// Write the model node `index` and its subtree as new glTF nodes, depth
+/// first, and return the index of the first. `path` holds the model nodes
+/// above it: a child that is also an ancestor would close a cycle and is left
+/// out.
+fn push_node_tree(
+    root: &mut Root,
+    model: &Model,
+    index: usize,
+    mesh_of: &[Index<mesh::Mesh>],
+    path: &mut Vec<usize>,
+) -> Result<Index<scene::Node>> {
+    let node = model
+        .nodes
+        .get(index)
+        .ok_or_else(|| Error::invalid(index as u64, "scene graph child is out of range"))?;
+    let mesh_index = node_mesh(model, node, mesh_of)?;
+    let position = root.nodes.len();
+    root.nodes.push(to_node(node, Vec::new(), mesh_index));
+    path.push(index);
+    let mut children = Vec::with_capacity(node.children.len());
+    for &child in &node.children {
+        if !path.contains(&child) {
+            children.push(push_node_tree(root, model, child, mesh_of, path)?);
+        }
+    }
+    path.pop();
+    root.nodes[position].children = (!children.is_empty()).then_some(children);
+    Ok(Index::new(position as u32))
 }
 
 /// Depth first ordering of every node reachable from a scene root.
@@ -803,6 +809,67 @@ mod tests {
         });
         model.default_scene_mut().roots.push(node);
         model
+    }
+
+    /// An instanced subtree is one model node with two parents. glTF allows a
+    /// node only one parent, so the export holds one copy per path, and the
+    /// copies share the mesh.
+    #[test]
+    fn a_shared_subtree_is_written_once_per_path() {
+        let mut model = triangle_model();
+        let part = model.default_scene_mut().roots.pop().expect("the triangle");
+        let left = model.push_node(Node {
+            name: Some("left".into()),
+            children: vec![part],
+            ..Node::default()
+        });
+        let right = model.push_node(Node {
+            name: Some("right".into()),
+            children: vec![part],
+            ..Node::default()
+        });
+        let assembly = model.push_node(Node {
+            name: Some("assembly".into()),
+            children: vec![left, right],
+            ..Node::default()
+        });
+        model.default_scene_mut().roots.push(assembly);
+
+        let root = build(&model).unwrap().root;
+        let names: Vec<_> = root.nodes.iter().map(|n| n.name.as_deref()).collect();
+        assert_eq!(
+            names,
+            [
+                Some("assembly"),
+                Some("left"),
+                Some("triangle"),
+                Some("right"),
+                Some("triangle")
+            ]
+        );
+        let mut parents = vec![0; root.nodes.len()];
+        for node in &root.nodes {
+            for child in node.children.iter().flatten() {
+                parents[child.value()] += 1;
+            }
+        }
+        assert_eq!(parents, [0, 1, 1, 1, 1]);
+        assert_eq!(root.nodes[2].mesh, root.nodes[4].mesh);
+        assert_eq!(root.meshes.len(), 1);
+    }
+
+    #[test]
+    fn a_cycle_in_the_model_is_cut() {
+        let mut model = triangle_model();
+        let part = model.default_scene_mut().roots[0];
+        let group = model.push_node(Node {
+            children: vec![part],
+            ..Node::default()
+        });
+        model.nodes[part].children.push(group);
+        let root = build(&model).unwrap().root;
+        assert_eq!(root.nodes.len(), 2);
+        assert_eq!(root.nodes[1].children, None);
     }
 
     #[test]
