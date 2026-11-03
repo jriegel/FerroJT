@@ -377,6 +377,8 @@ impl DualVFMesh {
 /// The decoded symbol streams of one mesh, with the read cursors that walk them.
 #[derive(Clone, Debug, Default)]
 struct Symbols {
+    /// JT 10.x splits the masks of context 7 into a low and a high word.
+    mask_words: bool,
     degrees: Vec<Vec<i32>>,
     valences: Vec<i32>,
     groups: Vec<i32>,
@@ -447,6 +449,13 @@ impl Symbols {
     /// in that implementation and is reproduced here so the output matches.
     fn next_attr_mask(&mut self, context: usize) -> i64 {
         let position = self.attr_mask_pos[context];
+        if context == 7 && self.mask_words {
+            // JT 10.x stores context 7 as two unsigned 32-bit words, the low
+            // one in the context array and the high one in `mask8_30`.
+            let word = |stream: &[i32]| stream.get(position).map_or(0, |v| i64::from(*v as u32));
+            self.attr_mask_pos[context] += 1;
+            return word(&self.attr_masks[7]) | word(&self.mask8_30) << 32;
+        }
         let mut value = self.attr_masks[context]
             .get(position)
             .copied()
@@ -570,6 +579,7 @@ pub struct MeshInput {
     attr_masks_large: Vec<u32>,
     split_faces: Package,
     split_positions: Package,
+    mask_words: bool,
 }
 
 impl MeshInput {
@@ -614,6 +624,7 @@ impl MeshInput {
             attr_masks_large,
             split_faces,
             split_positions,
+            mask_words: cursor.major() >= 10,
         })
     }
 
@@ -628,6 +639,7 @@ impl MeshInput {
             attr_masks.push(package.decode(order, Unpack::Null)?);
         }
         let symbols = Symbols {
+            mask_words: self.mask_words,
             degree_pos: vec![0; degrees.len()],
             attr_mask_pos: vec![0; attr_masks.len()],
             degrees,
@@ -1188,6 +1200,28 @@ mod tests {
         let mask = symbols.next_attr_mask(7);
         let expected = 2i64 | (i64::from(4) << 30) | (i64::from(3) << 30);
         assert_eq!(mask, expected);
+        assert_eq!(symbols.attr_mask_pos[7], 1);
+        assert_eq!(symbols.next_attr_mask(7), 0);
+    }
+
+    #[test]
+    fn ten_x_context_seven_is_a_low_and_a_high_word() {
+        // A 40-sided face with every edge carrying an attribute: the low word
+        // has bit 31 set, which must not spill into the high word.
+        let mut attr_masks = vec![Vec::new(); 8];
+        attr_masks[7] = vec![-1];
+        let mut symbols = Symbols {
+            mask_words: true,
+            degrees: vec![Vec::new(); 8],
+            attr_masks,
+            mask8_30: vec![0xFF],
+            degree_pos: vec![0; 8],
+            attr_mask_pos: vec![0; 8],
+            ..Symbols::default()
+        };
+        let mask = symbols.next_attr_mask(7);
+        assert_eq!(mask, 0xFF_FFFF_FFFF);
+        assert_eq!(mask.count_ones(), 40);
         assert_eq!(symbols.attr_mask_pos[7], 1);
         assert_eq!(symbols.next_attr_mask(7), 0);
     }
