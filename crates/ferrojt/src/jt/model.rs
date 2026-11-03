@@ -716,7 +716,8 @@ fn read_element_of_segment_impl(
     if let Some(element) = read_element_envelope(&mut cursor, false)? {
         if class_of(&element.guid).is_some() {
             cursor.seek(element.body_offset)?;
-            first = Some(Element::read(&element.guid, &mut cursor)?);
+            let end = element.body_offset.saturating_add(element.body_len);
+            first = Some(Element::read(&element.guid, &mut cursor, end)?);
         }
         finish_element(&mut cursor, &element)?;
     }
