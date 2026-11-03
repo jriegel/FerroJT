@@ -97,12 +97,17 @@ Upload with `python -m twine upload dist\*`.
   is unbounds-checked — never reproduce an out-of-bounds read (the `RangeLOD`
   `limits` off-by-one is fixed as `limits.get(1..).unwrap_or(&[])`).
 - **LOD tier is positional, not encoded.** JT never stores a tier: it is the child
-  position under `RangeLod` (first group = 0, next = 1, …). Segment type cannot
-  identify it — JT 8.x/10.x use types 7..10 for LOD0..LOD3, but JT 9.x uses type 6
-  ("Shape") for every tier. `to_model()` exports only the finest tier, mirroring
-  `example/ToolsLib/src/JtGltfMesh.cpp`; the state is `LodWalk { inside, level }`
-  threaded through `build_node`. Nodes are never dropped, only geometry, and each
-  mesh records `Mesh::lod_level`. `jt::dump` is *not* filtered.
+  position under `RangeLod` (first child = 0, next = 1, …), **whatever the child's
+  class**. The plate samples wrap each tier in a `Group`; the NIST parts list the
+  finer tiers as bare `Shape`s (`Shape`, `Shape`, `Group { Shape }`), and counting
+  groups only (as `example/ToolsLib/src/JtGltfMesh.cpp` does) exported all three
+  tiers stacked. Segment type cannot identify it — JT 8.x/10.x use types 7..10 for
+  LOD0..LOD3, but JT 9.x uses type 6 ("Shape") for every tier. `to_model()` exports
+  only the finest tier; the state is `LodWalk { inside, level }` threaded through
+  `build_node`, set per child of a `RangeLod` and inherited below it. Nodes are
+  never dropped, only geometry, and each mesh records `Mesh::lod_level`.
+  `jt::dump` is *not* filtered. NIST counts are pinned in
+  `every_child_of_a_range_lod_is_a_tier` (they equal Aspose.3D 26.10's).
 - Pinned LOD0 counts (`crates/ferrojt/tests/model.rs`): block 8.1/9.5/10.3 →
   1 mesh / 12 triangles; plate1-8.0 → 2 / 617; plate1-9.5 → 2 / 486.
   `tests/test_ferrojt.py` asserts `mesh_count == 1`, `triangle_count == 12`.

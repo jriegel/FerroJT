@@ -652,21 +652,19 @@ fn union_box(a: Option<(Vec3, Vec3)>, b: Option<(Vec3, Vec3)>) -> Option<(Vec3, 
 
 /// The level-of-detail stacks of a row tree, in graph order.
 ///
-/// The reader numbers the tiers of a range LOD by the position of its group
-/// children, so the tiers are exactly the `Group` children of a `RangeLOD` row,
-/// in order. A range LOD with a single tier — which is what `SampleJT_Server.jt`
-/// declares for all 584 of them — is not a stack and is left alone.
+/// The reader numbers the tiers of a range LOD by the position of its
+/// children, so the tiers are exactly the children of a `RangeLOD` row, in
+/// order: a `Group` per tier in the plate samples, the bare `Shape` of a tier
+/// in the NIST parts. A range LOD with a single tier — which is what
+/// `SampleJT_Server.jt` declares for all 584 of them — is not a stack and is
+/// left alone.
 fn detect_stacks(rows: &[Row], child_rows: &[Vec<usize>]) -> Vec<LodGroup> {
     let mut stacks = Vec::new();
     for (id, row) in rows.iter().enumerate() {
         if row.kind != "RangeLOD" {
             continue;
         }
-        let tiers: Vec<usize> = children_of(child_rows, id)
-            .iter()
-            .copied()
-            .filter(|&child| rows[child].kind == "Group")
-            .collect();
+        let tiers: Vec<usize> = children_of(child_rows, id).to_vec();
         if tiers.len() < 2 {
             continue;
         }
@@ -903,6 +901,29 @@ mod tests {
     fn a_single_tier_range_lod_is_not_a_stack() {
         let (rows, child_rows) = stacked_rows(1);
         assert!(detect_stacks(&rows, &child_rows).is_empty());
+    }
+
+    /// The NIST parts list the shape of a tier directly under the range LOD,
+    /// without a group around it; that shape is the tier.
+    #[test]
+    fn a_bare_shape_is_a_tier_too() {
+        let (mut rows, mut child_rows) = stacked_rows(2);
+        let shape = rows.len();
+        rows.push(Row {
+            id: shape,
+            node: shape,
+            parent: Some(0),
+            depth: 1,
+            name: "bare shape".to_string(),
+            kind: "Shape".to_string(),
+            has_children: false,
+            instances: 1,
+        });
+        child_rows.push(Vec::new());
+        child_rows[0].insert(0, shape);
+        let stacks = detect_stacks(&rows, &child_rows);
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].tiers, [shape, 1, 3]);
     }
 
     #[test]
