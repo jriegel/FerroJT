@@ -1586,7 +1586,9 @@ pub fn read_element_envelope(cursor: &mut Cursor<'_>, lsg: bool) -> Result<Optio
     if end > cursor.position() + cursor.remaining() {
         return Err(cursor.error("element extends past the end of its segment"));
     }
-    let body_len = end - body_offset;
+    let body_len = end
+        .checked_sub(body_offset)
+        .ok_or_else(|| cursor.error("element length is shorter than its header"))?;
     Ok(Some(RawElement {
         guid,
         base_type,
@@ -1650,5 +1652,21 @@ pub fn class_of(guid: &Guid) -> Option<Class> {
         Some(Class::Element)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::ByteOrder;
+
+    #[test]
+    fn an_element_shorter_than_its_header_is_rejected() {
+        // A length of 4 ends the element inside its own GUID.
+        let mut data = 4i32.to_le_bytes().to_vec();
+        data.extend_from_slice(&[0x11; 16]);
+        data.extend_from_slice(&[0; 8]);
+        let mut cursor = Cursor::new(&data, ByteOrder::Little, 10);
+        assert!(read_element_envelope(&mut cursor, false).is_err());
     }
 }
