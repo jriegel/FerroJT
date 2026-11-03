@@ -174,8 +174,8 @@ fn every_level_of_detail_can_be_loaded() {
         (
             "SampleJT_Server.jt",
             All {
-                meshes: 105,
-                triangles: 124_154,
+                meshes: 106,
+                triangles: 129_067,
                 tiers: 1,
             },
         ),
@@ -313,32 +313,28 @@ fn every_sample_exports_to_gltf() {
 }
 
 #[test]
-fn a_sample_with_empty_representations_still_exports_its_graph() {
+fn the_server_sample_exports_every_shape() {
     // `SampleJT_Server.jt` is the odd one out of the samples: it has no
-    // reference dump, its shapes are mostly empty, and it is the file that
-    // showed the POSITION failure. Its counts are pinned so that a change in
-    // how empty representations are handled becomes visible.
+    // reference dump, and it is the file that showed the POSITION failure. One
+    // of its shapes (36 instances) has faces with more than 64 attributes; it
+    // read as empty until the wide attribute masks were read as the plain
+    // word array they are. Its counts are pinned so that a change in how
+    // representations are read becomes visible.
     let file = sample("SampleJT_Server.jt");
     let model = file.to_model();
 
     assert_eq!(model.nodes.len(), 2_158, "nodes");
-    assert_eq!(model.meshes.len(), 105, "meshes");
+    assert_eq!(model.meshes.len(), 106, "meshes");
     assert_eq!(model.materials.len(), 23, "materials");
-    assert_eq!(model.triangle_count(), 124_154, "triangles");
+    assert_eq!(model.triangle_count(), 129_067, "triangles");
 
-    // The empty shapes keep their node — dropping geometry never drops a node —
-    // so there are more shape nodes than there are meshes.
+    // Every shape node carries the mesh of its representation.
     let shapes = model
         .nodes
         .iter()
         .filter(|node| node.kind.as_deref() == Some("Shape"))
         .count();
-    assert!(
-        shapes > model.meshes.len(),
-        "the empty shapes vanished instead of keeping their node: {shapes} shape \
-         nodes for {} meshes",
-        model.meshes.len()
-    );
+    assert_eq!(shapes, model.meshes.len(), "a shape lost its geometry");
     let drawn = model
         .nodes
         .iter()
