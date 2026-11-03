@@ -99,12 +99,14 @@ impl GlbBuilder {
     }
 }
 
+/// Write one chunk. The padding is part of the chunk data, so the declared
+/// length includes it: readers step from chunk to chunk by that length.
 fn write_chunk(out: &mut Vec<u8>, chunk_type: u32, payload: &[u8], pad: u8) {
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    let padded = pad4(payload.len());
+    out.extend_from_slice(&(padded as u32).to_le_bytes());
     out.extend_from_slice(&chunk_type.to_le_bytes());
     out.extend_from_slice(payload);
-    let pad_len = pad4(payload.len()) - payload.len();
-    out.resize(out.len() + pad_len, pad);
+    out.resize(out.len() + padded - payload.len(), pad);
 }
 
 /// Round `len` up to the next multiple of four, as required by the GLB spec.
@@ -185,7 +187,7 @@ mod tests {
             .finish()
             .unwrap();
         let (json_len, bin) = parse_header(&file).unwrap();
-        assert_eq!(json_len, 27);
+        assert_eq!(json_len, 28, "27 bytes of JSON and one space");
         assert_eq!(bin, None);
         assert_eq!(file.len() % 4, 0);
     }
@@ -197,12 +199,34 @@ mod tests {
             .finish()
             .unwrap();
         let (json_len, bin) = parse_header(&file).unwrap();
-        assert_eq!(json_len, 27);
-        assert_eq!(bin, Some(3));
+        assert_eq!(json_len, 28, "27 bytes of JSON and one space");
+        assert_eq!(bin, Some(4), "3 bytes and one zero");
         assert_eq!(
             file.len(),
             u32::from_le_bytes([file[8], file[9], file[10], file[11]]) as usize
         );
+    }
+
+    /// Readers find the next chunk by adding the declared length to the end
+    /// of the chunk header, so that length has to include the padding.
+    #[test]
+    fn each_chunk_starts_where_the_previous_one_ends() {
+        let file = GlbBuilder::new(br#"{"asset":{"version":"2.0"}}"#.to_vec())
+            .with_bin(vec![1, 2, 3])
+            .finish()
+            .unwrap();
+        let word = |at: usize| u32::from_le_bytes(file[at..at + 4].try_into().unwrap()) as usize;
+        let mut at = HEADER_LEN;
+        let mut chunks = Vec::new();
+        while at < file.len() {
+            let length = word(at);
+            assert_eq!(length % 4, 0);
+            chunks.push(word(at + 4) as u32);
+            at += CHUNK_HEADER_LEN + length;
+        }
+        assert_eq!(at, word(8));
+        assert_eq!(chunks, [JSON_CHUNK_TYPE, BIN_CHUNK_TYPE]);
+        assert_eq!(&file[HEADER_LEN + CHUNK_HEADER_LEN + 27], &b' ');
     }
 
     #[test]
