@@ -905,8 +905,9 @@ pub enum Element {
 }
 
 impl Element {
-    /// Read the body of an element whose class is known from its GUID.
-    pub(crate) fn read(guid: &Guid, cursor: &mut Cursor<'_>) -> Result<Self> {
+    /// Read the body of an element whose class is known from its GUID. The
+    /// body ends at `end`.
+    pub(crate) fn read(guid: &Guid, cursor: &mut Cursor<'_>, end: usize) -> Result<Self> {
         let element = if *guid == types::SHAPE_LOD_TRI_STRIP_SET {
             Element::ShapeLodTriStripSet(ShapeLodTriStripSet::read(cursor)?)
         } else if *guid == types::SHAPE_LOD_VERTEX {
@@ -917,7 +918,7 @@ impl Element {
         } else if *guid == types::ELEMENT_PROXY_META_DATA {
             Element::ProxyMetaData(ProxyMetaData::read(cursor)?)
         } else if *guid == types::XTB_REP {
-            XtBRep::read(cursor)?;
+            XtBRep::read(cursor, end)?;
             Element::XtBRep
         } else if *guid == types::ELEMENT_META_DATA_PMI_MANAGER {
             PmiManager::read(cursor)?;
@@ -1517,7 +1518,18 @@ fn push_cstr(stream: &mut Vec<u8>, text: &str) {
 pub struct XtBRep;
 
 impl XtBRep {
-    fn read(cursor: &mut Cursor<'_>) -> Result<()> {
+    fn read(cursor: &mut Cursor<'_>, end: usize) -> Result<()> {
+        if cursor.major() >= 10 {
+            // JT 10.x starts with a `U8` version and a subordinate flag that
+            // can put a MultiXT body list before the Parasolid versions, so
+            // the 9.x layout does not apply. Nothing of it is modelled.
+            let _version = cursor.read_version()?;
+            if end < cursor.position() {
+                return Err(cursor.error("element body read past its declared end"));
+            }
+            cursor.seek(end)?;
+            return Ok(());
+        }
         let _version = cursor.read_i32()?;
         let _major = cursor.read_i32()?;
         let _minor = cursor.read_i32()?;
@@ -1668,5 +1680,39 @@ mod tests {
         data.extend_from_slice(&[0; 8]);
         let mut cursor = Cursor::new(&data, ByteOrder::Little, 10);
         assert!(read_element_envelope(&mut cursor, false).is_err());
+    }
+
+    #[test]
+    fn a_ten_x_xt_brep_is_skipped_to_its_end() {
+        // U8 version, U8 subordinate flag, Parasolid major/minor/build, a
+        // stray byte, the transmit data and an attribute trailer.
+        let mut body = vec![1u8, 0];
+        for word in [33i32, 0, 171] {
+            body.extend_from_slice(&word.to_le_bytes());
+        }
+        body.push(0);
+        body.extend_from_slice(&4i32.to_le_bytes());
+        body.extend_from_slice(b"PS\0\0");
+        body.extend_from_slice(&0i32.to_le_bytes());
+        let end = body.len();
+        body.extend_from_slice(&[0xee; 4]);
+
+        let mut cursor = Cursor::new(&body, ByteOrder::Little, 10);
+        XtBRep::read(&mut cursor, end).unwrap();
+        assert_eq!(cursor.position(), end);
+    }
+
+    #[test]
+    fn a_nine_x_xt_brep_reads_its_declared_data() {
+        let mut body = Vec::new();
+        for word in [1i32, 26, 0, 171, 3] {
+            body.extend_from_slice(&word.to_le_bytes());
+        }
+        body.extend_from_slice(b"PS\0");
+        let end = body.len();
+
+        let mut cursor = Cursor::new(&body, ByteOrder::Little, 9);
+        XtBRep::read(&mut cursor, end).unwrap();
+        assert_eq!(cursor.position(), end);
     }
 }
