@@ -48,8 +48,11 @@ pub fn segment_type_name(kind: i32) -> &'static str {
 }
 
 /// Segment types that carry a compression envelope.
+///
+/// JT 10.x also wraps the STT (23), MultiXT B-Rep (30) and info (31)
+/// segments that NX writes next to an XT B-Rep.
 fn has_compression_header(kind: i32) -> bool {
-    matches!(kind, 1 | 2 | 3 | 4 | 17 | 18 | 20 | 24)
+    matches!(kind, 1 | 2 | 3 | 4 | 17 | 18 | 20 | 23 | 24 | 30 | 31)
 }
 
 /// The fixed part of a JT file: version, byte order, TOC offset and LSG GUID.
@@ -454,5 +457,34 @@ mod tests {
         let segment = read_segment(&data, 0, &header).unwrap();
         assert_eq!(segment.body.as_ref(), payload.as_slice());
         assert!(segment.check_length(0).is_ok());
+    }
+
+    #[test]
+    fn ten_x_brep_side_segments_are_compressed() {
+        let header = FileHeader {
+            major: 10,
+            minor: 0,
+            order: ByteOrder::Little,
+            toc_offset: 0,
+            lsg_guid: Guid::default(),
+        };
+        let payload = vec![9u8; 12];
+        let packed = crate::codec::deflate(&payload).unwrap();
+        for kind in [23i32, 30, 31] {
+            let mut data = Vec::new();
+            data.extend_from_slice(&[0x22u8; 16]);
+            data.extend_from_slice(&kind.to_le_bytes());
+            data.extend_from_slice(&((16 + 4 + 4 + 4 + 4 + 1 + packed.len()) as i32).to_le_bytes());
+            data.extend_from_slice(&2u32.to_le_bytes());
+            data.extend_from_slice(&((packed.len() + 1) as i32).to_le_bytes());
+            data.push(2);
+            data.extend_from_slice(&packed);
+            let segment = read_segment(&data, 0, &header).unwrap();
+            assert_eq!(
+                segment.body.as_ref(),
+                payload.as_slice(),
+                "segment type {kind}"
+            );
+        }
     }
 }

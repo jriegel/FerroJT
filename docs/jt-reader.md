@@ -69,8 +69,9 @@ Submodules:
     `Translation Date::`, `LAYER::`, the `LAYERFILTERnnn::` records and
     whatever else the CAD system wrote. The pairs come from
     `jt::key_value_pairs`, are stored as a sorted map, and stay `None` when the
-    stream is empty. Neither exporter emits them, so they are there for a
-    consumer that wants them — the viewer's detail pane shows them.
+    stream is empty. The glTF writer emits them as the `extras` of the node,
+    on every copy of an instanced subtree; the USD writer does not. The
+    viewer's detail pane shows them too.
 
 ## Materials and colours
 

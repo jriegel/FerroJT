@@ -446,11 +446,12 @@ def test_shapes_without_vertices_are_left_out_of_the_export() -> None:
     """
     model = ferrojt.read(str(SERVER))
     assert model.node_count == 2158
-    assert model.mesh_count == 105
-    assert model.triangle_count == 124154
+    assert model.mesh_count == 106
+    assert model.triangle_count == 129067
 
     document = glb_json(model.to_bytes("glb"))
-    assert len(document["nodes"]) == model.node_count
+    # Instanced subtrees are written once per path: glTF allows one parent.
+    assert len(document["nodes"]) > model.node_count
     assert len(document["meshes"]) == model.mesh_count
     for mesh in document["meshes"]:
         for primitive in mesh["primitives"]:

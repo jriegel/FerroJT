@@ -10,6 +10,7 @@
 //! | [`Material`](crate::model::Material) | `materials[n]` (same order, so indices match) |
 //! | [`Texture`](crate::model::Texture) | `textures[n]` / `images[n]` (same order) |
 //! | [`Node`](crate::model::Node) | `nodes[n]`, depth first from the scene roots |
+//! | `Node::extras`, such as the JT properties | `extras` of every glTF node written for it |
 //!
 //! Each attribute gets its own buffer view, which is always valid; a later
 //! optimisation pass can merge attributes that are already contiguous.
@@ -17,7 +18,7 @@
 //! Component types that glTF cannot express (`F16`, `F64`, `I32`, `I64`, `U64`)
 //! are widened to a representable type by [`widen`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gltf_json::validation::{Checked, USize64};
@@ -48,13 +49,22 @@ impl GltfExporter {
     /// Serialize to `.glb` or `.gltf` bytes.
     pub fn to_bytes(&self, model: &Model) -> Result<Vec<u8>> {
         let document = build(model)?;
-        let root = document.root;
+        let mut root = document.root;
         if self.binary {
             let json = root
                 .to_vec()
                 .map_err(|err| Error::Unsupported(format!("serializing glTF JSON: {err}")))?;
             GlbBuilder::new(json).with_bin(document.bin).finish()
         } else {
+            // `.gltf` has no binary chunk, so inline the buffer as a data URI.
+            if !document.bin.is_empty() {
+                if let Some(buffer) = root.buffers.first_mut() {
+                    buffer.uri = Some(format!(
+                        "data:application/octet-stream;base64,{}",
+                        STANDARD.encode(&document.bin)
+                    ));
+                }
+            }
             let json = root
                 .to_vec_pretty()
                 .map_err(|err| Error::Unsupported(format!("serializing glTF JSON: {err}")))?;
@@ -84,9 +94,15 @@ fn build(model: &Model) -> Result<Document> {
     let mut bin: Vec<u8> = Vec::new();
 
     // --- accessors and buffer views ---------------------------------------
+    let index_attributes: BTreeSet<usize> = model
+        .meshes
+        .iter()
+        .flat_map(|mesh| mesh.primitives.iter().filter_map(|prim| prim.indices))
+        .collect();
     let mut accessor_of = Vec::with_capacity(model.accessors.attributes.len());
     for index in 0..model.accessors.attributes.len() {
-        accessor_of.push(push_accessor(&mut root, &mut bin, model, index)?);
+        let is_index = index_attributes.contains(&index);
+        accessor_of.push(push_accessor(&mut root, &mut bin, model, index, is_index)?);
     }
 
     // --- images and textures (model order, so material indices stay valid) --
@@ -160,48 +176,24 @@ fn build(model: &Model) -> Result<Document> {
     }
 
     // --- nodes -------------------------------------------------------------
-    let order = depth_first(model);
-    let mut node_of = vec![usize::MAX; model.nodes.len()];
-    for (position, model_index) in order.iter().enumerate() {
-        node_of[*model_index] = position;
-    }
-    for model_index in &order {
-        let node = &model.nodes[*model_index];
-        let children: Vec<Index<scene::Node>> = node
-            .children
-            .iter()
-            .map(|child| {
-                node_of
-                    .get(*child)
-                    .copied()
-                    .filter(|position| *position != usize::MAX)
-                    .map(|position| Index::new(position as u32))
-                    .ok_or_else(|| {
-                        Error::invalid(
-                            *child as u64,
-                            "scene graph child is not reachable from a scene root",
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mesh_index = node_mesh(model, node, &mesh_of)?;
-        root.nodes.push(to_node(node, children, mesh_index));
+    // glTF needs the nodes to form strict trees, so a model node reached along
+    // several paths (an instanced subtree) is written once per path. The
+    // copies share their meshes.
+    let mut roots = Vec::new();
+    for index in model.scenes.iter().flat_map(|s| s.roots.iter().copied()) {
+        if index >= model.nodes.len() {
+            return Err(Error::invalid(index as u64, "scene root is out of range"));
+        }
+        roots.push(push_node_tree(
+            &mut root,
+            model,
+            index,
+            &mesh_of,
+            &mut Vec::new(),
+        )?);
     }
 
     // --- scene -------------------------------------------------------------
-    let roots = model
-        .scenes
-        .iter()
-        .flat_map(|s| s.roots.iter().copied())
-        .map(|index| {
-            node_of
-                .get(index)
-                .copied()
-                .filter(|position| *position != usize::MAX)
-                .map(|position| Index::new(position as u32))
-                .ok_or_else(|| Error::invalid(index as u64, "scene root is out of range"))
-        })
-        .collect::<Result<Vec<_>>>()?;
     let scene_index = root.push(scene::Scene {
         name: model
             .scenes
@@ -214,17 +206,37 @@ fn build(model: &Model) -> Result<Document> {
     });
     root.scene = Some(scene_index);
 
-    // `.gltf` has no binary chunk, so inline the buffer as a data URI.
-    if !bin.is_empty() {
-        if let Some(buffer) = root.buffers.first_mut() {
-            buffer.uri = Some(format!(
-                "data:application/octet-stream;base64,{}",
-                STANDARD.encode(&bin)
-            ));
+    Ok(Document { root, bin })
+}
+
+/// Write the model node `index` and its subtree as new glTF nodes, depth
+/// first, and return the index of the first. `path` holds the model nodes
+/// above it: a child that is also an ancestor would close a cycle and is left
+/// out.
+fn push_node_tree(
+    root: &mut Root,
+    model: &Model,
+    index: usize,
+    mesh_of: &[Index<mesh::Mesh>],
+    path: &mut Vec<usize>,
+) -> Result<Index<scene::Node>> {
+    let node = model
+        .nodes
+        .get(index)
+        .ok_or_else(|| Error::invalid(index as u64, "scene graph child is out of range"))?;
+    let mesh_index = node_mesh(model, node, mesh_of)?;
+    let position = root.nodes.len();
+    root.nodes.push(to_node(node, Vec::new(), mesh_index));
+    path.push(index);
+    let mut children = Vec::with_capacity(node.children.len());
+    for &child in &node.children {
+        if !path.contains(&child) {
+            children.push(push_node_tree(root, model, child, mesh_of, path)?);
         }
     }
-
-    Ok(Document { root, bin })
+    path.pop();
+    root.nodes[position].children = (!children.is_empty()).then_some(children);
+    Ok(Index::new(position as u32))
 }
 
 /// Depth first ordering of every node reachable from a scene root.
@@ -298,7 +310,7 @@ fn to_node(
         skin: None,
         weights: None,
         extensions: None,
-        extras: None,
+        extras: raw_extras(&node.extras),
     }
 }
 
@@ -457,12 +469,14 @@ fn to_material(root: &Root, mat: &crate::model::Material) -> Result<material::Ma
     })
 }
 
-/// The source specific fields of a material as glTF `extras`.
+/// The source specific fields of a material or a node as glTF `extras`.
 ///
 /// A fixed-function format such as JT carries more of an appearance than a
 /// metallic/roughness workflow can hold — ambient and specular colour, a
-/// shininess exponent — and a consumer that can use them should not have to
-/// re-read the source file for them.
+/// shininess exponent — and more about a part than glTF has fields for — its
+/// key/value properties such as `Name::`, `CAD_MASS::` or a part number. A
+/// consumer that can use them should not have to re-read the source file for
+/// them.
 fn raw_extras(extras: &Option<serde_json::Value>) -> Option<Box<serde_json::value::RawValue>> {
     serde_json::value::RawValue::from_string(extras.as_ref()?.to_string()).ok()
 }
@@ -480,12 +494,14 @@ fn texture_info(root: &Root, index: Option<usize>, tex_coord: u8) -> Option<text
     })
 }
 
-/// Append one attribute as a buffer view plus accessor.
+/// Append one attribute as a buffer view plus accessor. `is_index` marks the
+/// view as an element array, whatever the attribute is called.
 fn push_accessor(
     root: &mut Root,
     bin: &mut Vec<u8>,
     model: &Model,
     handle: usize,
+    is_index: bool,
 ) -> Result<Index<accessor::Accessor>> {
     let attribute = model
         .accessors
@@ -497,7 +513,7 @@ fn push_accessor(
         .ok_or_else(|| Error::invalid(handle as u64, "attribute extends past its buffer"))?;
 
     let (component_type, bytes) = widen(attribute.component_type, source)?;
-    let target = if attribute.name.ends_with("_INDICES") || attribute.name == "INDICES" {
+    let target = if is_index {
         Some(Checked::Valid(buffer::Target::ElementArrayBuffer))
     } else {
         Some(Checked::Valid(buffer::Target::ArrayBuffer))
@@ -798,6 +814,97 @@ mod tests {
         model
     }
 
+    /// An instanced subtree is one model node with two parents. glTF allows a
+    /// node only one parent, so the export holds one copy per path, and the
+    /// copies share the mesh.
+    #[test]
+    fn a_shared_subtree_is_written_once_per_path() {
+        let mut model = triangle_model();
+        let part = model.default_scene_mut().roots.pop().expect("the triangle");
+        let left = model.push_node(Node {
+            name: Some("left".into()),
+            children: vec![part],
+            ..Node::default()
+        });
+        let right = model.push_node(Node {
+            name: Some("right".into()),
+            children: vec![part],
+            ..Node::default()
+        });
+        let assembly = model.push_node(Node {
+            name: Some("assembly".into()),
+            children: vec![left, right],
+            ..Node::default()
+        });
+        model.default_scene_mut().roots.push(assembly);
+
+        let root = build(&model).unwrap().root;
+        let names: Vec<_> = root.nodes.iter().map(|n| n.name.as_deref()).collect();
+        assert_eq!(
+            names,
+            [
+                Some("assembly"),
+                Some("left"),
+                Some("triangle"),
+                Some("right"),
+                Some("triangle")
+            ]
+        );
+        let mut parents = vec![0; root.nodes.len()];
+        for node in &root.nodes {
+            for child in node.children.iter().flatten() {
+                parents[child.value()] += 1;
+            }
+        }
+        assert_eq!(parents, [0, 1, 1, 1, 1]);
+        assert_eq!(root.nodes[2].mesh, root.nodes[4].mesh);
+        assert_eq!(root.meshes.len(), 1);
+    }
+
+    /// The properties of a part travel in the `extras` of its node, so a glTF
+    /// consumer does not have to re-read the JT file for them. Every copy of an
+    /// instanced part carries them, and a node without extras gets none.
+    #[test]
+    fn the_extras_of_a_node_are_written_on_every_copy() {
+        let mut model = triangle_model();
+        let part = model.default_scene_mut().roots.pop().expect("the triangle");
+        let properties = serde_json::json!({
+            "properties": { "Name::": "triangle", "CAD_MASS::": "0.5" }
+        });
+        model.nodes[part].extras = Some(properties.clone());
+        let assembly = model.push_node(Node {
+            name: Some("assembly".into()),
+            children: vec![part, part],
+            ..Node::default()
+        });
+        model.default_scene_mut().roots.push(assembly);
+
+        let root = build(&model).unwrap().root;
+        let extras: Vec<Option<serde_json::Value>> = root
+            .nodes
+            .iter()
+            .map(|node| {
+                let raw = node.extras.as_ref()?;
+                Some(serde_json::from_str(raw.get()).expect("the extras are JSON"))
+            })
+            .collect();
+        assert_eq!(extras, [None, Some(properties.clone()), Some(properties)]);
+    }
+
+    #[test]
+    fn a_cycle_in_the_model_is_cut() {
+        let mut model = triangle_model();
+        let part = model.default_scene_mut().roots[0];
+        let group = model.push_node(Node {
+            children: vec![part],
+            ..Node::default()
+        });
+        model.nodes[part].children.push(group);
+        let root = build(&model).unwrap().root;
+        assert_eq!(root.nodes.len(), 2);
+        assert_eq!(root.nodes[1].children, None);
+    }
+
     #[test]
     fn split_suffix_parses_sets() {
         assert_eq!(split_suffix("TEXCOORD_0"), ("TEXCOORD", 0));
@@ -830,6 +937,38 @@ mod tests {
             serde_json::Value::Null
         );
         assert!(value["accessors"][0]["min"].is_array());
+    }
+
+    /// The buffer of a GLB is its BIN chunk; a `uri` would point readers
+    /// elsewhere and store the data twice.
+    #[test]
+    fn glb_buffer_is_the_bin_chunk() {
+        let bytes = GltfExporter::glb().to_bytes(&triangle_model()).unwrap();
+        let (json_len, bin) = crate::export::glb::parse_header(&bytes).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes[20..20 + json_len]).unwrap();
+        assert_eq!(value["buffers"][0]["uri"], serde_json::Value::Null);
+        assert_eq!(
+            value["buffers"][0]["byteLength"].as_u64(),
+            bin.map(|len| len as u64)
+        );
+    }
+
+    /// The JT reader names its index attribute `indices`; the view target
+    /// follows from the primitive, not from the name.
+    #[test]
+    fn index_views_are_element_arrays() {
+        let mut model = triangle_model();
+        model.accessors.attributes[1].name = "indices".into();
+        let bytes = GltfExporter::glb().to_bytes(&model).unwrap();
+        let (json_len, _) = crate::export::glb::parse_header(&bytes).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes[20..20 + json_len]).unwrap();
+        let targets: Vec<_> = value["bufferViews"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|view| view["target"].as_u64())
+            .collect();
+        assert_eq!(targets, [Some(34962), Some(34963)]);
     }
 
     #[test]

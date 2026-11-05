@@ -174,8 +174,8 @@ fn every_level_of_detail_can_be_loaded() {
         (
             "SampleJT_Server.jt",
             All {
-                meshes: 105,
-                triangles: 124_154,
+                meshes: 106,
+                triangles: 129_067,
                 tiers: 1,
             },
         ),
@@ -313,32 +313,28 @@ fn every_sample_exports_to_gltf() {
 }
 
 #[test]
-fn a_sample_with_empty_representations_still_exports_its_graph() {
+fn the_server_sample_exports_every_shape() {
     // `SampleJT_Server.jt` is the odd one out of the samples: it has no
-    // reference dump, its shapes are mostly empty, and it is the file that
-    // showed the POSITION failure. Its counts are pinned so that a change in
-    // how empty representations are handled becomes visible.
+    // reference dump, and it is the file that showed the POSITION failure. One
+    // of its shapes (36 instances) has faces with more than 64 attributes; it
+    // read as empty until the wide attribute masks were read as the plain
+    // word array they are. Its counts are pinned so that a change in how
+    // representations are read becomes visible.
     let file = sample("SampleJT_Server.jt");
     let model = file.to_model();
 
     assert_eq!(model.nodes.len(), 2_158, "nodes");
-    assert_eq!(model.meshes.len(), 105, "meshes");
+    assert_eq!(model.meshes.len(), 106, "meshes");
     assert_eq!(model.materials.len(), 23, "materials");
-    assert_eq!(model.triangle_count(), 124_154, "triangles");
+    assert_eq!(model.triangle_count(), 129_067, "triangles");
 
-    // The empty shapes keep their node — dropping geometry never drops a node —
-    // so there are more shape nodes than there are meshes.
+    // Every shape node carries the mesh of its representation.
     let shapes = model
         .nodes
         .iter()
         .filter(|node| node.kind.as_deref() == Some("Shape"))
         .count();
-    assert!(
-        shapes > model.meshes.len(),
-        "the empty shapes vanished instead of keeping their node: {shapes} shape \
-         nodes for {} meshes",
-        model.meshes.len()
-    );
+    assert_eq!(shapes, model.meshes.len(), "a shape lost its geometry");
     let drawn = model
         .nodes
         .iter()
@@ -997,6 +993,46 @@ fn the_key_value_properties_of_a_sample_reach_its_nodes() {
     }
 }
 
+#[test]
+fn the_key_value_properties_of_a_sample_reach_its_gltf_nodes() {
+    // The same streams have to survive the writer, as the `extras` of the glTF
+    // nodes, or a glTF consumer would have to re-read the JT file for them.
+    // glTF nodes carry no JT class, so only the property sets are compared.
+    for (name, _, _) in FILTERS {
+        let model = sample(name).to_model();
+        let bytes = ferrojt::export::to_format(ferrojt::Format::Glb, &model)
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        let (json_len, _) =
+            ferrojt::export::parse_header(&bytes).unwrap_or_else(|err| panic!("{name}: {err}"));
+        let json: serde_json::Value = serde_json::from_slice(&bytes[20..20 + json_len])
+            .unwrap_or_else(|err| panic!("{name}: the glTF JSON is not valid: {err}"));
+
+        let mut got: Vec<BTreeMap<String, String>> = json["nodes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name}: the glTF has no nodes"))
+            .iter()
+            .filter_map(|node| node.get("extras")?.get("properties"))
+            .map(|properties| {
+                serde_json::from_value(properties.clone())
+                    .unwrap_or_else(|err| panic!("{name}: the properties are not strings: {err}"))
+            })
+            .collect();
+        got.sort();
+        got.dedup();
+
+        let mut wanted: Vec<BTreeMap<String, String>> = reference_properties(name)
+            .into_iter()
+            .map(|(_, properties)| properties)
+            .collect();
+        wanted.sort();
+        wanted.dedup();
+        assert_eq!(
+            got, wanted,
+            "{name}: the glTF nodes lost or changed properties"
+        );
+    }
+}
+
 /// Every `properties` object of the reference dump of a sample, paired with the
 /// `jt_type` of the node carrying it, sorted and deduplicated. The dump prints
 /// them under the node they belong to, so walking the whole JSON for that key is
@@ -1078,6 +1114,60 @@ fn asking_for_a_filter_the_file_does_not_declare_fails() {
         assert_eq!(
             filter.expect("LAYCUR is declared").name.as_deref(),
             Some("LAYCUR")
+        );
+    }
+}
+
+#[test]
+fn a_move_to_front_package_decodes() {
+    // The JT 10.5 NIST assembly stores integer packages with the move-to-front
+    // codec (mark 2 codec 5). Before that codec was read, every shape segment
+    // that used it failed and the assembly exported no mesh at all.
+    let model = sample("NIST/nist-mtc-assembly.jt").to_model();
+    assert!(
+        model.meshes.len() >= 7,
+        "the assembly holds only {} meshes",
+        model.meshes.len()
+    );
+    assert!(
+        model.triangle_count() >= 43_924,
+        "the assembly holds only {} triangles",
+        model.triangle_count()
+    );
+}
+
+#[test]
+fn every_child_of_a_range_lod_is_a_tier() {
+    // The NIST parts list the shapes of their finer tiers directly under the
+    // range LOD (`Shape`, `Shape`, `Group { Shape }`) instead of wrapping each
+    // tier in a group. Every child is a tier all the same, so only the first
+    // shape is exported; counting groups alone exported all three stacked.
+    // The triangle counts are the ones Aspose.3D 26.10 reports for these files.
+    const NIST: &[(&str, usize)] = &[
+        ("nist-ctc-01-part.jt", 1_350),
+        ("nist-ctc-02-part.jt", 6_842),
+        ("nist-ctc-03-part.jt", 1_536),
+        ("nist-ctc-05-part.jt", 2_272),
+        ("nist-ftc-11-part.jt", 1_936),
+        ("nist-htc-part.jt", 3_050),
+        ("nist-mtc-cover.jt", 4_248),
+        ("nist-mtc-plate.jt", 4_412),
+        ("nist-socket-head-cap-screw.jt", 6_450),
+    ];
+    for (name, triangles) in NIST {
+        let file = sample(&format!("NIST/{name}"));
+        let model = file.to_model();
+        assert_eq!(model.meshes.len(), 1, "{name}: meshes");
+        assert_eq!(model.triangle_count(), *triangles, "{name}: triangles");
+        assert_eq!(model.meshes[0].lod_level, Some(0), "{name}: tier");
+
+        let all = file.to_model_with_all_lods();
+        let mut tiers: Vec<_> = all.meshes.iter().map(|mesh| mesh.lod_level).collect();
+        tiers.sort_unstable();
+        tiers.dedup();
+        assert!(
+            tiers.len() >= 3 && tiers.iter().all(Option::is_some),
+            "{name}: tiers {tiers:?}"
         );
     }
 }
