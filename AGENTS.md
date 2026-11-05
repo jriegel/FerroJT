@@ -404,9 +404,10 @@ Upload with `python -m twine upload dist\*`.
   `CAD_MASS::`, `Translation Date::` and whatever else the CAD system wrote.
   `jt/model.rs::node_properties` stores it as `Node::extras["properties"]` (a
   sorted map, `None` when empty so plain nodes and existing fixtures are
-  unchanged). Neither exporter emits node extras (glTF `to_node` sets
-  `extras: None`, USD reads only `model.extras["layer_filter"]`), so pinned
-  counts are unchanged and the viewer's detail pane is their only exit. The
+  unchanged). The glTF writer emits node extras (`to_node` →
+  `raw_extras`, on every copy `push_node_tree` writes, pinned in
+  `the_key_value_properties_of_a_sample_reach_its_gltf_nodes`); USD reads only
+  `model.extras["layer_filter"]`. Pinned counts are unchanged either way. The
   parity test `the_key_value_properties_of_a_sample_reach_its_nodes()` must
   **sort and dedup both sides**: `jt::dump` expands an instanced subtree once per
   instance (plate1-9.5 → 6 `properties` objects) while the model keeps **one

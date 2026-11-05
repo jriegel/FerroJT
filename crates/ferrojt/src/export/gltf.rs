@@ -10,6 +10,7 @@
 //! | [`Material`](crate::model::Material) | `materials[n]` (same order, so indices match) |
 //! | [`Texture`](crate::model::Texture) | `textures[n]` / `images[n]` (same order) |
 //! | [`Node`](crate::model::Node) | `nodes[n]`, depth first from the scene roots |
+//! | `Node::extras`, such as the JT properties | `extras` of every glTF node written for it |
 //!
 //! Each attribute gets its own buffer view, which is always valid; a later
 //! optimisation pass can merge attributes that are already contiguous.
@@ -309,7 +310,7 @@ fn to_node(
         skin: None,
         weights: None,
         extensions: None,
-        extras: None,
+        extras: raw_extras(&node.extras),
     }
 }
 
@@ -468,12 +469,14 @@ fn to_material(root: &Root, mat: &crate::model::Material) -> Result<material::Ma
     })
 }
 
-/// The source specific fields of a material as glTF `extras`.
+/// The source specific fields of a material or a node as glTF `extras`.
 ///
 /// A fixed-function format such as JT carries more of an appearance than a
 /// metallic/roughness workflow can hold — ambient and specular colour, a
-/// shininess exponent — and a consumer that can use them should not have to
-/// re-read the source file for them.
+/// shininess exponent — and more about a part than glTF has fields for — its
+/// key/value properties such as `Name::`, `CAD_MASS::` or a part number. A
+/// consumer that can use them should not have to re-read the source file for
+/// them.
 fn raw_extras(extras: &Option<serde_json::Value>) -> Option<Box<serde_json::value::RawValue>> {
     serde_json::value::RawValue::from_string(extras.as_ref()?.to_string()).ok()
 }
@@ -856,6 +859,36 @@ mod tests {
         assert_eq!(parents, [0, 1, 1, 1, 1]);
         assert_eq!(root.nodes[2].mesh, root.nodes[4].mesh);
         assert_eq!(root.meshes.len(), 1);
+    }
+
+    /// The properties of a part travel in the `extras` of its node, so a glTF
+    /// consumer does not have to re-read the JT file for them. Every copy of an
+    /// instanced part carries them, and a node without extras gets none.
+    #[test]
+    fn the_extras_of_a_node_are_written_on_every_copy() {
+        let mut model = triangle_model();
+        let part = model.default_scene_mut().roots.pop().expect("the triangle");
+        let properties = serde_json::json!({
+            "properties": { "Name::": "triangle", "CAD_MASS::": "0.5" }
+        });
+        model.nodes[part].extras = Some(properties.clone());
+        let assembly = model.push_node(Node {
+            name: Some("assembly".into()),
+            children: vec![part, part],
+            ..Node::default()
+        });
+        model.default_scene_mut().roots.push(assembly);
+
+        let root = build(&model).unwrap().root;
+        let extras: Vec<Option<serde_json::Value>> = root
+            .nodes
+            .iter()
+            .map(|node| {
+                let raw = node.extras.as_ref()?;
+                Some(serde_json::from_str(raw.get()).expect("the extras are JSON"))
+            })
+            .collect();
+        assert_eq!(extras, [None, Some(properties.clone()), Some(properties)]);
     }
 
     #[test]

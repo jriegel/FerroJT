@@ -993,6 +993,46 @@ fn the_key_value_properties_of_a_sample_reach_its_nodes() {
     }
 }
 
+#[test]
+fn the_key_value_properties_of_a_sample_reach_its_gltf_nodes() {
+    // The same streams have to survive the writer, as the `extras` of the glTF
+    // nodes, or a glTF consumer would have to re-read the JT file for them.
+    // glTF nodes carry no JT class, so only the property sets are compared.
+    for (name, _, _) in FILTERS {
+        let model = sample(name).to_model();
+        let bytes = ferrojt::export::to_format(ferrojt::Format::Glb, &model)
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        let (json_len, _) =
+            ferrojt::export::parse_header(&bytes).unwrap_or_else(|err| panic!("{name}: {err}"));
+        let json: serde_json::Value = serde_json::from_slice(&bytes[20..20 + json_len])
+            .unwrap_or_else(|err| panic!("{name}: the glTF JSON is not valid: {err}"));
+
+        let mut got: Vec<BTreeMap<String, String>> = json["nodes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name}: the glTF has no nodes"))
+            .iter()
+            .filter_map(|node| node.get("extras")?.get("properties"))
+            .map(|properties| {
+                serde_json::from_value(properties.clone())
+                    .unwrap_or_else(|err| panic!("{name}: the properties are not strings: {err}"))
+            })
+            .collect();
+        got.sort();
+        got.dedup();
+
+        let mut wanted: Vec<BTreeMap<String, String>> = reference_properties(name)
+            .into_iter()
+            .map(|(_, properties)| properties)
+            .collect();
+        wanted.sort();
+        wanted.dedup();
+        assert_eq!(
+            got, wanted,
+            "{name}: the glTF nodes lost or changed properties"
+        );
+    }
+}
+
 /// Every `properties` object of the reference dump of a sample, paired with the
 /// `jt_type` of the node carrying it, sorted and deduplicated. The dump prints
 /// them under the node they belong to, so walking the whole JSON for that key is

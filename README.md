@@ -179,8 +179,8 @@ key/value detail pane below, reporting what the selected row carries — its cla
 and name, transform, world box, meshes with triangle counts, materials and LOD
 tier, and the raw properties a JT file stores in the meta data stream of that
 node (`Name::`, `CAD_MASS::`, `LAYER::` and the rest). Those properties are read
-by the library and kept in `Node::extras`; neither the glTF nor the USD writer
-emits them, so the detail pane is their only exit.
+by the library and kept in `Node::extras`; the glTF writer emits them as the
+`extras` of the node, the USD writer does not.
 
 Hiding a node or filtering the tree never removes it from the graph: a hidden
 subtree keeps its rows, its place in the tree and its selection, and `View All`
