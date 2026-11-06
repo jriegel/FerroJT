@@ -219,10 +219,20 @@ impl SceneGraph {
     /// The element a late-load property refers to.
     #[must_use]
     pub fn loaded_element(&self, load: &LateLoad) -> Option<&Element> {
-        self.loaded_ids
-            .get(&load.property_id)
-            .and_then(|pos| self.loaded.get(*pos))
+        self.loaded_pos(load)
+            .and_then(|pos| self.loaded.get(pos))
             .map(|stored| &stored.element)
+    }
+
+    /// Position of the loaded element a late-load property refers to.
+    ///
+    /// That position is the identity of a representation inside the file: it is
+    /// stable for the lifetime of the graph, and every node that draws the same
+    /// representation — an `Instance` and the shape it instantiates — resolves
+    /// to the same one.
+    #[must_use]
+    pub fn loaded_pos(&self, load: &LateLoad) -> Option<usize> {
+        self.loaded_ids.get(&load.property_id).copied()
     }
 
     /// Geometry of the representation a late-load property refers to.
@@ -1009,12 +1019,17 @@ impl LodWalk {
 }
 
 /// The transform described by a node's geometric transform attribute.
-fn transform_of(graph: &SceneGraph, node: &Node) -> Transform {
+///
+/// A node without that attribute answers with the identity.
+#[must_use]
+pub fn transform_of(graph: &SceneGraph, node: &Node) -> Transform {
     graph
         .attributes_of(node)
         .iter()
         .find_map(|attribute| match attribute {
-            Attribute::GeometricTransform(attribute) => Some(decompose(&attribute.matrix)),
+            Attribute::GeometricTransform(attribute) => {
+                Some(decompose_transform(&attribute.matrix))
+            }
             _ => None,
         })
         .unwrap_or(Transform::IDENTITY)
@@ -1079,7 +1094,8 @@ const ROUGHNESS_FACTOR: f32 = 0.8;
 /// is at `matrix[4 * c + r]`. Reading the array row major instead yields the
 /// transpose, i.e. the inverse rotation — which is why positions still look
 /// right while every rotated part spins the wrong way.
-fn decompose(matrix: &[f64; 16]) -> Transform {
+#[must_use]
+pub fn decompose_transform(matrix: &[f64; 16]) -> Transform {
     let column = |axis: usize| [matrix[4 * axis], matrix[4 * axis + 1], matrix[4 * axis + 2]];
     let length = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
 
@@ -1162,6 +1178,7 @@ fn to_quaternion(m: [[f64; 3]; 3]) -> [f32; 4] {
 
 #[cfg(test)]
 mod tests {
+    use super::decompose_transform as decompose;
     use super::*;
     use crate::codec::ByteOrder;
     use crate::jt::object::{

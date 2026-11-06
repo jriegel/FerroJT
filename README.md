@@ -231,7 +231,63 @@ The keywords work on `ferrojt.open`, `ferrojt.read`, `JtFile.model`,
 `JtFile.writeGlTf` and `JtFile.write_gltf`; combining the two of them raises
 `ValueError`.
 
-Requires Python 3.10 or newer.
+### Walking the scene graph
+
+`Model` is what the exporters build: one node tree, only the finest LOD tier, the
+layer filter already applied. `JtFile.lsg` is the other view — the logical scene
+graph **of the file**, with every tier, the JT class names, the key/value
+properties a translator wrote, the layer tags and the attributes.
+
+```python
+jt = ferrojt.JtFile("gear.jt")
+jt.open()
+graph = jt.lsg                       # JtLsg: the LSG of the file
+
+root = graph.root()                  # JtNode
+print(root.class_name, root.name)    # 'Partition' 'gear.asm'
+for child in root:                   # iterate, len(), root[0], root[-1]
+    print(child.class_name, child.name, child.properties())
+
+node = graph.nodes()[2]              # every node, in file order
+print(node.class_name, node.bounds, node.area)
+print(node.properties())             # {'Name::': ..., 'CAD_MASS::': ...}
+print(node.layers, node.material())  # layer tags, shading of a shape
+print(node.transform)                # {'translation': ..., 'rotation': ..., 'scale': ...}
+```
+
+Meshes are the special case, because a JT file *instances* them: the plate
+samples hold one screw and place it twice. A representation is identified by its
+id — its position in the representation list of the file — so the two placements
+report the same ids and the geometry is read once.
+
+```python
+for mesh in graph.meshes():          # every representation of the file, once
+    print(mesh.id, mesh.vertex_count, mesh.triangle_count)
+
+for instance in (n for n in graph.nodes() if n.is_instance):
+    print(instance.name, instance.transform["translation"])
+    print(instance.mesh_ids)         # [] — an instance carries no geometry
+    print(instance.subtree_mesh_ids())   # the ids it shares with its twin
+```
+
+Each array of a representation implements the buffer protocol, so NumPy wraps it
+**without copying** — the view points straight at the decoded buffers of the file
+and keeps them alive. That is how a mesh gets to OpenMesh, trimesh or VTK without
+any C++ dependency.
+
+```python
+import numpy as np
+
+mesh = graph.mesh(4)
+vertices = np.asarray(mesh.array("vertices"))   # float32, (n, 3), read-only
+normals = np.asarray(mesh.array("normals"))     # float32, (n, 3)
+indices = np.asarray(mesh.array("indices"))     # int32, (m,)
+assert vertices.flags.owndata is False          # borrowed, not copied
+mesh.array_names                                # ['indices', 'vertices', 'normals']
+mesh.arrays()                                   # all three as a dict
+```
+
+Requires Python 3.11 or newer.
 
 ### Visual regression
 
@@ -291,8 +347,8 @@ the same extra as the visual regression test, `pip install -e ".[test,visual]"`.
 
 ### Wheels
 
-`pyo3` is built with the `abi3-py310` feature, so the extension uses the stable
-ABI: **one wheel per platform covers every CPython from 3.10 upwards**, there is
+`pyo3` is built with the `abi3-py311` feature, so the extension uses the stable
+ABI: **one wheel per platform covers every CPython from 3.11 upwards**, there is
 no wheel per Python version. `build-wheel.bat` builds them all into `dist/`:
 
 ```bat
@@ -305,8 +361,8 @@ build-wheel.bat sdist      source distribution only
 It produces
 
 ```text
-ferrojt-0.1.0-cp310-abi3-win_amd64.whl                                    Windows
-ferrojt-0.1.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl   Linux, glibc >= 2.17
+ferrojt-0.1.0-cp311-abi3-win_amd64.whl                                    Windows
+ferrojt-0.1.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl   Linux, glibc >= 2.17
 ferrojt-0.1.0.tar.gz                                                      source distribution
 ```
 

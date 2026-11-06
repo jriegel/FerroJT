@@ -13,6 +13,7 @@
 | `jt::read_header(path) -> Result<FileHeader>` | Parses only the header banner (version, byte order, TOC offset, LSG GUID) for `ferrojt info`. |
 | `jt::JtFile::open(path)` | The JT native view: header, TOC table and the decoded logical scene graph. This is what `ferrojt dump` and `ferrojt.JtFile` use. |
 | `jt::dump(file, config, indent) -> Result<String>` | The JSON layout the JT tooling writes; see [dump.md](dump.md). |
+| `ferrojt.JtFile.lsg` | The same native view as python objects — `JtLsg`, `JtNode`, `JtMesh`, `JtArray`; see "The file view" below. |
 
 Submodules:
 
@@ -136,6 +137,76 @@ ones declare `ALL` and `LAYCUR` with an empty active name; every part of every
 sample survives its own default filter, so the pinned export counts do not
 change.
 
+## The file view (`JtLsg` / `JtNode` / `JtMesh` / `JtArray`)
+
+`Model` is the **export** view: one node tree, finest LOD tier only, the layer
+filter already applied, JT names normalised. `ferrojt.JtFile.lsg` is the **file**
+view — the decoded `SceneGraph` itself, exposed as python handles by
+`crates/ferrojt-python/src/lsg.rs`. Nothing is filtered and nothing is renamed:
+every LOD tier, the JT class name, the whole key/value stream, the layer tags and
+the attributes are reachable, which is what a python script that wants to pick
+and choose needs.
+
+* `JtLsg` is the handle on the parsed file: `root()`, `nodes()` (every node in
+  file order), `meshes()`, `mesh(id)`, `node_count`, `representation_count`.
+* `JtNode` is a position in the graph, not a copy of a subtree. It iterates
+  (`len()`, `node[i]` with negative indices, `for child in node`), compares and
+  hashes by that position, and reports `class_name`, `id`, `name`, `version`,
+  `flags`, `is_instance`, `is_tri_strip_set`, `layers`, `attribute_names`,
+  `properties()`, `material()`, `late_loads()`, the transform as `matrix` /
+  `transform` / `translation` / `rotation` / `scale`, plus the per-kind fields
+  `bounds`, `area`, `lod_limits`, `lod_signal`, `lod_center`, `up_axis` and
+  `partition_file_name`. Indexing and iteration keep a child reference that does
+  not resolve to a node — it comes back as `None`, and
+  `unresolved_children()` counts them; `children()` skips them.
+* Every handle keeps the file alive, so a node or an array stays valid on its own
+  and a NumPy view of an array keeps the whole file readable.
+
+### Representation ids
+
+A JT shape node does not own its geometry, it late-loads it, and an `Instance`
+refers to a subtree that is stored once. So the geometry is keyed by **position
+in the representation list of the file** — `SceneGraph::loaded`, resolved by
+`model.rs::loaded_pos`, which matches on the late-load ids so an `Instance` and
+its target share one id. That id is the instancing key:
+
+* `node.mesh_ids` is the geometry of that node alone — empty for an `Instance`.
+* `node.subtree_mesh_ids()` is everything below it, so the two placements of one
+  screw report the same ids and the geometry is read once.
+* `meshes()`, `mesh(id)` and `representation_count` only list entries that
+  actually carry geometry, because `SceneGraph::loaded` also holds meta data late
+  loads. The ids are **not** `0..count`: block 9.5 has three representations,
+  `[4, 5, 6]`, and `mesh(0)` is an `IndexError`.
+* Unlike `to_model()`, the file view **keeps** a representation with no vertices:
+  glTF mandates a `POSITION` attribute and drops it, a python consumer may still
+  want to see it. `SampleJT_Server.jt` declares 36 such shapes, which collapse to
+  one shared representation because they are instanced — `representation_count`
+  is 106, the pinned 105 meshes plus that one.
+
+### Zero-copy arrays
+
+`mesh.array("indices" | "vertices" | "normals")` returns a `JtArray` that
+implements the buffer protocol directly over the decoded `LodGeometry` of the
+file — no intermediate `bytes`, no copy, no C++ dependency:
+
+| Channel | Shape | Format | Strides |
+| --- | --- | --- | --- |
+| `indices` | `(m,)` | `int32` (`"i"`) | `(4,)` |
+| `vertices` | `(n, 3)` | `float32` (`"f"`) | `(12, 4)` |
+| `normals` | `(n, 3)` | `float32` (`"f"`) | `(12, 4)` |
+
+`memoryview(a)` and `numpy.asarray(a)` both borrow: `flags.owndata is False`, and
+`np.shares_memory` holds between two calls. The view is always read-only —
+requesting `PyBUF_WRITABLE` is a `BufferError`, because the arrays of a JT file
+are what the file says they are. An **empty** channel still hands out a
+zero-length buffer, pointed at a static stand-in since a `Vec` of length zero has
+a null pointer: returning nothing would make `numpy.asarray` fall back to a 0-d
+**object** array instead of an empty `float32`. `len(a)` is the number of rows, so
+it agrees with `len(memoryview(a))` and `len(np.asarray(a))`.
+
+Python 3.11 is the floor for this: the stable ABI only gained the `bf_getbuffer`
+slot then, so pyo3 compiles `__getbuffer__` out below it.
+
 ## Constraints
 
 * No `unsafe` — `crates/ferrojt` is `#![forbid(unsafe_code)]`.
@@ -169,7 +240,11 @@ change.
   for byte.
 * Unit tests in `jt/model` build a synthetic scene graph, because no sample has
   a part on a layer its filter rejects or a representation without vertices.
-* `tests/test_ferrojt.py` — the same reference dumps through the python bindings.
+* `tests/test_ferrojt.py` — the same reference dumps through the python bindings,
+  plus the file view: the node list and class names of a sample, its
+  representation ids, two `Instance` nodes sharing one representation, the JT 8.x
+  tier names carried by the segment type, and the zero-copy contract of `JtArray`
+  (`owndata is False`, `np.shares_memory`, read-only).
 * `tests/test_visual.py` — the export of every sample — the three
   `example_block` versions, the two `opening_protection_plate1` ones and
   `SampleJT_Server.jt` — is rendered offscreen and compared with a reference

@@ -10,7 +10,7 @@ design detail lives in `docs/`.
 | --- | --- |
 | `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `export/` glTF/GLB writer and the ASCII USD writer. |
 | `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `ls`. |
-| `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `pyproject.toml` + `python/ferrojt/` + `tests/`. |
+| `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `lib.rs` is the export view (`Model`) plus `lsg.rs` the file view (`JtLsg`/`JtNode`/`JtMesh`/`JtArray`); `pyproject.toml` + `python/ferrojt/` + `tests/`. |
 | `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `details.rs` key/value pane for the selected row, `backdrop.rs` viewport gradient, `camera.rs` `Camera3d` wrapper that places the backdrop, `picking.rs`, `trihedron.rs`. |
 | `python/ferrojt/` | Pure-Python package re-exporting `_ferrojt` (`__init__.py`, `_ferrojt.pyi`, `py.typed`). |
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
@@ -48,7 +48,7 @@ without it):
 ```
 
 Interactive viewer (also needs `open3d`; it is a tool, not a test — nothing in it
-is named `test_*`, so pytest still collects 53 tests):
+is named `test_*`, so pytest still collects 62 tests):
 
 ```powershell
 .\.venv\Scripts\python.exe tests\test_viewer.py data\ExampleFiles\example_block_jt9.5.jt
@@ -251,9 +251,54 @@ Upload with `python -m twine upload dist\*`.
   with `Python::attach`); `Python::allow_threads` is gone. Optional args need
   `#[pyo3(signature = (path, format = None))]`. Error mapping:
   `Io`→`PyOSError`, `Invalid`→`PyValueError`, `NotImplemented`→`PyNotImplementedError`.
-- `pyo3` is built with `abi3-py310`, so one wheel per platform covers CPython
-  ≥ 3.10. Tags: `cp310-abi3-win_amd64`,
-  `cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64`.
+- `pyo3` is built with `abi3-py311`, so one wheel per platform covers CPython
+  ≥ 3.11. Tags: `cp311-abi3-win_amd64`,
+  `cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64`. **3.11 is the floor
+  because `__getbuffer__` is compiled out below it** — pyo3 gates the
+  `bf_getbuffer`/`bf_releasebuffer` trampolines on `Py_3_11` (the stable ABI only
+  gained the slot then), which is what `JtArray` is built on. Bumping back to
+  `abi3-py310` silently drops the buffer protocol.
+- **The LSG view (`crates/ferrojt-python/src/lsg.rs`).** `JtFile.lsg` is a
+  `JtLsg` handle holding the parsed `ferrojt::jt::JtFile`; `JtNode`/`JtMesh`/
+  `JtArray` are thin handles that keep it alive through a `Py<Lsg>`, so a handle
+  stays valid on its own and a NumPy view of an array keeps the whole file alive.
+  This is the **file** view (`SceneGraph`, every LOD tier, JT class names, the
+  whole key/value stream, layer tags, nothing filtered) — `Model` stays the
+  export view and is unchanged. The **representation id** is the position in
+  `SceneGraph::loaded` (`model.rs::loaded_pos`, keyed by `loaded_ids`/`property_id`
+  so an `Instance` and its target share it) and is the instancing key: an
+  `Instance` has `mesh_ids == []` and shares `subtree_mesh_ids()` with its twin.
+  The server sample's **36 empty shapes collapse to one** representation (id 164,
+  one node) because they are instanced — `representation_count` is 106, i.e. the
+  pinned 105 non-empty meshes plus that one, and the file view **keeps** it while
+  `to_model()` drops it (glTF mandates POSITION).
+- **`Lsg::representations()` must filter `element.geometry().is_some()`.**
+  `SceneGraph::loaded` also holds Meta Data / `ProxyMetaData` late loads, so the
+  raw length counts too much: block 9.5 went 7 → 3. The ids are **not**
+  `0..count` — block 9.5 is `[4, 5, 6]`, plate1-9.5 `[4, 5, 6, 11, 12, 13]` — so
+  `mesh(id)` raises `IndexError` unless the id is in that list.
+- **`JtArray` zero copy.** `__getbuffer__(slf: Bound<'_, Self>, view, flags)` +
+  `slf.into_ptr()` as the owner, `__releasebuffer__(&self, view)` frees the
+  heap-owned `CString` in `view.format` and the `Box<[Py_ssize_t; 4]>` in
+  `view.internal` (shape/strides/format **must not** point at a local). Indices
+  are 1-D `(m,)` `int32`, vertices/normals 2-D `(n, 3)` `float32` with strides
+  `(12, 4)`; `readonly = 1` always, and `PyBUF_WRITABLE` is refused. An **empty**
+  channel still hands out a zero-length buffer pointed at a `static EMPTY`
+  array — returning `None` makes `numpy.asarray` fall back to a 0-d **object**
+  array instead of an empty `float32`. `__len__` is `dims[0]` (rows), not the
+  product, so it agrees with `len(memoryview(a))` and `len(np.asarray(a))`.
+  Proof: `flags.owndata is False`, `np.shares_memory` across two `asarray` calls,
+  and all 106 representations of the server sample in ~0.9 s.
+- **pyo3 0.30 handle classes.** `Py<T>` is **not** `Clone` — `impl<T> Clone for
+  Py<T>` sits behind the `py-clone` feature (`instance.rs:2127`), so never
+  `#[derive(Clone)]` a pyclass holding a `Py<_>`; use `clone_ref(py)`. `Py<Self>`
+  is a valid `#[pymethods]` receiver, and `Py::get(&self) -> &T` needs
+  `T: PyClass<Frozen = True> + Sync` — legal here because nothing in
+  `crates/ferrojt/src` has interior mutability. **`tp_iter` must return a real
+  iterator**: returning a `Py<PyList>` compiles but raises `TypeError: iter()
+  returned non-iterator of type 'list'`; use
+  `PyList::new(py, items)?.try_iter()?.into_any().unbind()` as `PyResult<Py<PyAny>>`
+  (`Py<PyIterator>` is not `Py<PyAny>`).
 - maturin on Windows: always pass `-i <venv python>` for a cross build (otherwise
   it probes the Microsoft Store `python3` stub), and put
   `.venv\Lib\site-packages\ziglang` on `PATH` — `ZIG=` is ignored.
@@ -541,7 +586,10 @@ Upload with `python -m twine upload dist\*`.
 - **JT 8.x samples and `SampleJT_Server.jt` declare NO layer filters**, so their layers
   record no `ferrojt:layer_filter` in `customLayerData` (that is how a consumer tells
   "unfiltered" from "filtered by a file with no layers"). block-9.5/10.3 and plate1-9.5
-  declare `ALL` (+ `LAYCUR`); plate1-9.5 tags its parts `LAYER:: = 20`. Recorded via
+  declare `ALL` (+ `LAYCUR`); plate1-9.5 tags the **instance target** (the `MetaData`
+  node the two `Instance`s point at, position 11) with `LAYER:: = 20`, **not** the
+  `Part` — the block 9.5 `Part` (position 2) is the sample where the tag sits on the
+  part itself. Recorded via
   `Model::extras["layer_filter"]` → `ferrojt:layer_filter` / `int[] ferrojt:layers`.
 - **usd-core 26.11 Python API** (for `target\usd_*.py` probes): no
   `Stage.GetCustomLayerData` — read `stage.GetRootLayer().customLayerData`; `Prim` has

@@ -54,8 +54,10 @@ rfd = "0.17"
 image = { version = "0.25", default-features = false }
 webbrowser = "1.2"
 
-# python bindings
-pyo3 = { version = "0.30", features = ["abi3-py310"] }
+# python bindings — abi3-py311 is the floor because the mesh arrays implement the
+# buffer protocol: `__getbuffer__` is only compiled into a stable-ABI extension
+# from CPython 3.11 on (pyo3 `trampoline.rs` gates it on `Py_3_11`).
+pyo3 = { version = "0.30", features = ["abi3-py311"] }
 
 # NOTE: `panic = "abort"` is deliberately *not* used: the Python extension catches
 # panics at the FFI boundary and surfaces them as Python exceptions.

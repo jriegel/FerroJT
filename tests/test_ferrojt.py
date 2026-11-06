@@ -52,6 +52,8 @@ def test_package_exports() -> None:
     assert callable(ferrojt.detect_format)
     assert callable(ferrojt.dump)
     assert ferrojt.JtFile is not None
+    for name in ("JtLsg", "JtNode", "JtMesh", "JtArray"):
+        assert getattr(ferrojt, name) is not None, name
     assert "glb" in ferrojt.formats()
 
 
@@ -329,6 +331,307 @@ def test_the_colour_of_a_sample_reaches_the_gltf(name: str) -> None:
             assert primitive["material"] < len(materials), name
 
 
+# ---------------------------------------------------------------------------
+# The scene graph of a file: JtLsg, JtNode, JtMesh and JtArray.
+#
+# These handles expose the LSG of the JT file itself rather than the neutral
+# model the exporters build, so every LOD tier of a file is visible and the
+# representation id of a mesh is the identity that instancing shares.
+# ---------------------------------------------------------------------------
+
+PLATE_95 = SAMPLES / "opening_protection_plate1_jt9.5.jt"
+PLATE_80 = SAMPLES / "opening_protection_plate1_jt8.0.jt"
+
+needs_plate95 = pytest.mark.skipif(
+    not PLATE_95.is_file(), reason="the plate sample is not checked out"
+)
+needs_plate80 = pytest.mark.skipif(
+    not PLATE_80.is_file(), reason="the 8.0 plate sample is not checked out"
+)
+
+
+@needs_sample
+def test_lsg_reports_the_scene_graph_of_a_file() -> None:
+    jt = ferrojt.JtFile(str(BLOCK_95))
+    assert jt.open()
+    graph = jt.lsg
+    assert graph is not None
+    assert graph.path.endswith("example_block_jt9.5.jt")
+
+    # The block file is a Partition with one Meta Data child, one Part and
+    # three LOD tiers of one shape.
+    assert graph.node_count == 10
+    assert graph.representation_count == 3
+    assert len(graph.nodes()) == graph.node_count
+
+    root = graph.root()
+    assert root is not None and root == jt.root()
+    assert root.class_name == "Partition"
+    assert root.id == 0
+    assert root.position == 0
+    assert root.name == "example_block_nx8.5.asm"
+    assert root.partition_file_name == "example_block_nx8_5.jt"
+    assert root.up_axis == 0
+    assert len(root) == root.child_count() == 1
+    assert [child.class_name for child in root] == ["MetaData"]
+    assert root[0] == root[-1] == graph.nodes()[1]
+    assert len(root.descendants()) == graph.node_count - 1
+
+    # A Partition carries neither transform nor properties.
+    assert root.transform is None
+    assert root.matrix is None
+    assert root.properties() == {}
+    assert root.attribute_names == []
+    assert root.material() is None
+    assert root.late_loads() == []
+
+    classes = [node.class_name for node in graph.nodes()]
+    assert classes[0] == "Partition"
+    assert "Part" in classes and "Shape" in classes
+    assert repr(graph).startswith("JtLsg(path=")
+
+
+@needs_sample
+def test_a_node_reports_its_own_jt_details() -> None:
+    jt = ferrojt.JtFile(str(BLOCK_95))
+    assert jt.open()
+    graph = jt.lsg
+
+    part = graph.nodes()[2]
+    assert part.class_name == "Part"
+    assert part.name == "example_block_750.part"
+    # The key/value stream of the late loads: the same pairs the dump prints.
+    # Note that ``Name::`` is the property the translator wrote, which is not
+    # always the object name of the node — the block file spells the one
+    # without the extension and the other with it.
+    properties = part.properties()
+    assert properties["Name::"] == "example_block_750"
+    assert properties["LAYER::"] == "1"
+    assert properties["CAD_MASS::"]
+    assert part.layers == [1]
+
+    shape = next(node for node in graph.nodes() if node.class_name == "Shape")
+    assert shape.bounds == [0.0, 0.0, 0.0, 100.0, 80.0, 60.0]
+    assert shape.area == pytest.approx(37600.0)
+    assert shape.is_tri_strip_set is True
+    assert shape.attribute_names == ["Material"]
+    material = shape.material()
+    assert material is not None
+    assert set(material) == {
+        "ambient",
+        "diffuse",
+        "specular",
+        "emission",
+        "shininess",
+        "reflectivity",
+    }
+    assert material["diffuse"] == pytest.approx(
+        [0.596063, 0.666667, 0.686259, 1.0], abs=1e-5
+    )
+    # The shape itself has no transform attribute — the segment type of its
+    # representation is the plain "Shape" of a JT 9.x file.
+    assert shape.transform is None
+    assert shape.mesh_ids == [4]
+    assert shape.subtree_mesh_ids() == [4]
+    assert [mesh.id for mesh in shape.meshes()] == [4]
+    assert [mesh.id for mesh in shape.subtree_meshes()] == [4]
+
+
+@needs_sample
+def test_lsg_meshes_are_the_representations_of_the_file() -> None:
+    jt = ferrojt.JtFile(str(BLOCK_95))
+    assert jt.open()
+    graph = jt.lsg
+
+    meshes = graph.meshes()
+    assert [mesh.id for mesh in meshes] == [4, 5, 6]
+    assert [mesh.id for mesh in jt.meshes()] == [4, 5, 6]
+    for mesh in meshes:
+        assert mesh.element_class == "JtElement_ShapeLOD_TriStripSet"
+        assert mesh.segment_type_name == "Shape"
+        assert mesh.segment
+        assert mesh.index_count == 36
+        assert mesh.vertex_count == 24
+        assert mesh.normal_count == 24
+        assert mesh.triangle_count == 12
+        assert mesh.is_empty is False
+        assert mesh.normal_binding is None
+        assert mesh.array_names == ["indices", "vertices", "normals"]
+        assert repr(mesh).startswith("JtMesh(id=")
+
+    # JT 9.x stores one tier per "Shape" segment, so all three tiers of the
+    # block are visible here even though the export keeps only the finest.
+    assert sum(mesh.triangle_count for mesh in meshes) == 36
+
+    assert graph.mesh(4) == meshes[0]
+    assert hash(graph.mesh(4)) == hash(meshes[0])
+    with pytest.raises(IndexError, match="no representation"):
+        graph.mesh(0)
+    with pytest.raises(IndexError, match="no representation"):
+        graph.mesh(999)
+
+
+@needs_plate95
+def test_an_instance_shares_one_representation_instead_of_copying_it() -> None:
+    """The plate file holds one screw and instantiates it twice.
+
+    The two ``Instance`` nodes carry no geometry of their own; they point at
+    one shared subtree, so both see the same representation ids.
+    """
+    jt = ferrojt.JtFile(str(PLATE_95))
+    assert jt.open()
+    graph = jt.lsg
+
+    assert graph.node_count == 21
+    assert graph.representation_count == 6
+    assert [mesh.id for mesh in graph.meshes()] == [4, 5, 6, 11, 12, 13]
+
+    instances = [node for node in graph.nodes() if node.is_instance]
+    assert len(instances) == 2
+    assert [node.name for node in instances] == ["shcs.asm", "shcs.asm"]
+    assert [node.position for node in instances] == [10, 20]
+
+    first, second = instances
+    assert first.instance_target() == second.instance_target()
+    target = first.instance_target()
+    assert target is not None
+    assert target.class_name == "MetaData"
+    # The layer tag of the plate sits on that meta data, not on the part.
+    assert target.layers == [20]
+    assert target.properties()["LAYER::"] == "20"
+
+    # An instance has no representation itself, only the subtree it targets.
+    assert first.mesh_ids == [] and second.mesh_ids == []
+    assert first.subtree_mesh_ids() == second.subtree_mesh_ids() == [11, 12, 13]
+    assert [mesh.id for mesh in first.subtree_meshes()] == [11, 12, 13]
+
+    # The two placements differ only by the translation of the instance.
+    assert first.transform["translation"] == [0.0, -25.0, 15.0]
+    assert second.transform["translation"] == [0.0, 25.0, 15.0]
+    for node in (first, second):
+        assert node.rotation == [0.0, 0.0, 0.0, 1.0]
+        assert node.scale == [1.0, 1.0, 1.0]
+        assert node.matrix is not None
+    assert first.translation == [0.0, -25.0, 15.0]
+
+    # One screw, two placements: the shared representations appear once each.
+    screw = [mesh for mesh in graph.meshes() if mesh.id in (11, 12, 13)]
+    assert len(screw) == 3
+
+
+@needs_plate80
+def test_an_8_x_file_names_its_lod_tiers_by_segment_type() -> None:
+    """JT 8.x uses one segment type per tier, JT 9.x uses "Shape" for all."""
+    jt = ferrojt.JtFile(str(PLATE_80))
+    assert jt.open()
+    graph = jt.lsg
+
+    assert graph.node_count == 25
+    assert graph.representation_count == 8
+    meshes = graph.meshes()
+    assert [mesh.id for mesh in meshes] == [4, 5, 6, 7, 11, 12, 13, 14]
+    assert [mesh.segment_type_name for mesh in meshes] == [
+        "Shape LOD0",
+        "Shape LOD1",
+        "Shape LOD2",
+        "Shape LOD3",
+        "Shape LOD0",
+        "Shape LOD1",
+        "Shape LOD2",
+        "Shape LOD3",
+    ]
+    assert [mesh.segment_type for mesh in meshes] == [7, 8, 9, 10, 7, 8, 9, 10]
+    # The 8.x writers store a per-vertex normal binding.
+    assert {mesh.normal_binding for mesh in meshes} == {1}
+
+    instances = [node for node in graph.nodes() if node.is_instance]
+    assert [node.subtree_mesh_ids() for node in instances] == [
+        [11, 12, 13, 14],
+        [11, 12, 13, 14],
+    ]
+
+
+@needs_sample
+def test_mesh_arrays_are_numpy_compatible_and_zero_copy() -> None:
+    numpy = pytest.importorskip("numpy")
+    jt = ferrojt.JtFile(str(BLOCK_95))
+    assert jt.open()
+    mesh = jt.lsg.mesh(4)
+
+    arrays = mesh.arrays()
+    assert list(arrays) == ["indices", "vertices", "normals"]
+
+    indices = numpy.asarray(mesh.array("indices"))
+    vertices = numpy.asarray(mesh.array("vertices"))
+    normals = numpy.asarray(mesh.array("normals"))
+
+    assert indices.dtype == numpy.int32
+    assert indices.shape == (36,)
+    assert vertices.dtype == numpy.float32
+    assert vertices.shape == (24, 3)
+    assert normals.shape == (24, 3)
+
+    # Zero copy: NumPy borrows the decoded arrays of the file.
+    assert indices.flags.owndata is False
+    assert vertices.flags.owndata is False
+    assert numpy.shares_memory(vertices, numpy.asarray(mesh.array("vertices")))
+    assert numpy.shares_memory(vertices, numpy.asarray(memoryview(mesh.array("vertices"))))
+
+    # The buffer itself is read-only and shaped like the channel.
+    view = memoryview(mesh.array("vertices"))
+    assert view.readonly is True
+    assert view.ndim == 2
+    assert view.shape == (24, 3)
+    assert view.strides == (12, 4)
+    assert view.format == "f"
+    assert view.nbytes == 24 * 3 * 4
+    with pytest.raises((TypeError, NotImplementedError)):
+        view[0][0] = 1.0
+    # NumPy sees the read-only flag and refuses to hand out a writable view.
+    with pytest.raises(ValueError):
+        numpy.asarray(mesh.array("vertices")).flags.writeable = True
+
+    # The handle agrees with what NumPy sees.
+    array = mesh.array("vertices")
+    assert array.ndim == 2
+    assert array.shape == [24, 3]
+    assert array.itemsize == 4
+    assert array.format == "f"
+    assert array.mesh_id == 4
+    assert len(array) == len(view) == len(vertices) == 24
+    assert repr(array).startswith("JtArray(mesh=4")
+
+    # The values are the ones the file holds: the block spans 100 x 80 x 60.
+    assert vertices.min(axis=0).tolist() == [0.0, 0.0, 0.0]
+    assert vertices.max(axis=0).tolist() == [100.0, 80.0, 60.0]
+    assert indices.min() == 0
+    assert indices.max() == 23
+
+    with pytest.raises(ValueError, match="unknown array"):
+        mesh.array("bogus")
+
+
+@needs_sample
+def test_node_handles_compare_by_position_in_the_graph() -> None:
+    jt = ferrojt.JtFile(str(BLOCK_95))
+    assert jt.open()
+    graph = jt.lsg
+
+    assert graph.root() == jt.root() == graph.nodes()[0]
+    assert hash(graph.root()) == hash(jt.root())
+    assert graph.nodes()[0] != graph.nodes()[1]
+    assert graph.root() != 7
+
+    root = graph.root()
+    with pytest.raises(IndexError, match="it has 1"):
+        root[5]
+    assert root[-1] is not None
+    assert list(root) == [root[0]]
+    assert iter(root).__class__.__name__ != "list"
+    assert root.unresolved_children() == 0
+    assert repr(root).startswith('JtNode(class="Partition"')
+
+
 #: The layer filters each sample declares, and the one an export uses by
 #: default. A JT 8.x file declares none at all, and the newer ones all leave
 #: ``ACTIVELAYERFILTER::`` empty, so the first name in sorted order wins.
@@ -456,3 +759,38 @@ def test_shapes_without_vertices_are_left_out_of_the_export() -> None:
         for primitive in mesh["primitives"]:
             assert "POSITION" in primitive["attributes"], "a primitive has no POSITION"
             assert primitive["attributes"]["POSITION"] is not None
+
+
+@needs_server
+def test_the_file_view_keeps_a_representation_without_vertices() -> None:
+    """The export drops a shape with no vertices, the file view keeps it.
+
+    ``SampleJT_Server.jt`` declares 36 such shapes; they are instanced, so the
+    file has exactly one representation for them. The arrays stay empty rather
+    than missing, which lets a consumer walk the graph without special cases.
+    """
+    numpy = pytest.importorskip("numpy")
+    jt = ferrojt.JtFile(str(SERVER))
+    assert jt.open()
+    graph = jt.lsg
+
+    assert graph.node_count == 2158
+    assert len(graph.nodes()) == 2158
+    assert len(graph.root().descendants()) == 2157
+
+    # 106 representations, one of them empty — the export keeps the other 105.
+    assert graph.representation_count == 106
+    empty = [mesh.id for mesh in graph.meshes() if mesh.is_empty]
+    assert len(empty) == 1
+    assert len([mesh for mesh in graph.meshes() if not mesh.is_empty]) == 105
+
+    mesh = graph.mesh(empty[0])
+    assert mesh.vertex_count == 0
+    assert mesh.triangle_count == 0
+    for name in mesh.array_names:
+        array = mesh.array(name)
+        assert len(array) == 0
+        data = numpy.asarray(array)
+        assert data.size == 0
+        assert data.dtype == (numpy.int32 if name == "indices" else numpy.float32)
+        assert memoryview(array).nbytes == 0
