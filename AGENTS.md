@@ -1,22 +1,22 @@
 # FerroJT — agent notes
 
 Rust cargo workspace plus a Python wrapper that reads OpenJT (`.jt`) and exports
-glTF 2.0 / GLB and ASCII USD (`.usda`). Read this before changing code; the
-design detail lives in `docs/`.
+glTF 2.0 / GLB and ASCII USD (`.usda`), and can write a read file back out as
+JT. Read this before changing code; the design detail lives in `docs/`.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `export/` glTF/GLB writer and the ASCII USD writer. |
-| `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `ls`. |
+| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer) and `jt/write.rs` the JT writer, `export/` glTF/GLB writer and the ASCII USD writer. |
+| `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `write`, `ls`. |
 | `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `lib.rs` is the export view (`Model`) plus `lsg.rs` the file view (`JtLsg`/`JtNode`/`JtMesh`/`JtArray`); `pyproject.toml` + `python/ferrojt/` + `tests/`. |
 | `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `details.rs` key/value pane for the selected row, `backdrop.rs` viewport gradient, `camera.rs` `Camera3d` wrapper that places the backdrop, `picking.rs`, `trihedron.rs`. |
 | `python/ferrojt/` | Pure-Python package re-exporting `_ferrojt` (`__init__.py`, `_ferrojt.pyi`, `py.typed`). |
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
 | `data/Reference/` | Reference JSON dumps from the JT tooling **and** reference PNG pictures — **the oracle**. |
 | `example/` | GPL-2.0 C++ sources (TKJT, ToolsLib, JtDump, PyOpenJt). Behavioural reference only, never linked or copied; gitignored. |
-| `docs/` | `README.md` index, `architecture.md`, `jt-reader.md`, `dump.md`, `usd-writer.md` and `viewer.png` — the viewer picture shown at the top of the top-level `README.md` (Git LFS). |
+| `docs/` | `README.md` index, `architecture.md`, `jt-reader.md`, `jt-writer.md`, `dump.md`, `usd-writer.md` and `viewer.png` — the viewer picture shown at the top of the top-level `README.md` (Git LFS). |
 
 ## Commands
 
@@ -26,6 +26,13 @@ cargo test  --workspace --exclude ferrojt-python   # must exclude, see below
 cargo clippy --workspace --all-targets
 cargo fmt --all
 cargo doc --no-deps -p ferrojt
+```
+
+Round-trip a sample through the JT writer (`write` refuses to overwrite, so a
+sweep needs `--force`):
+
+```powershell
+cargo run -p ferrojt-cli -- write data\ExampleFiles\example_block_jt9.5.jt -o target\out.jt --force
 ```
 
 `ferrojt-python` must be excluded from `cargo test`: its default features enable
@@ -603,6 +610,54 @@ Upload with `python -m twine upload dist\*`.
   `shoot` retries `MAX_FRAMES` but still loses occasionally, and a re-run picks a
   different sample. Re-run before investigating; `pytest tests\test_ferrojt.py` alone
   is the stable check.
+- **JT writer: only the LSG is re-serialised** (`jt/write.rs`). There is **no JT
+  writer anywhere in `example/`**, so the framing was read out of the sample
+  bytes. Representation/meta data/PMI/B-rep segments are copied byte for byte
+  out of the source (`write_to_bytes` therefore needs the source `data`), and a
+  segment is dropped only when every referrer is gone. The new TOC is always
+  appended at the **end**; 5 of 6 sources put it right after the header — both
+  legal.
+- **Writer version fields are gated per class**: `RangeLod` (its second
+  version), `Shape` and `Instance` only when `major > 8`, while `MetaData` and
+  `Part` write version/reserved fields **unconditionally**. Writing one extra
+  byte per node shifts everything and surfaces as
+  `element body read past its declared end` on JT 8.x.
+- **An attribute referenced by several nodes is written once**, under the first
+  referrer, and numbered once — dedup on the attribute position in **both**
+  `number_nodes_and_attributes()` (`seen`) and `lsg_body()` (`written`).
+- **An `Instance` target is one bare `i32`**, not a length-prefixed vector
+  (`Instance::read` reads a single `Deferred`). A wrong target makes
+  `jt::dump`'s `recurse_down_the_tree` (no cycle guard) stack-overflow.
+- **Compression must be written as flag 2 / algorithm 2** (zlib, i.e.
+  `codec::deflate`). XZ (flag 3) is read but never emitted, even though
+  block-10.3 and the server sample store their LSG that way.
+- **A property atom is emitted exactly when a surviving table row refers to it.**
+  Numbering and emission must use one rule (`collect_rows()` decides the
+  surviving rows *before* `number_properties()`), or a second write of an
+  already written file shrinks it — that is the fixed-point assert in
+  `a_lossless_round_trip_reproduces_the_file` (`bytes.len() == twice.len()`).
+- **`SampleJT_Server.jt` carries 55 property atoms of the unknown class
+  `10dd1019`** (not in `guid::types` nor in the C++ sources) that **are** framed
+  like known ones: `21 00 00 00 | <guid> | 05 | 57 0f 00 00 | <body>` — base
+  type 5 at offset 20, real object id 3927 at offset 21, length 33. But
+  `read_element_envelope` returns `object_id = 0` and a 20-byte envelope for an
+  unknown class, so `write.rs::read_property_atom` reads the id itself
+  (`UNKNOWN_ENVELOPE = 20`, `OBJECT_ID_OFFSET = 21`). Dropping those atoms lost
+  55 table pairs and, through `read_property_table`'s `JT_PROP_NAME` key lookup,
+  55 string values (`PROPERTY_STRING 4562 → 4507`).
+- **A filtered write legitimately drops `PROPERTY_LATE_LOAD` atoms** with their
+  representations (block-9.5: 47 → 45 atoms, rows stay 6). `tests/write.rs`
+  therefore compares `values()` (every property that is *not* a late load) for
+  equality and `late_loads()` as `<=` — asserting the whole property list equal
+  is wrong.
+- **Picture parity for a written file must be measured one process per picture**
+  and compared as PNGs: for the ~1M-triangle server mesh Open3D returns
+  permanent all-zero frames partway through a process, so retrying inside one
+  process does not help. Probe: `target\rt_picture.py` (`render <glb> <png>`,
+  then `compare <stem>`). All six samples: source vs written **1.00000**.
+- **`multi_replace_string_in_file` needs `filePath` as the FIRST key** of each
+  replacement object — putting it last yields "must have required property
+  'filePath'".
 
 ## Language / platform gotchas hit before
 
@@ -628,4 +683,9 @@ pyo3 0.30 (`abi3-py310`). No USD crate — `export/usd.rs` writes `.usda` by han
 
 USD: `.usdc` (binary) and `.usdz` (packaged) output, and JT textures into the
 `UsdPreviewSurface` — `docs/usd-writer.md` holds the mapping and the open work.
+JT: writing from a neutral `Model` instead of a read `JtFile` (that needs the
+representation codecs re-encoded, so `Format::Jt` stays
+`Error::UnsupportedFormat("jt (write)")` in `export/mod.rs`), and keeping the
+source TOC position instead of always appending the table —
+`docs/jt-writer.md` holds the details.
 macOS and ARM wheels need CI (`maturin generate-ci github`).

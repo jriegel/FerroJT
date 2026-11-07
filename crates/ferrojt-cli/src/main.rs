@@ -27,6 +27,7 @@ fn run() -> Result<()> {
         Command::Inspect(args) => cli::inspect(args),
         Command::Dump(args) => cli::dump(args),
         Command::Convert(args) => cli::convert(args),
+        Command::Write(args) => cli::write(args),
         Command::Ls(args) => cli::ls(args),
     }
 }

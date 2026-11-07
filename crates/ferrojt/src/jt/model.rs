@@ -977,7 +977,7 @@ fn node_properties(graph: &SceneGraph, node: &Node) -> Option<serde_json::Value>
 /// group of that subtree, and drops the shape of anything that is not tier
 /// zero. This mirrors that, so the same file exports the same mesh.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LodWalk {
+pub(crate) struct LodWalk {
     /// Set below a range LOD, where the tier of a branch matters.
     inside: bool,
     /// Tier of the branch currently being walked.
@@ -986,20 +986,20 @@ struct LodWalk {
 
 impl LodWalk {
     /// Outside of any range LOD, where every representation is kept.
-    const ROOT: Self = Self {
+    pub(crate) const ROOT: Self = Self {
         inside: false,
         level: 0,
     };
 
     /// The first child of a range LOD.
-    const FIRST: Self = Self {
+    pub(crate) const FIRST: Self = Self {
         inside: true,
         level: 0,
     };
 
     /// `true` when the representations of this branch belong in the model.
     #[must_use]
-    fn keeps_geometry(self) -> bool {
+    pub(crate) fn keeps_geometry(self) -> bool {
         !self.inside || self.level == 0
     }
 
@@ -1011,7 +1011,7 @@ impl LodWalk {
 
     /// Move past a child of a range LOD. Only a group counts as a tier, and a
     /// group nested in a group moves on too, as it does in the reference.
-    fn next_tier(&mut self, class_name: &str) {
+    pub(crate) fn next_tier(&mut self, class_name: &str) {
         if self.inside && class_name == "Group" {
             self.level += 1;
         }

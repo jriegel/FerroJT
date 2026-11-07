@@ -70,6 +70,7 @@ FerroJT is a Rust workspace with four parts:
 | JT decode codecs (Huffman, range/CDP, vertex and mesh coders) | done |
 | glTF 2.0 / GLB writer | done |
 | USD writer (ASCII `.usda`) | done — each mesh written once and referenced, materials deduplicated by value |
+| JT writer (rebuild a read file, LOD and layer filtered) | done — a round trip re-reads to the same dump, structure and picture |
 | CLI | done |
 | Python bindings | done (packaged with `maturin`) |
 | Visual regression (rendered export vs. reference picture) | done (`tests/test_visual.py`, Open3D) |
@@ -91,7 +92,7 @@ crates/
       model/               neutral scene graph (nodes, meshes, materials, ...)
       codec/               endian, bit reader, compression
       jt/                  OpenJT reader, segment/TOC table, element objects,
-                           decode codecs and the JSON dump writer
+                           decode codecs, the JSON dump writer and the JT writer
       export/              gltf/glb writer, glb framing, ascii usd writer
       error.rs  lib.rs
   ferrojt-cli/             `ferrojt` binary
@@ -132,6 +133,9 @@ cargo run -p ferrojt-cli -- convert gear.jt -f glb -o gear.glb
 cargo run -p ferrojt-cli -- convert gear.jt -f usd -o gear.usda
 cargo run -p ferrojt-cli -- convert gear.jt --layer-filter LAYCUR -o gear.glb
 cargo run -p ferrojt-cli -- convert gear.jt --no-layer-filter -o gear.glb
+cargo run -p ferrojt-cli -- write    gear.jt -o gear.out.jt
+cargo run -p ferrojt-cli -- write    gear.jt --all-lods --no-layer-filter
+cargo run -p ferrojt-cli -- write    gear.jt --layer-filter LAYCUR --compress
 ```
 
 `dump` writes the same JSON the reference JT dump tool produces: the header, the
@@ -142,6 +146,13 @@ one JSON array. A dump is never filtered by layer.
 `convert` applies the layer filter the file declares as active, or its first
 filter when the file leaves that unset: `--layer-filter NAME` picks another one
 of the declared filters, and `--no-layer-filter` exports every part.
+
+`write` rebuilds the file as JT. It applies the same selection an export
+applies — the finest tier below a range LOD and the active layer filter —
+unless `--all-lods` or `--no-layer-filter` says otherwise, and it copies every
+segment but the scene graph out of the source unchanged. The result is re-read
+and reported, so the second line of output says what the filters cost. See
+[docs/jt-writer.md](docs/jt-writer.md).
 
 ## Rust viewer
 

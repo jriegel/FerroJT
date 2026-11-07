@@ -109,6 +109,56 @@ impl<R: Read> ReaderExt for R {}
 
 /// Extension trait adding byte order aware primitives to any [`Write`] sink.
 pub trait WriterExt: Write {
+    /// Write an `u8`.
+    fn write_u8_value(&mut self, value: u8) -> Result<()> {
+        self.write_all(&[value])?;
+        Ok(())
+    }
+
+    /// Write an `i8`.
+    fn write_i8_value(&mut self, value: i8) -> Result<()> {
+        self.write_all(&[value as u8])?;
+        Ok(())
+    }
+
+    /// Write `value` verbatim.
+    fn write_bytes(&mut self, value: &[u8]) -> Result<()> {
+        self.write_all(value)?;
+        Ok(())
+    }
+
+    /// Write an `i16`.
+    fn write_i16_value(&mut self, value: i16, order: ByteOrder) -> Result<()> {
+        let bytes = if order.is_big() {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        };
+        self.write_all(&bytes)?;
+        Ok(())
+    }
+
+    /// Write an `i32`.
+    fn write_i32_value(&mut self, value: i32, order: ByteOrder) -> Result<()> {
+        self.write_u32_value(value as u32, order)
+    }
+
+    /// Write an `u64`.
+    fn write_u64_value(&mut self, value: u64, order: ByteOrder) -> Result<()> {
+        let bytes = if order.is_big() {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        };
+        self.write_all(&bytes)?;
+        Ok(())
+    }
+
+    /// Write an `f64`.
+    fn write_f64_value(&mut self, value: f64, order: ByteOrder) -> Result<()> {
+        self.write_u64_value(value.to_bits(), order)
+    }
+
     /// Write an `u16`.
     fn write_u16_value(&mut self, value: u16, order: ByteOrder) -> Result<()> {
         let bytes = if order.is_big() {

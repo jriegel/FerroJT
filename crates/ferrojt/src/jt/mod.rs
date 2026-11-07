@@ -19,7 +19,9 @@
 //! - the loader that ties it together: [`JtFile`], [`SceneGraph`], the
 //!   property table and the late-loaded representations [`LoadedElement`],
 //! - a JT native JSON writer that reports a file the way the classic JT
-//!   tooling does: [`dump`], [`write_model`] and [`recurse_down_the_tree`].
+//!   tooling does: [`dump`], [`write_model`] and [`recurse_down_the_tree`],
+//! - and a JT writer that rebuilds a file, optionally filtered: [`write_to_bytes`]
+//!   and [`WriteOptions`].
 
 use std::path::Path;
 
@@ -33,6 +35,7 @@ mod model;
 mod object;
 mod reader;
 mod segment;
+mod write;
 
 pub use decode::{
     Context, Decoded, ESCAPE, Entry, Kind, MeshInput, Package, PointQuantizer, Topology,
@@ -56,6 +59,7 @@ pub use object::{
 };
 pub use reader::Cursor;
 pub use segment::{FileHeader, Segment, TocEntry, segment_type_name};
+pub use write::{WriteOptions, write_to_bytes, write_to_file};
 
 /// Open a JT file and translate it into a [`Model`].
 pub fn open(path: impl AsRef<Path>) -> Result<Model> {

@@ -48,7 +48,7 @@ pub fn segment_type_name(kind: i32) -> &'static str {
 }
 
 /// Segment types that carry a compression envelope.
-fn has_compression_header(kind: i32) -> bool {
+pub(crate) fn has_compression_header(kind: i32) -> bool {
     matches!(kind, 1 | 2 | 3 | 4 | 17 | 18 | 20 | 24)
 }
 
