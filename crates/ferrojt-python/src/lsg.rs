@@ -416,7 +416,7 @@ impl JtNode {
         let dict = PyDict::new(py);
         let pairs = self
             .graph()
-            .and_then(|graph| self.node().map(|node| (graph, node)))
+            .zip(self.node())
             .map(|(graph, node)| key_value_pairs(&handle_late_loads_meta(graph, node.late_loads())))
             .unwrap_or_default();
         for (key, value) in pairs {
