@@ -12,12 +12,14 @@ use pyo3::exceptions::{PyNotImplementedError, PyOSError, PyRuntimeError, PyValue
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+mod build;
 mod lsg;
 
+use build::Builder;
 use lsg::Lsg;
 
 /// Convert a FerroJT error into a Python exception.
-fn py_err(err: ferrojt::Error) -> PyErr {
+pub(crate) fn py_err(err: ferrojt::Error) -> PyErr {
     match err {
         ferrojt::Error::NotImplemented(what) => PyNotImplementedError::new_err(what),
         ferrojt::Error::Io(io) => PyOSError::new_err(io.to_string()),
@@ -426,6 +428,11 @@ fn _ferrojt(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<lsg::JtNode>()?;
     module.add_class::<lsg::JtMesh>()?;
     module.add_class::<lsg::JtArray>()?;
+    module.add_class::<Builder>()?;
+    module.add_class::<build::NodeHandle>()?;
+    module.add_class::<build::MeshHandle>()?;
+    module.add_class::<build::MeshData>()?;
+    module.add_class::<build::MaterialData>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

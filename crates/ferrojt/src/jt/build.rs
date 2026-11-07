@@ -74,7 +74,10 @@ impl MeshData {
     /// Build a mesh from positions and slot indices, with flat normals.
     ///
     /// Each triangle gets the normal of its own plane, which is what a CAD
-    /// writer stores for a faceted part.
+    /// writer stores for a faceted part. A corner shared by several triangles
+    /// is stored once per triangle, because a faceted normal cannot be shared
+    /// either: the mesh is exploded, so `vertices` comes back longer than it
+    /// went in and `indices` counts the slots of the result.
     ///
     /// # Errors
     ///
@@ -86,15 +89,19 @@ impl MeshData {
             indices,
         };
         mesh.validate()?;
-        let normals = flat_normals(&mesh.vertices, &mesh.indices);
+        let (vertices, _, indices) = explode(&mesh.vertices, &[], &mesh.indices);
+        let normals = flat_normals(&vertices, &indices);
         Ok(Self {
-            vertices: mesh.vertices,
+            vertices,
             normals,
-            indices: mesh.indices,
+            indices,
         })
     }
 
     /// Build a mesh with one explicit normal per slot.
+    ///
+    /// The mesh is exploded the way [`MeshData::new`] explodes it, so the
+    /// normals of a shared corner are repeated once per triangle.
     ///
     /// # Errors
     ///
@@ -106,7 +113,12 @@ impl MeshData {
             indices,
         };
         mesh.validate()?;
-        Ok(mesh)
+        let (vertices, normals, indices) = explode(&mesh.vertices, &mesh.normals, &mesh.indices);
+        Ok(Self {
+            vertices,
+            normals,
+            indices,
+        })
     }
 
     /// Build a mesh from a representation that was read out of a file.
@@ -199,6 +211,25 @@ impl MeshData {
         }
         (box_[0] <= box_[3]).then_some(box_)
     }
+}
+
+/// Rebuild a mesh so that every triangle corner is its own vertex slot, the way
+/// a JT 8.x faceted shape stores it. `normals` may be empty, in which case it is
+/// passed through unchanged.
+fn explode(vertices: &[f32], normals: &[f32], indices: &[i32]) -> (Vec<f32>, Vec<f32>, Vec<i32>) {
+    let with_normals = !normals.is_empty();
+    let mut out_vertices: Vec<f32> = Vec::with_capacity(indices.len() * 3);
+    let mut out_normals: Vec<f32> = Vec::new();
+    let mut out_indices: Vec<i32> = Vec::with_capacity(indices.len());
+    for (corner, index) in indices.iter().enumerate() {
+        let at = usize::try_from(*index).unwrap_or(0) * 3;
+        out_vertices.extend_from_slice(&vertices[at..at + 3]);
+        if with_normals {
+            out_normals.extend_from_slice(&normals[at..at + 3]);
+        }
+        out_indices.push(corner as i32);
+    }
+    (out_vertices, out_normals, out_indices)
 }
 
 /// The normal of the plane of each triangle, one triple per slot.
@@ -407,6 +438,12 @@ impl JtBuilder {
         self
     }
 
+    /// Whether the scene graph segment is DEFLATE compressed.
+    #[must_use]
+    pub fn compress(&self) -> bool {
+        self.compress
+    }
+
     /// Add a node under `parent` and return its handle.
     ///
     /// # Errors
@@ -485,6 +522,12 @@ impl JtBuilder {
     pub fn add_mesh(&mut self, mesh: MeshData) -> JtMesh {
         self.meshes.push(mesh);
         JtMesh(self.meshes.len() - 1)
+    }
+
+    /// The mesh a handle refers to.
+    #[must_use]
+    pub fn mesh(&self, mesh: JtMesh) -> Option<&MeshData> {
+        self.meshes.get(mesh.0)
     }
 
     /// Attach an existing mesh to a shape node.
@@ -1192,15 +1235,19 @@ fn late_load_body(segment: &Guid, kind: i32) -> Vec<u8> {
 /// carries no object id and its length counts only the GUID and the base type
 /// byte.
 fn representation(mesh: &MeshData) -> Result<Vec<u8>> {
-    let slots = mesh.vertices().len() / 3;
     let strips = mesh.indices().len() / 3;
+    let with_normals = !mesh.normals().is_empty();
 
     // A JT 8.x representation stores every triangle as its own three slot
     // strip, and the reader walks a strip alternating between the two windings
-    // — `0,1,2` then `3,5,4` then `6,7,8`. Storing the last two slots of every
-    // second strip the other way round makes the indices come back exactly as
-    // they were given.
-    let order: Vec<usize> = (0..strips)
+    // — `0,1,2` then `3,5,4` then `6,7,8`. The slot number *is* the index the
+    // reader emits, so the slots it walks over are permuted: `emit` is that
+    // permutation, and `written` inverts it to say which corner of the source
+    // mesh belongs in which slot of the file. A mesh that shares its corners
+    // between triangles is therefore written exploded, one slot per corner, so
+    // that the geometry comes back unchanged even though the index list is
+    // renumbered by the strip walk.
+    let emit: Vec<usize> = (0..strips)
         .flat_map(|strip| {
             let base = strip * 3;
             if strip % 2 == 0 {
@@ -1210,6 +1257,13 @@ fn representation(mesh: &MeshData) -> Result<Vec<u8>> {
             }
         })
         .collect();
+    let mut written: Vec<usize> = vec![0; emit.len()];
+    for (corner, slot) in mesh.indices().iter().enumerate() {
+        let Ok(at) = usize::try_from(*slot) else {
+            continue;
+        };
+        written[emit[corner]] = at;
+    }
 
     let mut body: Vec<u8> = Vec::new();
     // Shape LOD base: the class version, the 32 bit vertex binding of JT 8.x
@@ -1224,7 +1278,7 @@ fn representation(mesh: &MeshData) -> Result<Vec<u8>> {
     // The vertex based representation: its version, the per-slot bindings and
     // the parameters saying the geometry is stored lossless.
     write_version(&mut body, ORDER, MAJOR, 1)?;
-    body.write_u8_value(1)?;
+    body.write_u8_value(u8::from(with_normals))?;
     body.write_u8_value(0)?;
     body.write_u8_value(0)?;
     for value in [0u8, 0, 0, 0] {
@@ -1241,18 +1295,17 @@ fn representation(mesh: &MeshData) -> Result<Vec<u8>> {
     }
     // The vertex block: the unpacked length, the packed length, then the
     // normals and positions interleaved one slot at a time.
-    let mut unpacked: Vec<u8> = Vec::with_capacity(slots * 24);
-    for slot in &order {
+    let mut unpacked: Vec<u8> =
+        Vec::with_capacity(written.len() * if with_normals { 24 } else { 12 });
+    for slot in &written {
         let at = slot * 3;
-        for value in [
-            mesh.normals()[at],
-            mesh.normals()[at + 1],
-            mesh.normals()[at + 2],
-            mesh.vertices()[at],
-            mesh.vertices()[at + 1],
-            mesh.vertices()[at + 2],
-        ] {
-            unpacked.write_f32_value(value, ORDER)?;
+        if with_normals {
+            for axis in 0..3 {
+                unpacked.write_f32_value(mesh.normals()[at + axis], ORDER)?;
+            }
+        }
+        for axis in 0..3 {
+            unpacked.write_f32_value(mesh.vertices()[at + axis], ORDER)?;
         }
     }
     let packed = deflate(&unpacked)?;

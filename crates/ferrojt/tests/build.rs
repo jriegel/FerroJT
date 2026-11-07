@@ -271,6 +271,57 @@ fn the_triangles_of_a_built_mesh_come_back_unchanged() {
 }
 
 #[test]
+fn a_compact_mesh_is_exploded_and_comes_back_unchanged() {
+    // The same cube written the way a modeller hands it over: eight shared
+    // corners and indices that point at them. A JT 8.x faceted shape cannot
+    // share a corner, because the normal belongs to the slot, so the builder
+    // explodes the mesh — and because the strip walk renumbers the slots, the
+    // writer has to permute the geometry to match. The triangles are what has
+    // to survive.
+    let mut indices: Vec<i32> = Vec::new();
+    for face in FACES {
+        for corner in [face[0], face[1], face[2], face[0], face[2], face[3]] {
+            indices.push(corner as i32);
+        }
+    }
+    let corners: Vec<f32> = CORNERS.iter().flatten().copied().collect();
+    let source = MeshData::new(corners.clone(), indices.clone()).expect("the cube is valid");
+    assert_eq!(source.vertices().len(), 108, "the mesh was exploded");
+    assert_eq!(source.indices().len(), 36);
+    assert_eq!(
+        triangle_corners(source.indices(), source.vertices()),
+        triangle_corners(&indices, &corners),
+        "exploding keeps the triangles"
+    );
+
+    let mut build = JtBuilder::new();
+    let shape = build
+        .add_shape(build.root(), "compact", source.clone())
+        .expect("the root takes a shape");
+    assert_eq!(build.class(shape), Some(BuildNode::Shape));
+    let bytes = build.write_to_bytes().expect("the graph can be written");
+    let file = parse(&bytes);
+    let geometry = graph(&file).loaded[0]
+        .element
+        .geometry()
+        .expect("a representation");
+
+    assert_eq!(
+        triangle_corners(&geometry.indices, &geometry.vertices),
+        triangle_corners(&indices, &corners),
+        "the shared corners came back as their own slots"
+    );
+    assert_eq!(geometry.vertex_count, 36);
+    assert_eq!(geometry.normal_count, 36);
+    assert_eq!(
+        geometry.normals,
+        source.normals(),
+        "each corner kept the normal of its face"
+    );
+    assert_eq!(parse(&bytes).to_model().triangle_count(), 12);
+}
+
+#[test]
 fn an_instance_shares_one_representation_and_keeps_its_own_placement() {
     let bytes = builder()
         .write_to_bytes()
