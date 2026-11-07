@@ -21,13 +21,16 @@
 //! - a JT native JSON writer that reports a file the way the classic JT
 //!   tooling does: [`dump`], [`write_model`] and [`recurse_down_the_tree`],
 //! - and a JT writer that rebuilds a file, optionally filtered: [`write_to_bytes`]
-//!   and [`WriteOptions`].
+//!   and [`WriteOptions`],
+//! - and a builder that creates a file from nothing: [`JtBuilder`], [`MeshData`]
+//!   and [`BuildNode`].
 
 use std::path::Path;
 
 use crate::error::Result;
 use crate::model::Model;
 
+mod build;
 mod decode;
 mod dump;
 mod guid;
@@ -37,6 +40,7 @@ mod reader;
 mod segment;
 mod write;
 
+pub use build::{BuildNode, JtBuilder, JtMesh, JtNode, MaterialData, MeshData};
 pub use decode::{
     Context, Decoded, ESCAPE, Entry, Kind, MeshInput, Package, PointQuantizer, Topology,
     UnifiedMesh, UniformQuantizer, Unpack, VertexData,

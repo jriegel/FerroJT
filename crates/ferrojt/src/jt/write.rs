@@ -28,13 +28,13 @@ use crate::jt::object::{
 use crate::jt::segment::{FileHeader, TocEntry, has_compression_header, read_segment};
 
 /// Base type byte of an instance atom.
-const BASE_INSTANCE: u8 = 0;
+pub(crate) const BASE_INSTANCE: u8 = 0;
 /// Base type byte of a group, part, meta data, partition or range LOD atom.
-const BASE_GROUP: u8 = 1;
+pub(crate) const BASE_GROUP: u8 = 1;
 /// Base type byte of a shape atom.
-const BASE_SHAPE: u8 = 2;
+pub(crate) const BASE_SHAPE: u8 = 2;
 /// Base type byte of an attribute atom.
-const BASE_ATTRIBUTE: u8 = 3;
+pub(crate) const BASE_ATTRIBUTE: u8 = 3;
 /// Envelope of an atom of a known class: length, GUID, base type, object id.
 const KNOWN_ENVELOPE: usize = 4 + 16 + 1 + 4;
 /// Envelope of an atom whose class the reader does not know: length and GUID.
@@ -45,7 +45,11 @@ const UNKNOWN_ENVELOPE: usize = 4 + 16;
 /// Offset of the object id inside an atom of a known class.
 const OBJECT_ID_OFFSET: usize = 4 + 16 + 1;
 /// Envelope of a segment whose type carries a compression header.
-const COMPRESSION_ENVELOPE: usize = 4 + 16 + 4 + 4 + 1;
+///
+/// The declared size counts the four bytes of the size field itself, the GUID,
+/// the segment type, the compression flag, the length of the compressed stream
+/// and the algorithm byte — so a segment is 33 bytes bigger than its payload.
+pub(crate) const COMPRESSION_ENVELOPE: usize = 4 + 16 + 4 + 4 + 4 + 1;
 
 /// What a rewritten file should keep.
 #[derive(Clone, Debug, Default)]
@@ -678,7 +682,7 @@ fn write_banner(
 }
 
 /// Length of the fixed header of a JT `major` version.
-fn header_length(major: u32) -> usize {
+pub(crate) fn header_length(major: u32) -> usize {
     80 + 1 + 4 + if major >= 10 { 8 } else { 4 } + 16
 }
 
@@ -699,7 +703,7 @@ fn write_toc(out: &mut Vec<u8>, toc: &[TocEntry], order: ByteOrder, major: u32) 
 }
 
 /// Frame a payload as a whole segment, envelope included.
-fn segment_bytes(
+pub(crate) fn segment_bytes(
     order: ByteOrder,
     guid: &Guid,
     kind: i32,
@@ -738,7 +742,7 @@ fn ordered_i32(value: i32, order: ByteOrder) -> [u8; 4] {
 }
 
 /// Write one element atom.
-fn write_atom(
+pub(crate) fn write_atom(
     out: &mut Vec<u8>,
     order: ByteOrder,
     guid: &Guid,
@@ -755,14 +759,14 @@ fn write_atom(
 }
 
 /// Write the marker that ends a run of atoms.
-fn write_end_of_elements(out: &mut Vec<u8>, order: ByteOrder) -> Result<()> {
+pub(crate) fn write_end_of_elements(out: &mut Vec<u8>, order: ByteOrder) -> Result<()> {
     out.write_i32_value(16, order)?;
     out.write_bytes(&[0xffu8; 16])?;
     Ok(())
 }
 
 /// Write a GUID as three numeric fields plus the tail, as the reader reads it.
-fn write_guid(out: &mut Vec<u8>, order: ByteOrder, guid: &Guid) -> Result<()> {
+pub(crate) fn write_guid(out: &mut Vec<u8>, order: ByteOrder, guid: &Guid) -> Result<()> {
     let bytes = guid.bytes();
     out.write_u32_value(
         u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
@@ -775,7 +779,12 @@ fn write_guid(out: &mut Vec<u8>, order: ByteOrder, guid: &Guid) -> Result<()> {
 }
 
 /// Write a class version: one byte from JT 10.x on, two before that.
-fn write_version(out: &mut Vec<u8>, order: ByteOrder, major: u32, version: u32) -> Result<()> {
+pub(crate) fn write_version(
+    out: &mut Vec<u8>,
+    order: ByteOrder,
+    major: u32,
+    version: u32,
+) -> Result<()> {
     if major >= 10 {
         out.write_u8_value(version as u8)?;
     } else {
@@ -785,7 +794,7 @@ fn write_version(out: &mut Vec<u8>, order: ByteOrder, major: u32, version: u32) 
 }
 
 /// Write a UTF-16 string: a count of code units, then the units.
-fn write_mb_string(out: &mut Vec<u8>, order: ByteOrder, value: &str) -> Result<()> {
+pub(crate) fn write_mb_string(out: &mut Vec<u8>, order: ByteOrder, value: &str) -> Result<()> {
     let units: Vec<u16> = value.encode_utf16().collect();
     out.write_i32_value(units.len() as i32, order)?;
     for unit in units {
@@ -795,7 +804,7 @@ fn write_mb_string(out: &mut Vec<u8>, order: ByteOrder, value: &str) -> Result<(
 }
 
 /// Write a vector of object references.
-fn write_deferred(out: &mut Vec<u8>, order: ByteOrder, ids: &[i32]) -> Result<()> {
+pub(crate) fn write_deferred(out: &mut Vec<u8>, order: ByteOrder, ids: &[i32]) -> Result<()> {
     out.write_i32_value(ids.len() as i32, order)?;
     for id in ids {
         out.write_i32_value(*id, order)?;
@@ -990,7 +999,7 @@ fn write_group(
 }
 
 /// Write the three `I32[2]` count arrays of a shape or partition.
-fn write_counts(out: &mut Vec<u8>, order: ByteOrder) -> Result<()> {
+pub(crate) fn write_counts(out: &mut Vec<u8>, order: ByteOrder) -> Result<()> {
     for _ in 0..6 {
         out.write_i32_value(0, order)?;
     }
@@ -998,7 +1007,7 @@ fn write_counts(out: &mut Vec<u8>, order: ByteOrder) -> Result<()> {
 }
 
 /// Write an axis aligned box.
-fn write_box(out: &mut Vec<u8>, order: ByteOrder, values: &[f32; 6]) -> Result<()> {
+pub(crate) fn write_box(out: &mut Vec<u8>, order: ByteOrder, values: &[f32; 6]) -> Result<()> {
     for value in values {
         out.write_f32_value(*value, order)?;
     }
@@ -1064,7 +1073,7 @@ fn attribute_body(attribute: &Attribute, order: ByteOrder, major: u32) -> Result
 }
 
 /// Write the fields every attribute starts with.
-fn write_attribute_base(
+pub(crate) fn write_attribute_base(
     out: &mut Vec<u8>,
     order: ByteOrder,
     major: u32,
