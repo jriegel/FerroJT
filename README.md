@@ -71,6 +71,7 @@ FerroJT is a Rust workspace with four parts:
 | glTF 2.0 / GLB writer | done |
 | USD writer (ASCII `.usda`) | done — each mesh written once and referenced, materials deduplicated by value |
 | JT writer (rebuild a read file, LOD and layer filtered) | done — a round trip re-reads to the same dump, structure and picture |
+| JT builder (create a file from nothing, meshes and instances) | done — JT 8.1, `tests/test_build.py` builds a cube and reads it back |
 | CLI | done |
 | Python bindings | done (packaged with `maturin`) |
 | Visual regression (rendered export vs. reference picture) | done (`tests/test_visual.py`, Open3D) |
@@ -92,7 +93,8 @@ crates/
       model/               neutral scene graph (nodes, meshes, materials, ...)
       codec/               endian, bit reader, compression
       jt/                  OpenJT reader, segment/TOC table, element objects,
-                           decode codecs, the JSON dump writer and the JT writer
+                           decode codecs, the JSON dump writer, the JT writer
+                           and the builder that creates a file from nothing
       export/              gltf/glb writer, glb framing, ascii usd writer
       error.rs  lib.rs
   ferrojt-cli/             `ferrojt` binary
@@ -299,6 +301,37 @@ mesh.arrays()                                   # all three as a dict
 ```
 
 Requires Python 3.11 or newer.
+
+### Building a file
+
+`JtBuilder` is the way in: it starts as an empty file holding only its root
+`Partition`, you fill the scene graph node by node, and `save` writes it as
+JT 8.1. The nodes are opaque handles that belong to their builder, so a handle
+of another builder is refused.
+
+```python
+import ferrojt
+
+builder = ferrojt.JtBuilder()
+root = builder.root()
+part = builder.add_node(root, "Part", "cube")
+shape = builder.add_shape(part, ferrojt.MeshData(vertices, indices), name="cube shape")
+builder.set_material(shape, ferrojt.MaterialData(diffuse=[0.2, 0.6, 0.9, 1.0]))
+builder.set_translation(part, [-20.0, 0.0, 0.0])
+
+left = builder.instance_of(root, part)     # shares the subtree of part
+right = builder.instance_of(root, part)    # ... and its geometry
+builder.set_translation(right, [20.0, 0.0, 0.0])
+builder.save("cube.jt")
+```
+
+A mesh is handed over the way a modeller emits one — shared corners and all —
+and the builder explodes it to one slot per triangle corner, because a JT 8.x
+faceted shape stores the normal per slot and cannot share a corner. Read the
+file back with `ferrojt.open` or `ferrojt.JtFile` like any other: the graph, the
+names, the placements and the triangles come back unchanged, and the two
+instances still share one representation. `docs/jt-builder.md` holds the layout
+the writer emits and what it leaves open.
 
 ### Visual regression
 

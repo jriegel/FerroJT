@@ -8,15 +8,15 @@ JT. Read this before changing code; the design detail lives in `docs/`.
 
 | Path | What it is |
 | --- | --- |
-| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer) and `jt/write.rs` the JT writer, `export/` glTF/GLB writer and the ASCII USD writer. |
+| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `jt/write.rs` the JT writer, `jt/build.rs` the builder that creates a file from nothing, and `export/` glTF/GLB writer and the ASCII USD writer. |
 | `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `write`, `ls`. |
-| `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `lib.rs` is the export view (`Model`) plus `lsg.rs` the file view (`JtLsg`/`JtNode`/`JtMesh`/`JtArray`); `pyproject.toml` + `python/ferrojt/` + `tests/`. |
+| `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `lib.rs` is the export view (`Model`) plus `lsg.rs` the file view (`JtLsg`/`JtNode`/`JtMesh`/`JtArray`) and `build.rs` the builder (`JtBuilder`/`NodeHandle`/`MeshHandle`/`MeshData`/`MaterialData`); `pyproject.toml` + `python/ferrojt/` + `tests/`. |
 | `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `details.rs` key/value pane for the selected row, `backdrop.rs` viewport gradient, `camera.rs` `Camera3d` wrapper that places the backdrop, `picking.rs`, `trihedron.rs`. |
 | `python/ferrojt/` | Pure-Python package re-exporting `_ferrojt` (`__init__.py`, `_ferrojt.pyi`, `py.typed`). |
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
 | `data/Reference/` | Reference JSON dumps from the JT tooling **and** reference PNG pictures — **the oracle**. |
 | `example/` | GPL-2.0 C++ sources (TKJT, ToolsLib, JtDump, PyOpenJt). Behavioural reference only, never linked or copied; gitignored. |
-| `docs/` | `README.md` index, `architecture.md`, `jt-reader.md`, `jt-writer.md`, `dump.md`, `usd-writer.md` and `viewer.png` — the viewer picture shown at the top of the top-level `README.md` (Git LFS). |
+| `docs/` | `README.md` index, `architecture.md`, `jt-reader.md`, `jt-writer.md`, `jt-builder.md`, `dump.md`, `usd-writer.md` and `viewer.png` — the viewer picture shown at the top of the top-level `README.md` (Git LFS). |
 
 ## Commands
 
@@ -35,6 +35,13 @@ sweep needs `--force`):
 cargo run -p ferrojt-cli -- write data\ExampleFiles\example_block_jt9.5.jt -o target\out.jt --force
 ```
 
+Build a file from nothing (the builder, not the writer):
+
+```powershell
+cargo test -p ferrojt --test build          # the Rust side
+.\.venv\Scripts\python.exe -m pytest tests\test_build.py -q   # the Python side
+```
+
 `ferrojt-python` must be excluded from `cargo test`: its default features enable
 `pyo3/extension-module`, so a test binary cannot resolve the Python symbols.
 
@@ -46,6 +53,9 @@ $env:VIRTUAL_ENV = "$PWD\.venv"
 .\.venv\Scripts\python.exe -m pytest
 ```
 
+`maturin develop` takes **no `-i`** — that flag belongs to `maturin build`. With
+`VIRTUAL_ENV` set it installs into the right environment on its own.
+
 Visual regression (needs `open3d`, `pip install -e ".[test,visual]"`; the tests skip
 without it):
 
@@ -55,7 +65,7 @@ without it):
 ```
 
 Interactive viewer (also needs `open3d`; it is a tool, not a test — nothing in it
-is named `test_*`, so pytest still collects 62 tests):
+is named `test_*`, so pytest still collects 80 tests):
 
 ```powershell
 .\.venv\Scripts\python.exe tests\test_viewer.py data\ExampleFiles\example_block_jt9.5.jt
@@ -650,6 +660,35 @@ Upload with `python -m twine upload dist\*`.
   therefore compares `values()` (every property that is *not* a late load) for
   equality and `late_loads()` as `<=` — asserting the whole property list equal
   is wrong.
+- **The builder (`jt/build.rs`) emits JT 8.1 only.** The dual vertex-face coder
+  of JT 9.x/10.x has no encoder here, so a from-scratch file uses the
+  vertex-based **lossless** representation (`params[0] == 0`), the null codec
+  (byte 0) for the strip offsets, and DEFLATE for the payload. `Format::Jt`
+  stays `Error::UnsupportedFormat("jt (write)")` in `export/mod.rs` — the
+  builder builds its own graph, it does not consume a `Model`.
+- **A JT 8.x shape cannot share a vertex slot, and the strip walk renumbers the
+  indices.** `MeshData::new`/`with_normals` **explode** the mesh (one slot per
+  triangle corner — a cube becomes 36 vertices / 36 normals / 36 indices, and
+  `vertices()` comes back three times longer). `representation()` then builds
+  `emit` (the winding-alternating walk `expand_strips` in `object.rs` performs:
+  `0,1,2` then `3,5,4` then `6,7,8`) and its inverse `written`, and writes the
+  geometry per **written** slot. The slot number *is* the index the reader
+  emits, so assuming file slot == source slot panics with
+  `index out of bounds: the len is 24 but the index is 24`. `normal_binding` is
+  `u8::from(with_normals)`, not a hardcoded `1`. **A Rust fixture that is
+  always pre-exploded hides this** — `a_compact_mesh_is_exploded_and_comes_back_unchanged`
+  is the test that feeds the compact form.
+- **Builder handles are opaque tokens.** `JtNode(usize)`/`JtMesh(usize)` have
+  private fields, so outside the crate only `.index()` exists; `check_node` /
+  `check_mesh` reject a handle of another builder. Property ids must **continue**
+  the node+attribute numbering — the property table ends a row with key `0`, so a
+  property numbered 0 truncates its own row. `write_to_bytes` refuses a shape
+  with no mesh, an instance with no target, a cycle and unreachable nodes.
+- **Python names for the builder**: `JtBuilder`/`NodeHandle`/`MeshHandle` —
+  `JtNode` and `JtMesh` are already the LSG view. `class` is a keyword, so the
+  accessor is `class_of` (`#[pyo3(name = "class_of")]`) and `add_node`'s
+  parameter is `class_name`; `add_shape(parent, mesh, *, name=None)`.
+  `MeshData.bounds` returns a **list** of six, not a tuple.
 - **Picture parity for a written file must be measured one process per picture**
   and compared as PNGs: for the ~1M-triangle server mesh Open3D returns
   permanent all-zero frames partway through a process, so retrying inside one
@@ -687,5 +726,7 @@ JT: writing from a neutral `Model` instead of a read `JtFile` (that needs the
 representation codecs re-encoded, so `Format::Jt` stays
 `Error::UnsupportedFormat("jt (write)")` in `export/mod.rs`), and keeping the
 source TOC position instead of always appending the table —
-`docs/jt-writer.md` holds the details.
+`docs/jt-writer.md` holds the details. The builder (`jt/build.rs`) creates a file
+from nothing but only as JT 8.1 — `docs/jt-builder.md` lists what is still open
+there (9.x/10.x coders, XZ, key/value properties, layer filters).
 macOS and ARM wheels need CI (`maturin generate-ci github`).
