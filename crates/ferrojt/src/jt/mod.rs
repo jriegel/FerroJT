@@ -24,6 +24,11 @@
 //!   and [`WriteOptions`],
 //! - and a builder that creates a file from nothing: [`JtBuilder`], [`MeshData`]
 //!   and [`BuildNode`].
+//!
+//! Both writers pick the file revision with [`JtVersion`]: 8.x, 9.x and 10.x
+//! differ in their version field widths, TOC offset width and — most
+//! importantly — in how a shape LOD stores its triangles, see
+//! [`JtVersion::has_vertex_based_representation`].
 
 use std::path::Path;
 
@@ -38,6 +43,7 @@ mod model;
 mod object;
 mod reader;
 mod segment;
+mod version;
 mod write;
 
 pub use build::{BuildNode, JtBuilder, JtMesh, JtNode, MaterialData, MeshData};
@@ -63,6 +69,7 @@ pub use object::{
 };
 pub use reader::Cursor;
 pub use segment::{FileHeader, Segment, TocEntry, segment_type_name};
+pub use version::JtVersion;
 pub use write::{WriteOptions, write_to_bytes, write_to_file};
 
 /// Open a JT file and translate it into a [`Model`].
