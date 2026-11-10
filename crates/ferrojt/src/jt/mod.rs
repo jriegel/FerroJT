@@ -15,7 +15,8 @@
 //!   [`Property`] and representation elements [`Element`], with the shape LOD
 //!   decoders [`ShapeLodVertex`] and [`ShapeLodTriStripSet`],
 //! - the lossless, quantized and topologically compressed codecs behind those
-//!   representations: [`Package`], [`VertexData`] and [`MeshInput`],
+//!   representations: [`Package`], [`VertexData`] and [`MeshInput`], plus the
+//!   encoder that writes a topologically compressed representation back out,
 //! - the loader that ties it together: [`JtFile`], [`SceneGraph`], the
 //!   property table and the late-loaded representations [`LoadedElement`],
 //! - a JT native JSON writer that reports a file the way the classic JT
@@ -38,6 +39,7 @@ use crate::model::Model;
 mod build;
 mod decode;
 mod dump;
+mod encode;
 mod guid;
 mod model;
 mod object;
