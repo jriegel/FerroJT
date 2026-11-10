@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use ferrojt::codec::ByteOrder;
 use ferrojt::jt::{
-    Attribute, BuildNode, Element, JtBuilder, JtFile, MaterialData, MeshData, SceneGraph,
+    Attribute, BuildNode, Element, JtBuilder, JtFile, JtVersion, MaterialData, MeshData, SceneGraph,
 };
 
 /// Half the edge length of the test cube.
@@ -119,6 +119,17 @@ fn classes(file: &JtFile) -> Vec<&'static str> {
 /// alternating winding, so the order and winding of the triangles is not part
 /// of what a round trip has to preserve — the triangles themselves are.
 fn triangle_corners(indices: &[i32], vertices: &[f32]) -> Vec<[f32; 9]> {
+    triples(indices, vertices)
+}
+
+/// The same as [`triangle_corners`], for the normal of each corner. A JT 9.x/10.x
+/// shape welds corners that sit at one place, so the per-slot order of the
+/// normals is not preserved either — only which normals belong to a triangle.
+fn triangle_normals(indices: &[i32], normals: &[f32]) -> Vec<[f32; 9]> {
+    triples(indices, normals)
+}
+
+fn triples(indices: &[i32], values: &[f32]) -> Vec<[f32; 9]> {
     let mut out: Vec<[f32; 9]> = Vec::new();
     for triangle in indices.chunks(3) {
         if triangle.len() != 3 {
@@ -127,7 +138,7 @@ fn triangle_corners(indices: &[i32], vertices: &[f32]) -> Vec<[f32; 9]> {
         let mut corners = [0.0f32; 9];
         for (slot, index) in triangle.iter().enumerate() {
             let from = usize::try_from(*index).expect("the index is in range");
-            corners[slot * 3..slot * 3 + 3].copy_from_slice(&vertices[from * 3..from * 3 + 3]);
+            corners[slot * 3..slot * 3 + 3].copy_from_slice(&values[from * 3..from * 3 + 3]);
         }
         corners.sort_by(|a, b| a.partial_cmp(b).expect("the corners are finite"));
         out.push(corners);
@@ -143,14 +154,15 @@ fn triangle_corners(indices: &[i32], vertices: &[f32]) -> Vec<[f32; 9]> {
 }
 
 #[test]
-fn a_built_file_reads_back_as_jt_8_1() {
+fn a_built_file_reads_back_as_jt_10_3() {
     let bytes = builder()
         .write_to_bytes()
         .expect("the graph can be written");
     let file = parse(&bytes);
 
-    assert_eq!(file.header.major, 8);
-    assert_eq!(file.header.minor, 1);
+    // 10.x is the default: a builder that never names a revision writes it.
+    assert_eq!(file.header.major, 10);
+    assert_eq!(file.header.minor, 3);
     assert_eq!(file.header.order, ByteOrder::Little);
 
     // One scene graph plus one representation segment per shape.
@@ -164,12 +176,71 @@ fn a_built_file_reads_back_as_jt_8_1() {
         assert!(entry.offset < bytes.len() as u64);
         assert!(u64::from(entry.length) <= bytes.len() as u64);
     }
-    // The scene graph comes first and the segments do not overlap.
-    assert_eq!(file.toc[0].offset, 105);
+    // The scene graph comes first and the segments do not overlap. A JT 10.x
+    // header carries a 64-bit table offset where 8.x and 9.x carry a 32-bit
+    // one, so the table — and with it the first segment — starts four bytes
+    // further along.
+    assert_eq!(file.toc[0].offset, 109);
     assert!(file.toc[1].offset > file.toc[0].offset);
 
     // Writing the same graph twice yields the same bytes.
     assert_eq!(bytes, builder().write_to_bytes().expect("deterministic"));
+}
+
+#[test]
+fn a_named_revision_reaches_the_banner_and_the_header() {
+    // The revision is not only a banner string: it decides the width of the
+    // table offsets, so the first segment moves.
+    for (version, major, minor, lsg_offset) in [
+        (JtVersion::V8_1, 8, 1, 105),
+        (JtVersion::V9_5, 9, 5, 105),
+        (JtVersion::V10_3, 10, 3, 109),
+    ] {
+        let mut build = builder();
+        let _ = build
+            .set_version(version)
+            .expect("8.1, 9.5 and 10.3 are all supported");
+        assert_eq!(build.version(), version, "the builder keeps it");
+        let bytes = build.write_to_bytes().expect("the graph can be written");
+        let banner = std::str::from_utf8(&bytes[..16]).expect("the banner starts with ASCII");
+        assert!(
+            banner.starts_with(&format!("Version {version} JT")),
+            "the banner of {version} says {banner:?}"
+        );
+
+        let file = parse(&bytes);
+        assert_eq!((file.header.major, file.header.minor), (major, minor));
+        assert_eq!(
+            file.toc[0].offset, lsg_offset,
+            "the header size of {version}"
+        );
+        assert_eq!(
+            classes(&file),
+            ["Partition", "Part", "Shape", "Instance", "Instance"]
+        );
+        assert_eq!(
+            file.to_model().triangle_count(),
+            12,
+            "{version} holds the cube"
+        );
+    }
+}
+
+#[test]
+fn an_unsupported_revision_is_refused() {
+    let mut build = builder();
+    let err = build
+        .set_version(JtVersion {
+            major: 11,
+            minor: 0,
+        })
+        .expect_err("JT 11.x does not exist");
+    assert!(err.to_string().contains("11"));
+    assert_eq!(
+        build.version(),
+        JtVersion::default(),
+        "the builder keeps it"
+    );
 }
 
 #[test]
@@ -237,12 +308,55 @@ fn the_triangles_of_a_built_mesh_come_back_unchanged() {
     assert!(matches!(loaded.element, Element::ShapeLodTriStripSet(_)));
     let geometry = loaded.element.geometry().expect("a representation");
 
-    // JT stores a *strip* set, and the reader expands each strip with
-    // alternating winding, so the index buffer comes back in strip order
-    // rather than as it was written: every second triangle has its last two
-    // corners swapped. The writer stores those two slots the other way round,
-    // so the swap lands on the original corners and the *triangles* are the
-    // ones that were given — which is what has to match.
+    // The default revision stores the mesh topologically: the dual walk emits
+    // its own corner order, so neither the index buffer nor the per-slot order
+    // of the normals is the one that went in. The triangles are, and that is
+    // what a round trip has to preserve.
+    assert_eq!(
+        geometry.indices,
+        (0..36).collect::<Vec<i32>>(),
+        "the walk numbers its corners as it emits them"
+    );
+    assert_eq!(
+        triangle_corners(&geometry.indices, &geometry.vertices),
+        triangle_corners(source.indices(), source.vertices()),
+        "the same 12 triangles came back"
+    );
+    assert_eq!(
+        triangle_normals(&geometry.indices, &geometry.normals),
+        triangle_normals(source.indices(), source.normals()),
+        "each triangle kept the normals of its corners"
+    );
+    assert_eq!(geometry.vertex_count, 36);
+    assert_eq!(geometry.normal_count, 36);
+    // The 64-bit binding of a topological shape carries no per-slot normal flag.
+    assert_eq!(geometry.normal_binding, None);
+
+    // And the export view sees the same cube.
+    let model = file.to_model();
+    assert_eq!(model.meshes.len(), 1);
+    assert_eq!(model.triangle_count(), 12);
+    assert_eq!(model.vertex_count(), 36);
+}
+
+#[test]
+fn the_vertex_based_representation_of_jt_8x_keeps_the_strip_order() {
+    let source = cube();
+    let mut build = builder();
+    let _ = build.set_version(JtVersion::V8_1);
+    let bytes = build.write_to_bytes().expect("the graph can be written");
+    let file = parse(&bytes);
+    let geometry = graph(&file).loaded[0]
+        .element
+        .geometry()
+        .expect("a representation");
+
+    // JT 8.x stores a *strip* set slot by slot, and the reader expands each
+    // strip with alternating winding, so the index buffer comes back in strip
+    // order rather than as it was written: every second triangle has its last
+    // two corners swapped. The writer stores those two slots the other way
+    // round, so the swap lands on the original corners and the *triangles* are
+    // the ones that were given.
     assert_eq!(
         geometry.indices,
         [
@@ -262,12 +376,82 @@ fn the_triangles_of_a_built_mesh_come_back_unchanged() {
     assert_eq!(geometry.vertex_count, 36);
     assert_eq!(geometry.normal_count, 36);
     assert_eq!(geometry.normal_binding, Some(1));
+    assert_eq!(file.to_model().triangle_count(), 12);
+}
 
-    // And the export view sees the same cube.
-    let model = file.to_model();
-    assert_eq!(model.meshes.len(), 1);
-    assert_eq!(model.triangle_count(), 12);
-    assert_eq!(model.vertex_count(), 36);
+#[test]
+fn every_supported_revision_round_trips_the_same_cube() {
+    // One geometry check across the three revisions: the containers differ —
+    // vertex-based slots for 8.x, a dual walk for 9.x and 10.x — but the
+    // triangles, the normals attached to them and the export view do not.
+    let source = cube();
+    for version in [JtVersion::V8_1, JtVersion::V9_5, JtVersion::V10_3] {
+        let mut build = builder();
+        let _ = build.set_version(version);
+        let bytes = build.write_to_bytes().expect("the graph can be written");
+        let file = parse(&bytes);
+        let geometry = file.lsg.as_ref().expect("a scene graph").loaded[0]
+            .element
+            .geometry()
+            .expect("a representation");
+
+        assert_eq!(
+            triangle_corners(&geometry.indices, &geometry.vertices),
+            triangle_corners(source.indices(), source.vertices()),
+            "{version} lost a triangle"
+        );
+        assert_eq!(
+            triangle_normals(&geometry.indices, &geometry.normals),
+            triangle_normals(source.indices(), source.normals()),
+            "{version} lost a normal"
+        );
+        assert_eq!(geometry.vertex_count, 36, "{version} vertex count");
+        assert_eq!(geometry.normal_count, 36, "{version} normal count");
+
+        let model = file.to_model();
+        assert_eq!(model.meshes.len(), 1, "{version} mesh count");
+        assert_eq!(model.triangle_count(), 12, "{version} triangle count");
+        assert_eq!(model.vertex_count(), 36, "{version} vertex count");
+        assert_eq!(model.materials.len(), 1, "{version} material count");
+    }
+}
+
+#[test]
+fn an_open_mesh_cannot_be_written_as_jt_9x_or_10x() {
+    // The topological coder needs a closed two-manifold; the vertex-based
+    // representation of 8.x has no such requirement.
+    let open = MeshData::new(
+        vec![
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0,
+            0.0,
+        ],
+        vec![0, 1, 2, 3, 4, 5],
+    )
+    .expect("the strip is a valid mesh");
+
+    for version in [JtVersion::V9_5, JtVersion::V10_3] {
+        let mut build = JtBuilder::new();
+        let _ = build.set_version(version);
+        let _ = build
+            .add_shape(build.root(), "open", open.clone())
+            .expect("the root takes a shape");
+        let err = build
+            .write_to_bytes()
+            .expect_err("{version} cannot hold an open shell");
+        assert!(
+            err.to_string()
+                .contains("the mesh is not a closed two-manifold"),
+            "{version} reports {err}"
+        );
+    }
+
+    let mut build = JtBuilder::new();
+    let _ = build.set_version(JtVersion::V8_1);
+    let _ = build
+        .add_shape(build.root(), "open", open)
+        .expect("the root takes a shape");
+    let file = parse(&build.write_to_bytes().expect("8.x holds an open shell"));
+    assert_eq!(file.to_model().triangle_count(), 2);
 }
 
 #[test]
@@ -295,6 +479,7 @@ fn a_compact_mesh_is_exploded_and_comes_back_unchanged() {
     );
 
     let mut build = JtBuilder::new();
+    let _ = build.set_version(JtVersion::V8_1);
     let shape = build
         .add_shape(build.root(), "compact", source.clone())
         .expect("the root takes a shape");
@@ -449,7 +634,7 @@ fn a_built_file_can_be_written_to_disk_and_opened_again() {
     assert!(path.exists());
 
     let file = JtFile::open(&path).expect("the file on disk parses");
-    assert_eq!(file.header.major, 8);
+    assert_eq!(file.header.major, 10);
     assert_eq!(classes(&file).len(), 5);
     assert_eq!(file.to_model().triangle_count(), 12);
 

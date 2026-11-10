@@ -6,18 +6,24 @@
 //! with an empty scene graph, accumulates nodes, meshes and instances, and
 //! writes a complete JT file.
 //!
-//! The files it emits are **JT 8.1**. That is the newest version whose
-//! representation codec is available here: the dual vertex-face coder of JT
-//! 9.x and 10.x has no encoder in this crate, so a from-scratch file uses the
-//! vertex-based lossless representation of JT 8.x — the one [`LodGeometry`]
-//! hands back with `params[0] == 0`.
+//! The revision is chosen with [`JtBuilder::set_version`] and defaults to
+//! **JT 10.3**. JT 9.x and 10.x store their triangles in the topologically
+//! compressed representation, so [`encode`] re-encodes the mesh with the dual
+//! vertex-face coder the reader decodes; that coder only describes a closed
+//! two-manifold, and a mesh that is not one is refused rather than written
+//! wrong. JT 8.x keeps the vertex-based lossless representation — the one
+//! [`LodGeometry`] hands back with `params[0] == 0` — which accepts any mesh.
+//!
+//! [`encode`]: crate::jt::encode
 
 use std::path::Path;
 
 use crate::codec::{ByteOrder, WriterExt, deflate};
 use crate::error::{Error, Result};
+use crate::jt::encode::write_topological_body;
 use crate::jt::guid::{Guid, types};
 use crate::jt::segment::TocEntry;
+use crate::jt::version::JtVersion;
 use crate::jt::write::{
     BASE_ATTRIBUTE, BASE_GROUP, BASE_INSTANCE, BASE_SHAPE, header_length, segment_bytes,
     write_atom, write_attribute_base, write_box, write_counts, write_deferred,
@@ -27,10 +33,6 @@ use crate::model::Transform;
 
 use super::LodGeometry;
 
-/// The major version the builder writes.
-const MAJOR: u32 = 8;
-/// The minor version stored in the banner.
-const MINOR: u32 = 1;
 /// Byte order of every file the builder emits.
 const ORDER: ByteOrder = ByteOrder::Little;
 /// The property key that names a node.
@@ -45,13 +47,17 @@ const BASE_PROPERTY_STRING: u8 = 5;
 const BASE_PROPERTY_LATE_LOADED: u8 = 8;
 /// Base type byte of an element atom.
 const BASE_ELEMENT: u8 = 4;
+/// Segment type of the representation segments the builder emits.
+const SHAPE_SEGMENT_KIND: i32 = 7;
 /// Bytes between the length field and the body of an atom outside the LSG.
 ///
-/// The scene graph numbers its objects, so an LSG atom carries an object id
-/// and its length counts 21 envelope bytes. A representation segment numbers
-/// nothing before JT 9.x, so its length counts only the GUID and the base type
-/// byte — see [`read_element_envelope`].
-const ELEMENT_ENVELOPE: usize = 16 + 1;
+/// The scene graph numbers its objects, so an LSG atom always carries an
+/// object id and counts 21 envelope bytes. A representation segment numbers
+/// its objects only from JT 9.x on, so its length counts only the GUID and the
+/// base type byte before that — see [`read_element_envelope`].
+fn element_envelope(major: u32) -> usize {
+    if major > 8 { 16 + 1 + 4 } else { 16 + 1 }
+}
 /// Bytes between the body of a segment and its declared size when the segment
 /// carries no compression header, as a shape segment does not.
 const PLAIN_SEGMENT_ENVELOPE: usize = 4 + 16 + 4;
@@ -385,6 +391,7 @@ pub struct JtBuilder {
     meshes: Vec<MeshData>,
     root: JtNode,
     compress: bool,
+    version: JtVersion,
 }
 
 impl Default for JtBuilder {
@@ -410,6 +417,7 @@ impl JtBuilder {
             meshes: Vec::new(),
             root: JtNode(0),
             compress: true,
+            version: JtVersion::default(),
         }
     }
 
@@ -442,6 +450,29 @@ impl JtBuilder {
     #[must_use]
     pub fn compress(&self) -> bool {
         self.compress
+    }
+
+    /// Choose the JT revision to write.
+    ///
+    /// The default is [`JtVersion::V10_3`]. JT 9.x and 10.x store their
+    /// triangles topologically compressed, which needs a closed two-manifold —
+    /// [`JtBuilder::write_to_bytes`] refuses such a mesh instead of writing a
+    /// representation that decodes to nothing. JT 8.x accepts any mesh.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] is returned for a revision outside JT 8.x, 9.x or
+    /// 10.x.
+    pub fn set_version(&mut self, version: JtVersion) -> Result<&mut Self> {
+        version.validate()?;
+        self.version = version;
+        Ok(self)
+    }
+
+    /// The JT revision written by [`JtBuilder::write_to_bytes`].
+    #[must_use]
+    pub fn version(&self) -> JtVersion {
+        self.version
     }
 
     /// Add a node under `parent` and return its handle.
@@ -669,12 +700,19 @@ impl JtBuilder {
 
     /// Turn the graph into the bytes of a JT file.
     ///
+    /// The revision is the one set with [`JtBuilder::set_version`], JT 10.3 by
+    /// default. JT 9.x and 10.x encode their triangles with the topological
+    /// coder, which describes a closed two-manifold, so a mesh that is not one
+    /// is refused instead of written out wrong.
+    ///
     /// # Errors
     ///
     /// [`Error::Invalid`] is returned when a shape node has no mesh, when an
     /// instance has no target, or when the graph is not a tree — a node that is
-    /// its own ancestor, or a node that is not reachable from the root.
+    /// its own ancestor, or a node that is not reachable from the root. It is
+    /// also returned for a mesh that cannot be encoded at the chosen revision.
     pub fn write_to_bytes(&self) -> Result<Vec<u8>> {
+        let version = self.version;
         let plan = self.plan()?;
         let lsg_guid = self.segment_guid(0);
         let body = self.lsg_body(&plan)?;
@@ -689,9 +727,15 @@ impl JtBuilder {
         }
 
         let sizes: usize = segments.iter().map(|bytes| bytes.len()).sum();
+        let row = if version.major >= 10 { 32 } else { 28 };
         let mut out: Vec<u8> =
-            Vec::with_capacity(header_length(MAJOR) + sizes + 4 + 28 * segments.len());
-        write_banner(&mut out, header_length(MAJOR) + sizes, &lsg_guid)?;
+            Vec::with_capacity(header_length(version.major) + sizes + 4 + row * segments.len());
+        write_banner(
+            &mut out,
+            header_length(version.major) + sizes,
+            &lsg_guid,
+            version,
+        )?;
 
         let mut offset = out.len();
         let mut toc: Vec<TocEntry> = Vec::with_capacity(segments.len());
@@ -705,7 +749,7 @@ impl JtBuilder {
             offset += bytes.len();
             out.extend_from_slice(bytes);
         }
-        write_toc(&mut out, &toc)?;
+        write_toc(&mut out, &toc, version)?;
         Ok(out)
     }
 
@@ -783,7 +827,7 @@ impl JtBuilder {
                 attributes.push(Attribute {
                     guid: types::ATTRIBUTE_GEOMETRIC_TRANSFORM,
                     id,
-                    body: transform_body(&matrix)?,
+                    body: transform_body(&matrix, self.version)?,
                 });
                 attribute_of[*node].push(id);
             }
@@ -792,7 +836,7 @@ impl JtBuilder {
                 attributes.push(Attribute {
                     guid: types::ATTRIBUTE_MATERIAL,
                     id,
-                    body: material_body(&material)?,
+                    body: material_body(&material, self.version)?,
                 });
                 attribute_of[*node].push(id);
             }
@@ -827,7 +871,7 @@ impl JtBuilder {
 
         let representations = shapes
             .iter()
-            .map(|shape| representation(&self.meshes[shape.mesh]))
+            .map(|shape| representation(&self.meshes[shape.mesh], self.version))
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Plan {
@@ -875,15 +919,15 @@ impl JtBuilder {
         let first = (plan.order.len() + plan.attributes.len()) as i32;
         let mut next = first;
         let mut properties: Vec<Property> = Vec::new();
-        let name_key = add_string_property(&mut properties, &mut next, NAME_KEY);
-        let shape_key = add_string_property(&mut properties, &mut next, SHAPE_KEY);
+        let name_key = add_string_property(&mut properties, &mut next, NAME_KEY, self.version)?;
+        let shape_key = add_string_property(&mut properties, &mut next, SHAPE_KEY, self.version)?;
         let mut rows: Vec<Row> = Vec::new();
 
         for node in &plan.order {
             let slot = &self.nodes[*node];
             let mut pairs = Vec::new();
             if let Some(name) = &slot.name {
-                let value = add_string_property(&mut properties, &mut next, name);
+                let value = add_string_property(&mut properties, &mut next, name, self.version)?;
                 pairs.push((name_key, value));
             }
             if slot.class == BuildNode::Shape {
@@ -898,7 +942,7 @@ impl JtBuilder {
                     guid: types::PROPERTY_LATE_LOADED,
                     base: BASE_PROPERTY_LATE_LOADED,
                     id: value,
-                    body: late_load_body(&shape.guid, 7),
+                    body: late_load_body(&shape.guid, SHAPE_SEGMENT_KIND, self.version)?,
                 });
                 pairs.push((shape_key, value));
             }
@@ -935,6 +979,7 @@ impl JtBuilder {
                 &children,
                 target,
                 &bounds,
+                self.version,
             )?;
             write_atom(&mut body, ORDER, &guid, base, plan.ids[*node], &node_body)?;
             for id in &plan.attribute_of[*node] {
@@ -1031,20 +1076,30 @@ fn shape_segment(guid: Guid, element: &[u8]) -> Vec<u8> {
 }
 
 /// Add a string property and return its id, taken from the running object id.
-fn add_string_property(properties: &mut Vec<Property>, next: &mut i32, value: &str) -> i32 {
+fn add_string_property(
+    properties: &mut Vec<Property>,
+    next: &mut i32,
+    value: &str,
+    version: JtVersion,
+) -> Result<i32> {
     let id = *next;
     *next += 1;
     let mut body: Vec<u8> = Vec::new();
-    body.write_u32_value(PROPERTY_STATE, ORDER)
-        .expect("writing to a vector cannot fail");
-    write_mb_string(&mut body, ORDER, value).expect("writing to a vector cannot fail");
+    if version.has_object_versions() {
+        write_version(&mut body, ORDER, version.major, 1)?;
+    }
+    body.write_u32_value(PROPERTY_STATE, ORDER)?;
+    if version.has_object_versions() {
+        write_version(&mut body, ORDER, version.major, 1)?;
+    }
+    write_mb_string(&mut body, ORDER, value)?;
     properties.push(Property {
         guid: types::PROPERTY_STRING,
         base: BASE_PROPERTY_STRING,
         id,
         body,
     });
-    id
+    Ok(id)
 }
 
 /// An attribute the plan has serialised.
@@ -1090,10 +1145,16 @@ struct Plan {
     representations: Vec<Vec<u8>>,
 }
 
-/// Write the banner and the fixed fields of a JT 8.1 file.
-fn write_banner(out: &mut Vec<u8>, toc_offset: usize, lsg: &Guid) -> Result<()> {
+/// Write the banner and the fixed fields of a JT file of the given revision.
+fn write_banner(
+    out: &mut Vec<u8>,
+    toc_offset: usize,
+    lsg: &Guid,
+    version: JtVersion,
+) -> Result<()> {
     let text = format!(
-        "Version {MAJOR}.{MINOR} JT  FerroJT {}",
+        "Version {} JT  FerroJT {}",
+        version,
         env!("CARGO_PKG_VERSION")
     );
     let mut banner = [b' '; 80];
@@ -1102,24 +1163,32 @@ fn write_banner(out: &mut Vec<u8>, toc_offset: usize, lsg: &Guid) -> Result<()> 
     banner[78] = b'\n';
     banner[79] = b'\r';
     out.write_bytes(&banner)?;
-    // Byte 80 is the byte order flag, 0 for little endian, and JT 8.x keeps the
-    // TOC offset at 32 bits.
+    // Byte 80 is the byte order flag, 0 for little endian. JT 8.x and 9.x keep
+    // the TOC offset at 32 bits, JT 10.x widens it to 64.
     out.write_u8_value(0)?;
     out.write_i32_value(0, ORDER)?;
-    out.write_i32_value(toc_offset as i32, ORDER)?;
+    if version.offsets_are_32_bit() {
+        out.write_i32_value(toc_offset as i32, ORDER)?;
+    } else {
+        out.write_u64_value(toc_offset as u64, ORDER)?;
+    }
     write_guid(out, ORDER, lsg)?;
-    if out.len() != header_length(MAJOR) {
+    if out.len() != header_length(version.major) {
         return Err(Error::invalid(0, "internal: the fixed header is malformed"));
     }
     Ok(())
 }
 
 /// Write the TOC table at the end of the file.
-fn write_toc(out: &mut Vec<u8>, toc: &[TocEntry]) -> Result<()> {
+fn write_toc(out: &mut Vec<u8>, toc: &[TocEntry], version: JtVersion) -> Result<()> {
     out.write_i32_value(toc.len() as i32, ORDER)?;
     for entry in toc {
         write_guid(out, ORDER, &entry.guid)?;
-        out.write_i32_value(entry.offset as i32, ORDER)?;
+        if version.offsets_are_32_bit() {
+            out.write_i32_value(entry.offset as i32, ORDER)?;
+        } else {
+            out.write_u64_value(entry.offset, ORDER)?;
+        }
         out.write_u32_value(entry.length, ORDER)?;
         out.write_u32_value((entry.kind as u32) << 24, ORDER)?;
     }
@@ -1127,21 +1196,38 @@ fn write_toc(out: &mut Vec<u8>, toc: &[TocEntry]) -> Result<()> {
 }
 
 /// Serialise the body of one node, with its references already renumbered.
+///
+/// The field order follows the reader of each class: a node base gains a class
+/// version from JT 9.x on, a partition gains one only in JT 10.x, and a shape
+/// drops its reserved box in JT 10.x.
 fn node_body(
     class: BuildNode,
     attributes: &[i32],
     children: &[i32],
     target: i32,
     bounds: &[f32; 6],
+    version: JtVersion,
 ) -> Result<Vec<u8>> {
+    let major = version.major;
     let mut out: Vec<u8> = Vec::new();
     // JT 8.x stores no class version in a node base, only its flags and the
     // attributes it refers to.
+    if version.has_object_versions() {
+        write_version(&mut out, ORDER, major, 1)?;
+    }
     out.write_u32_value(0, ORDER)?;
     write_deferred(&mut out, ORDER, attributes)?;
     match class {
         BuildNode::Partition => {
+            // A partition is a group, and a group names its class version
+            // before its child list from JT 9.x on.
+            if version.has_object_versions() {
+                write_version(&mut out, ORDER, major, 1)?;
+            }
             write_deferred(&mut out, ORDER, children)?;
+            if version.major >= 10 {
+                write_version(&mut out, ORDER, major, 1)?;
+            }
             // No "untransformed box" flag, so the one box below is the last
             // field the reader stops at.
             out.write_i32_value(0, ORDER)?;
@@ -1151,26 +1237,48 @@ fn node_body(
             write_counts(&mut out, ORDER)?;
         }
         BuildNode::Group => {
+            if version.has_object_versions() {
+                write_version(&mut out, ORDER, major, 1)?;
+            }
             write_deferred(&mut out, ORDER, children)?;
         }
         // A shape and an instance have no child list at all: their reader goes
         // straight from the attribute vector to the fields below.
         BuildNode::Shape | BuildNode::Instance => {}
         BuildNode::MetaData => {
+            // A meta data node is a group, so its group version comes before the
+            // child list from JT 9.x on, and its own version follows whatever
+            // the revision.
+            if version.has_object_versions() {
+                write_version(&mut out, ORDER, major, 1)?;
+            }
             write_deferred(&mut out, ORDER, children)?;
-            write_version(&mut out, ORDER, MAJOR, 1)?;
+            write_version(&mut out, ORDER, major, 1)?;
         }
         BuildNode::Part => {
+            // A part is a meta data node, so both of their versions and the
+            // group version below them are stored.
+            if version.has_object_versions() {
+                write_version(&mut out, ORDER, major, 1)?;
+            }
             write_deferred(&mut out, ORDER, children)?;
-            write_version(&mut out, ORDER, MAJOR, 1)?;
-            write_version(&mut out, ORDER, MAJOR, 1)?;
+            write_version(&mut out, ORDER, major, 1)?;
+            write_version(&mut out, ORDER, major, 1)?;
             out.write_i32_value(0, ORDER)?;
         }
     }
     match class {
         BuildNode::Shape => {
-            // JT 8.x stores a reserved box and then the untransformed one.
-            write_box(&mut out, ORDER, &[0.0; 6])?;
+            // A shape names its class version right after the node base from
+            // JT 9.x on.
+            if version.has_object_versions() {
+                write_version(&mut out, ORDER, major, 1)?;
+            }
+            // JT 8.x and 9.x store a reserved box and then the untransformed
+            // one, JT 10.x keeps only the latter.
+            if major < 10 {
+                write_box(&mut out, ORDER, &[0.0; 6])?;
+            }
             write_box(&mut out, ORDER, bounds)?;
             out.write_f32_value(0.0, ORDER)?;
             write_counts(&mut out, ORDER)?;
@@ -1178,6 +1286,9 @@ fn node_body(
             out.write_f32_value(0.0, ORDER)?;
         }
         BuildNode::Instance => {
+            if version.has_object_versions() {
+                write_version(&mut out, ORDER, major, 1)?;
+            }
             // One reference, not a length prefixed vector.
             out.write_i32_value(target, ORDER)?;
         }
@@ -1187,21 +1298,33 @@ fn node_body(
 }
 
 /// Serialise the body of a geometric transform attribute.
-fn transform_body(matrix: &[f64; 16]) -> Result<Vec<u8>> {
+fn transform_body(matrix: &[f64; 16], version: JtVersion) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
-    write_attribute_base(&mut out, ORDER, MAJOR, 1)?;
+    write_attribute_base(&mut out, ORDER, version.major, 1)?;
+    if version.has_object_versions() {
+        write_version(&mut out, ORDER, version.major, 1)?;
+    }
     out.write_u16_value(0xffff, ORDER)?;
-    // JT 8.x stores single precision values.
-    for value in matrix {
-        out.write_f32_value(*value as f32, ORDER)?;
+    // JT 8.x stores single precision values, JT 9.x and later doubles.
+    if version.has_object_versions() {
+        for value in matrix {
+            out.write_f64_value(*value, ORDER)?;
+        }
+    } else {
+        for value in matrix {
+            out.write_f32_value(*value as f32, ORDER)?;
+        }
     }
     Ok(out)
 }
 
 /// Serialise the body of a material attribute.
-fn material_body(material: &MaterialData) -> Result<Vec<u8>> {
+fn material_body(material: &MaterialData, version: JtVersion) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
-    write_attribute_base(&mut out, ORDER, MAJOR, 1)?;
+    write_attribute_base(&mut out, ORDER, version.major, 1)?;
+    if version.has_object_versions() {
+        write_version(&mut out, ORDER, version.major, 1)?;
+    }
     // Flag 0 stores every colour as four components.
     out.write_u16_value(0, ORDER)?;
     for colour in [
@@ -1215,26 +1338,78 @@ fn material_body(material: &MaterialData) -> Result<Vec<u8>> {
         }
     }
     out.write_f32_value(material.shininess, ORDER)?;
+    if version.major >= 10 {
+        // JT 10.x appends the reflectivity and the bumpiness; the material
+        // version stays 1, so no further field follows.
+        out.write_f32_value(material.reflectivity, ORDER)?;
+        out.write_f32_value(0.0, ORDER)?;
+    }
     Ok(out)
 }
 
 /// The body of a late loaded property: state, segment GUID and segment type.
-fn late_load_body(segment: &Guid, kind: i32) -> Vec<u8> {
+fn late_load_body(segment: &Guid, kind: i32, version: JtVersion) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
-    out.write_u32_value(PROPERTY_STATE, ORDER)
-        .expect("writing to a vector cannot fail");
-    write_guid(&mut out, ORDER, segment).expect("writing to a vector cannot fail");
-    out.write_i32_value(kind, ORDER)
-        .expect("writing to a vector cannot fail");
-    out
+    if version.has_object_versions() {
+        write_version(&mut out, ORDER, version.major, 1)?;
+    }
+    out.write_u32_value(PROPERTY_STATE, ORDER)?;
+    if version.has_object_versions() {
+        write_version(&mut out, ORDER, version.major, 1)?;
+    }
+    write_guid(&mut out, ORDER, segment)?;
+    out.write_i32_value(kind, ORDER)?;
+    if version.has_object_versions() {
+        // The object id of the element inside that segment; the builder gives
+        // every representation element the id 0.
+        out.write_i32_value(0, ORDER)?;
+        if version.major < 10 {
+            out.write_i32_value(0, ORDER)?;
+        }
+    }
+    Ok(out)
 }
 
 /// Serialise the element atom of one representation, envelope included.
 ///
-/// A representation segment numbers no objects before JT 9.x, so the atom
-/// carries no object id and its length counts only the GUID and the base type
-/// byte.
-fn representation(mesh: &MeshData) -> Result<Vec<u8>> {
+/// The revision picks the coder: JT 8.x stores the vertex based lossless
+/// representation, JT 9.x and 10.x the topologically compressed one. A
+/// representation segment numbers its objects only from JT 9.x on, so its atom
+/// carries an object id only there — and the length counts it accordingly.
+fn representation(mesh: &MeshData, version: JtVersion) -> Result<Vec<u8>> {
+    let body = if version.has_topological_representation() {
+        topological_body(mesh, version)?
+    } else {
+        vertex_body(mesh, version)?
+    };
+
+    let mut out: Vec<u8> = Vec::new();
+    out.write_i32_value((element_envelope(version.major) + body.len()) as i32, ORDER)?;
+    write_guid(&mut out, ORDER, &types::SHAPE_LOD_TRI_STRIP_SET)?;
+    out.write_u8_value(BASE_ELEMENT)?;
+    if version.has_object_versions() {
+        // The id of the element inside the segment, as the late load says.
+        out.write_i32_value(0, ORDER)?;
+    }
+    out.write_bytes(&body)?;
+    Ok(out)
+}
+
+/// The body of a topologically compressed representation, envelope excluded.
+///
+/// The encoder writes everything up to the two payloads; the element appends
+/// its own trailing version after the representation, which is the order the
+/// reader uses.
+fn topological_body(mesh: &MeshData, version: JtVersion) -> Result<Vec<u8>> {
+    let mut body: Vec<u8> = Vec::new();
+    write_topological_body(mesh, version, &mut body)?;
+    write_version(&mut body, ORDER, version.major, 1)?;
+    Ok(body)
+}
+
+/// The body of a JT 8.x vertex based representation, envelope excluded.
+fn vertex_body(mesh: &MeshData, version: JtVersion) -> Result<Vec<u8>> {
+    let major = version.major;
     let strips = mesh.indices().len() / 3;
     let with_normals = !mesh.normals().is_empty();
 
@@ -1268,16 +1443,16 @@ fn representation(mesh: &MeshData) -> Result<Vec<u8>> {
     let mut body: Vec<u8> = Vec::new();
     // Shape LOD base: the class version, the 32 bit vertex binding of JT 8.x
     // and the quantization parameters of a lossless shape.
-    write_version(&mut body, ORDER, MAJOR, 1)?;
+    write_version(&mut body, ORDER, major, 1)?;
     body.write_u32_value(1, ORDER)?;
     for value in [0u8, 0, 0, 0] {
         body.write_u8_value(value)?;
     }
     // The trailing version of the tri-strip-set element.
-    write_version(&mut body, ORDER, MAJOR, 1)?;
+    write_version(&mut body, ORDER, major, 1)?;
     // The vertex based representation: its version, the per-slot bindings and
     // the parameters saying the geometry is stored lossless.
-    write_version(&mut body, ORDER, MAJOR, 1)?;
+    write_version(&mut body, ORDER, major, 1)?;
     body.write_u8_value(u8::from(with_normals))?;
     body.write_u8_value(0)?;
     body.write_u8_value(0)?;
@@ -1312,13 +1487,7 @@ fn representation(mesh: &MeshData) -> Result<Vec<u8>> {
     body.write_i32_value(unpacked.len() as i32, ORDER)?;
     body.write_i32_value(packed.len() as i32, ORDER)?;
     body.write_bytes(&packed)?;
-
-    let mut out: Vec<u8> = Vec::new();
-    out.write_i32_value((ELEMENT_ENVELOPE + body.len()) as i32, ORDER)?;
-    write_guid(&mut out, ORDER, &types::SHAPE_LOD_TRI_STRIP_SET)?;
-    out.write_u8_value(BASE_ELEMENT)?;
-    out.write_bytes(&body)?;
-    Ok(out)
+    Ok(body)
 }
 
 /// The residuals a stride-1 predictor needs to reproduce `values`.
