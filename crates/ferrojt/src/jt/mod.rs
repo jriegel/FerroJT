@@ -67,7 +67,7 @@ pub use model::{
 pub use object::{
     Attribute, Class, Deferred, Element, GeometricTransform, LateLoad, LodGeometry, Material, Node,
     NodeBase, Property, RawElement, ShapeLodTriStripSet, ShapeLodVertex, class_of,
-    read_element_envelope, skip_element,
+    element_stores_object_id, read_element_envelope, skip_element,
 };
 pub use reader::Cursor;
 pub use segment::{FileHeader, Segment, TocEntry, segment_type_name};

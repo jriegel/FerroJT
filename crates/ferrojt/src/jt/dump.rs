@@ -589,11 +589,19 @@ pub fn recurse_down_the_tree(
         tabs(out, *indent)?;
         out.write_all(b"\"jt_type\":\"TriStripSet\",\n")?;
         write_name(out, *indent, &shape.name)?;
-        handle_attributes_json(config, indent, out, graph, node)?;
-        for load in node.late_loads() {
-            if let Some(geometry) = graph.geometry_for(load) {
-                write_geometry(config, out, *indent, geometry)?;
-            }
+        // The geometry follows the attributes, so the last attribute ends with
+        // a separator. A shape whose representation is not in the file — a
+        // coarse level of detail left out of a filtered write, or a
+        // representation without vertices — has nothing to separate, and the
+        // separator would leave the object unparseable.
+        let geometry: Vec<&LodGeometry> = node
+            .late_loads()
+            .iter()
+            .filter_map(|load| graph.geometry_for(load))
+            .collect();
+        handle_attributes(config, indent, out, graph, node, !geometry.is_empty())?;
+        for geometry in geometry {
+            write_geometry(config, out, *indent, geometry)?;
         }
     }
 
@@ -662,19 +670,38 @@ fn write_geometry(
 
 /// Write the attributes attached to a node.
 pub fn handle_attributes_json(
-    _config: i32,
+    config: i32,
     indent: &mut i32,
     out: &mut impl Write,
     graph: &SceneGraph,
     node: &Node,
 ) -> Result<()> {
-    for attribute in graph.attributes_of(node) {
+    handle_attributes(config, indent, out, graph, node, true)
+}
+
+/// Write the attributes attached to a node.
+///
+/// `comma` says whether something is written after the attributes, which is
+/// what the reference relies on: it always follows a shape node by its
+/// geometry. Without it the last attribute closes the object and must not end
+/// with a separator.
+fn handle_attributes(
+    _config: i32,
+    indent: &mut i32,
+    out: &mut impl Write,
+    graph: &SceneGraph,
+    node: &Node,
+    comma: bool,
+) -> Result<()> {
+    let attributes = graph.attributes_of(node);
+    for (position, attribute) in attributes.iter().enumerate() {
+        let following = position + 1 < attributes.len();
         match attribute {
             Attribute::GeometricTransform(transform) => {
                 tabs(out, *indent)?;
                 out.write_all(b"\"Attribute_GeometricTransform\": [")?;
                 write_numbers(out, &transform.matrix)?;
-                out.write_all(b"],\n")?;
+                out.write_all(terminator(comma, following))?;
             }
             Attribute::Material(material) => {
                 let colours = [
@@ -683,11 +710,11 @@ pub fn handle_attributes_json(
                     ("Attribute_SpecularColor", &material.specular),
                     ("Attribute_EmissionColor", &material.emission),
                 ];
-                for (name, colour) in colours {
+                for (at, (name, colour)) in colours.into_iter().enumerate() {
                     tabs(out, *indent)?;
                     write!(out, "\"{name}\": [")?;
                     write_numbers(out, colour)?;
-                    out.write_all(b"],\n")?;
+                    out.write_all(terminator(comma, at + 1 < colours.len() || following))?;
                 }
             }
             Attribute::Unsupported { class_name } => {
@@ -698,6 +725,12 @@ pub fn handle_attributes_json(
         }
     }
     Ok(())
+}
+
+/// The bytes closing an attribute: a separator and a newline when something
+/// follows, only a newline when the object ends here.
+fn terminator(comma: bool, following: bool) -> &'static [u8] {
+    if comma || following { b"],\n" } else { b"]\n" }
 }
 
 /// Write the children of a node. A child that does not resolve becomes the

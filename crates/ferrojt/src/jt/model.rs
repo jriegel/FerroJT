@@ -18,7 +18,7 @@ use crate::jt::dump::{
 use crate::jt::guid::Guid;
 use crate::jt::object::{
     Attribute, Class, Element, LateLoad, LodGeometry, Material, Node, Property, class_of,
-    read_element_envelope, skip_element,
+    element_stores_object_id, read_element_envelope, skip_element,
 };
 use crate::jt::reader::Cursor;
 use crate::jt::segment::{self, FileHeader, TocEntry};
@@ -722,8 +722,11 @@ fn read_element_of_segment_impl(
     let segment = segment::read_segment(data, offset, header)?;
     let mut cursor = Cursor::new(&segment.body, header.order, header.major);
     let mut first = None;
-    // The reference reads exactly one element here, then checks the length.
-    if let Some(element) = read_element_envelope(&mut cursor, false)? {
+    // The reference reads exactly one element here, then checks the length. Its
+    // envelope carries an object id from JT 9.x on, exactly as the late load
+    // that points at it does.
+    let store_object_id = element_stores_object_id(header.major);
+    if let Some(element) = read_element_envelope(&mut cursor, store_object_id)? {
         if class_of(&element.guid).is_some() {
             cursor.seek(element.body_offset)?;
             first = Some(Element::read(&element.guid, &mut cursor)?);
@@ -1005,7 +1008,7 @@ impl LodWalk {
 
     /// The tier to record on a mesh, if a range LOD defines one.
     #[must_use]
-    fn level(self) -> Option<u32> {
+    pub(crate) fn level(self) -> Option<u32> {
         self.inside.then_some(self.level)
     }
 

@@ -11,16 +11,20 @@
 
 A JT file stores its geometry in one of the quantised or topologically
 compressed encodings — Huffman, the range/CDP driver, the length-zone and
-angle coders, the mesh coder. The reader decodes all of them, but re-encoding
-is a separate problem with its own parameter search, and nothing in the
-reference tooling does it. So the writer takes the other route:
+angle coders, the mesh coder. The reader decodes all of them; only the two
+representations a writer can actually target have an encoder here: the
+vertex-based lossless one of JT 8.x and the dual vertex-face coder of JT 9.x and
+10.x (`jt/encode.rs`). The quantised coders have none, and nothing in the
+reference tooling re-encodes anything at all. So the writer takes the safe route:
 
 * the **logical scene graph** is rebuilt from the parsed graph, because that is
   where a filter has to act;
 * **every other segment** — shape representations, meta data, PMI, B-rep — is
   copied out of the source file byte for byte;
 * a segment is dropped only when every node that referenced it is gone, which
-  is what makes `--all-lods` shrink the TOC table.
+  is what makes `--all-lods` shrink the TOC table;
+* a shape segment is **re-encoded** only when the target revision forces it,
+  which is a change of major version — see [Choosing the revision](#choosing-the-revision).
 
 That is also why `write_to_bytes` needs the bytes of the source file: the
 banner is reused verbatim and the segments are copied from there.
@@ -31,8 +35,57 @@ banner is reused verbatim and the segments are copied from there.
 | --- | --- |
 | `jt::write_to_bytes(file, data, options) -> Result<Vec<u8>>` | Rebuild the file in memory. `data` is the content of the file `file` was read from. |
 | `jt::write_to_file(file, path, options) -> Result<()>` | Same, reading the source again and storing the result. |
-| `jt::WriteOptions` | `all_lods`, `no_layer_filter`, `layer_filter`, `compress`. |
-| `ferrojt write in.jt -o out.jt` | The CLI: writes, re-reads the result and reports both counts. |
+| `jt::WriteOptions` | `all_lods`, `no_layer_filter`, `layer_filter`, `compress`, `version`. |
+| `jt::JtVersion` | The revision to write: `8.0`, `8.1`, `9.5`, `10.3`; parses from `"9"` or `"10.3"`. |
+| `ferrojt write in.jt -o out.jt` | The CLI: writes, re-reads the result and reports both counts. `--jt-version 10.3` picks the revision. |
+
+## Choosing the revision
+
+`version` is `None` by default, which keeps the revision of the source — that is
+what makes the rewrite lossless, since the segments in between are copied byte
+for byte and their framing is version dependent. Setting it rewrites the file at
+another revision, and three rules decide how far that can go.
+
+**The family cannot be changed.** JT 8.x stores its triangles in the vertex-based
+lossless representation, JT 9.x and 10.x in the topologically compressed coder,
+and a shape of one family does not exist in the other: a vertex-based
+representation read by a 9.x/10.x reader comes back with **zero triangles**. So
+`8.1 → 10.3` and `9.5 → 8.1` are refused outright, with the message
+
+> `a JT 8.1 file cannot be written as JT 10.3: JT 8.x stores its triangles in the
+> vertex based representation, JT 9.x and 10.x in the topologically compressed
+> one, and only the coder of the revision of the source file is available`
+
+**Inside a family, the major version decides how much is restructured.**
+`9.5 → 10.3` keeps every segment and re-serialises the framing of the scene
+graph; the property atoms of the source are parsed with the **source** framing
+and re-emitted with the target's. When the major version changes, the shape
+segments are re-encoded from the decoded geometry and their segment types are
+renumbered, and any segment whose own framing depends on the revision — the info
+segment JT 10.x added, for instance — makes the rewrite impossible rather than
+silently wrong:
+
+> `the segment <guid> has segment type 31, whose framing depends on the JT
+> revision, so it cannot be rewritten as JT 9.5`
+
+**The coder needs a closed two-manifold.** A real CAD assembly has open edges, so
+its shapes cannot be re-encoded and the write is refused instead of producing a
+file whose shapes come back empty:
+
+> `the representation <guid> cannot be written as JT 10.3: the mesh is not a
+> closed two-manifold, so it cannot be written as JT 9.x/10.x`
+
+What a restructure costs in the geometry is worth knowing: the coder keeps one
+vertex instance per triangle corner and orders the slots its own way, so the
+vertex table of a representation **grows and is re-ordered** while the triangle
+count does not change. A 24-corner cube of a 9.5 file comes back as 36 slots at
+10.3. Cross-revision geometry is therefore only comparable as a set of triangles,
+never as a digest of the index, vertex or normal arrays.
+
+The segment type of a shape is `7 + level` for JT 8.x and 10.x and `6` for 9.x —
+and that is a property of the file, not of the revision: `SampleJT_Server.jt` is
+a 9.5 file that stores its 106 shape segments as type 7. The renumbering therefore
+only runs when the major version actually changes.
 
 ## What a rewrite keeps
 
@@ -89,7 +142,10 @@ Read out of the samples, since no reference writer exists:
   read but never written.
 * Element: `i32 length | GUID | u8 base type | i32 object id | body`, where the
   length excludes its own field — the stride of an atom is `4 + length`. The
-  envelope of a known class is 25 bytes, of an unknown class 20.
+  envelope of a known class is 25 bytes, of an unknown class 20. A **non-LSG**
+  element carries the object id from JT 9.x on, which is what
+  `jt::element_stores_object_id` reports; passing `false` there silently breaks
+  the 9.x and 10.x output.
 * End of elements: `i32 16` followed by sixteen `0xff`.
 * Version fields are `i16` up to JT 9.x and `u8` from 10.x on. Whether a class
   carries one at all is per class: `RangeLod`, `Shape` and `Instance` gate it
@@ -134,6 +190,15 @@ source:
   buffers. `tests/test_visual.py` renders the export of a source file against a
   reference picture; the same oracle applied to a written file scores
   1.00000 for all six samples.
+* **a revision change**: the banner, the TOC segment types and the representation
+  family are checked, the refusal of an impossible change is checked, and the
+  triangles of a re-encoded file are compared as a set of welded corner triples —
+  the only comparison that survives the coder re-ordering the vertex table.
+* **a shape without geometry**: a write that keeps only the finest tier leaves a
+  coarse `Shape` node with no late load at all, and its dump must still be valid
+  JSON. None of the five reference dumps has such a node, so the byte-for-byte
+  parity check cannot catch it and `jt::dump` closes an attribute list on a flag
+  instead of a constant comma.
 
 ## Open work
 

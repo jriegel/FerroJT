@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ferrojt::jt::{self, JtFile, LodGeometry, Property, WriteOptions};
+use ferrojt::jt::{self, JtFile, JtVersion, LodGeometry, Property, WriteOptions};
 
 /// What a sample looks like after a round trip.
 struct Expectation {
@@ -404,6 +404,100 @@ fn representation_count(file: &JtFile) -> usize {
         .count()
 }
 
+/// The world position of one corner of a representation, as the bits of its
+/// three coordinates. Welding by the bit pattern is what makes two vertex
+/// tables comparable when they are laid out differently.
+fn corner(shape: &LodGeometry, index: i32) -> Option<[u64; 3]> {
+    let at = usize::try_from(index).ok()?.checked_mul(3)?;
+    let xyz = shape.vertices.get(at..at + 3)?;
+    Some([
+        u64::from(xyz[0].to_bits()),
+        u64::from(xyz[1].to_bits()),
+        u64::from(xyz[2].to_bits()),
+    ])
+}
+
+/// Every triangle of the file as a sorted set of welded corner positions.
+///
+/// A revision change re-encodes the representations, and the topologically
+/// compressed coder of JT 9.x and 10.x keeps one vertex instance per triangle
+/// corner and orders them differently from the source. So only the triangle set
+/// can be compared across a revision — never the vertex table, never the raw
+/// bytes, and not the digest [`structure`] compares, which is order sensitive.
+/// Each triangle is rotated to start at its smallest corner, which makes the
+/// set independent of where a strip walk happens to begin.
+fn triangles(file: &JtFile) -> Vec<[u64; 9]> {
+    let graph = file.lsg.as_ref().expect("a scene graph");
+    let mut out = Vec::new();
+    for loaded in &graph.loaded {
+        let Some(shape) = loaded.element.geometry() else {
+            continue;
+        };
+        for triangle in shape.indices.chunks(3) {
+            if triangle.len() != 3 {
+                continue;
+            }
+            let Ok(corners) = <[Option<[u64; 3]>; 3]>::try_from(
+                triangle
+                    .iter()
+                    .map(|index| corner(shape, *index))
+                    .collect::<Vec<_>>(),
+            ) else {
+                continue;
+            };
+            let [Some(a), Some(b), Some(c)] = corners else {
+                continue;
+            };
+            let mut ring = [a, b, c];
+            let start = ring
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, corner)| *corner)
+                .map_or(0, |(at, _)| at);
+            ring.rotate_left(start);
+            let mut flat = [0u64; 9];
+            for (at, corner) in ring.iter().enumerate() {
+                flat[3 * at..3 * at + 3].copy_from_slice(corner);
+            }
+            out.push(flat);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The segment types of a file as a sorted histogram, so the way a rewrite
+/// names the levels of detail can be pinned.
+fn kinds(file: &JtFile) -> Vec<(i32, usize)> {
+    let mut counts: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+    for row in &file.toc {
+        *counts.entry(row.kind).or_default() += 1;
+    }
+    counts.into_iter().collect()
+}
+
+/// Read a file, write it at `version`, and read the result back.
+fn rewrite(path: &Path, version: &str) -> (JtFile, JtFile, Vec<u8>) {
+    let options = WriteOptions {
+        all_lods: true,
+        no_layer_filter: true,
+        version: Some(version.parse::<JtVersion>().expect("a supported revision")),
+        ..WriteOptions::default()
+    };
+    round_trip(path, &options)
+}
+
+/// A sample of `data/ExampleFiles` by name.
+fn sample(stem: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("the workspace root")
+        .join("data")
+        .join("ExampleFiles")
+        .join(stem)
+}
+
 /// A write that keeps everything has to reproduce the file: the same segments,
 /// the same structure, the same dump — and writing the result again has to
 /// change nothing.
@@ -621,4 +715,378 @@ fn an_impossible_filter_is_refused() {
         err.to_string().contains("nope"),
         "unexpected message: {err}"
     );
+}
+
+/// A rewrite that stays inside the representation family of the source keeps
+/// every segment: the revision only moves the version gates of the scene graph,
+/// so the shape segments are copied byte for byte and the triangles come back
+/// exactly as they were stored.
+#[test]
+fn a_revision_of_the_same_family_keeps_every_segment() {
+    // (sample, revisions to write it at, its own segment types, TOC rows,
+    //  nodes, representations)
+    let cases = [
+        (
+            "example_block_jt8.1.jt",
+            &["8.0", "8.1"][..],
+            vec![(1, 1), (3, 1), (4, 2), (7, 1), (8, 1), (9, 1)],
+            7,
+            10,
+            3,
+        ),
+        (
+            "example_block_jt9.5.jt",
+            &["9.5"][..],
+            vec![(1, 1), (3, 1), (4, 2), (6, 3), (17, 1)],
+            8,
+            10,
+            3,
+        ),
+        (
+            "example_block_jt10.3.jt",
+            &["10.1", "10.3"][..],
+            vec![
+                (1, 1),
+                (3, 1),
+                (4, 2),
+                (7, 1),
+                (8, 1),
+                (9, 1),
+                (17, 1),
+                (31, 1),
+            ],
+            9,
+            11,
+            3,
+        ),
+        (
+            "opening_protection_plate1_jt8.0.jt",
+            &["8.0", "8.1"][..],
+            vec![(1, 1), (4, 5), (7, 2), (8, 2), (9, 2), (10, 2), (17, 2)],
+            16,
+            25,
+            8,
+        ),
+        (
+            "opening_protection_plate1_jt9.5.jt",
+            &["9.5"][..],
+            vec![(1, 1), (3, 2), (4, 4), (6, 6), (17, 2)],
+            15,
+            21,
+            6,
+        ),
+        // A JT 9.5 file that names its shape segments 7 rather than 6: the
+        // segment type is a property of the file, not of its revision, so a
+        // write that keeps the major revision has to keep the rows verbatim.
+        (
+            "SampleJT_Server.jt",
+            &["9.5"][..],
+            vec![(1, 1), (4, 711), (7, 106), (31, 1)],
+            819,
+            2158,
+            106,
+        ),
+    ];
+    for (stem, revisions, want_kinds, toc_rows, nodes, representations) in cases {
+        let path = sample(stem);
+        for &revision in revisions {
+            let (file, again, _) = rewrite(&path, revision);
+            let label = format!("{stem} [{revision}]");
+            let (major, minor) = revision.split_once('.').expect("major.minor");
+            assert_eq!(
+                (major.parse::<u32>().unwrap(), minor.parse::<u32>().unwrap()),
+                (again.header.major, again.header.minor),
+                "{label}: the banner"
+            );
+            assert_eq!(toc_rows, again.toc.len(), "{label}: TOC rows");
+            assert_eq!(want_kinds, kinds(&again), "{label}: segment types");
+            let graph = again.lsg.as_ref().expect("a scene graph");
+            assert_eq!(nodes, graph.nodes.len(), "{label}: nodes");
+            assert_eq!(
+                representations,
+                representation_count(&again),
+                "{label}: representations"
+            );
+            assert_eq!(structure(&file), structure(&again), "{label}: structure");
+            assert_eq!(triangles(&file), triangles(&again), "{label}: triangles");
+        }
+    }
+}
+
+/// Asking for another family restructures the file: the scene graph, the header
+/// and the TOC table are written at the new revision, the segment types follow
+/// the naming of that revision, and every shape is re-encoded with its coder.
+///
+/// The topological coder of JT 9.x and 10.x keeps one vertex instance per
+/// triangle corner and lays the table out differently, so the vertex tables do
+/// not match — the triangles do, and that is what the picture depends on.
+#[test]
+fn another_family_re_names_the_segments_and_re_encodes_the_shapes() {
+    let cases = [
+        (
+            "example_block_jt9.5.jt",
+            "10.3",
+            vec![(1, 1), (3, 1), (4, 2), (7, 1), (8, 1), (9, 1), (17, 1)],
+            8,
+            10,
+        ),
+        (
+            "opening_protection_plate1_jt9.5.jt",
+            "10.3",
+            vec![(1, 1), (3, 2), (4, 4), (7, 2), (8, 2), (9, 2), (17, 2)],
+            15,
+            21,
+        ),
+    ];
+    for (stem, revision, want_kinds, toc_rows, nodes) in cases {
+        let path = sample(stem);
+        let (file, again, _) = rewrite(&path, revision);
+        let label = format!("{stem} [{revision}]");
+        assert_eq!(10, again.header.major, "{label}: the banner major");
+        assert_eq!(toc_rows, again.toc.len(), "{label}: TOC rows");
+        assert_eq!(want_kinds, kinds(&again), "{label}: segment types");
+        let graph = again.lsg.as_ref().expect("a scene graph");
+        assert_eq!(nodes, graph.nodes.len(), "{label}: nodes");
+        assert_eq!(
+            representation_count(&file),
+            representation_count(&again),
+            "{label}: representations"
+        );
+        assert_eq!(triangles(&file), triangles(&again), "{label}: triangles");
+
+        // The vertex table is what differs. The topological coder keeps one
+        // vertex instance per triangle corner, so a 24-vertex cube comes back
+        // as 36; the triangle count is unchanged, the table is not.
+        let before = structure(&file).geometry;
+        let after = structure(&again).geometry;
+        let indices = |rows: &[(usize, usize, usize, u64)]| -> Vec<usize> {
+            rows.iter().map(|row| row.0).collect()
+        };
+        let table = |rows: &[(usize, usize, usize, u64)]| -> Vec<usize> {
+            rows.iter().map(|row| row.1).collect()
+        };
+        assert_eq!(indices(&before), indices(&after), "{label}: index counts");
+        assert_ne!(
+            table(&before),
+            table(&after),
+            "{label}: the coder is expected to explode the vertex table"
+        );
+
+        // And the export view of the rewritten file is the export view of the
+        // source: the same parts with the same triangles.
+        let direct = file.to_model();
+        let model = again.to_model();
+        assert_eq!(
+            direct.nodes.len(),
+            model.nodes.len(),
+            "{label}: exported nodes"
+        );
+        assert_eq!(
+            direct.meshes.len(),
+            model.meshes.len(),
+            "{label}: exported meshes"
+        );
+        assert_eq!(
+            direct.triangle_count(),
+            model.triangle_count(),
+            "{label}: exported triangles"
+        );
+    }
+}
+
+/// The two representation families are not offered to each other: a file
+/// carries only the coder of its own era, so there is nothing to re-encode 8.x
+/// triangles into 9.x form with, or the other way round.
+#[test]
+fn the_two_representation_families_cannot_be_exchanged() {
+    let cases = [
+        ("example_block_jt8.1.jt", "10.3"),
+        ("example_block_jt8.1.jt", "9.5"),
+        ("opening_protection_plate1_jt8.0.jt", "9.5"),
+        ("example_block_jt9.5.jt", "8.1"),
+        ("opening_protection_plate1_jt9.5.jt", "8.0"),
+    ];
+    for (stem, revision) in cases {
+        let path = sample(stem);
+        let data = std::fs::read(&path).unwrap_or_else(|err| panic!("{stem}: {err}"));
+        let file = JtFile::read(&path, &data).unwrap_or_else(|err| panic!("{stem}: {err}"));
+        let options = WriteOptions {
+            version: Some(revision.parse::<JtVersion>().expect("a supported revision")),
+            ..WriteOptions::default()
+        };
+        let err =
+            jt::write_to_bytes(&file, &data, &options).expect_err("{stem} cannot become 10.x");
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot be written as JT")
+                && message.contains("only the coder of the revision of the source file"),
+            "{stem} -> {revision}: unexpected message: {message}"
+        );
+    }
+}
+
+/// A segment whose framing itself depends on the revision cannot be copied, so
+/// a rewrite that would have to move it is refused. JT 10.x added the info
+/// segment (type 31), which no 9.x file can hold.
+#[test]
+fn a_segment_of_another_revision_is_refused() {
+    let path = sample("example_block_jt10.3.jt");
+    let data = std::fs::read(&path).unwrap_or_else(|err| panic!("{}: {err}", name(&path)));
+    let file = JtFile::read(&path, &data).unwrap_or_else(|err| panic!("{}: {err}", name(&path)));
+    let options = WriteOptions {
+        version: Some("9.5".parse::<JtVersion>().expect("a supported revision")),
+        ..WriteOptions::default()
+    };
+    let err = jt::write_to_bytes(&file, &data, &options)
+        .expect_err("a 10.x info segment has no place in a 9.x file");
+    let message = err.to_string();
+    assert!(
+        message.contains("segment type 31") && message.contains("cannot be rewritten as JT 9.5"),
+        "unexpected message: {message}"
+    );
+}
+
+/// The topological coder of JT 9.x and 10.x only accepts a closed two-manifold.
+/// A tessellation with open edges or degenerate triangles does not survive the
+/// re-encode, and the rewrite is refused rather than written as a file whose
+/// shapes come back empty.
+#[test]
+fn a_mesh_that_the_coder_cannot_hold_is_refused() {
+    let path = sample("SampleJT_Server.jt");
+    let data = std::fs::read(&path).unwrap_or_else(|err| panic!("{}: {err}", name(&path)));
+    let file = JtFile::read(&path, &data).unwrap_or_else(|err| panic!("{}: {err}", name(&path)));
+    let options = WriteOptions {
+        version: Some("10.3".parse::<JtVersion>().expect("a supported revision")),
+        ..WriteOptions::default()
+    };
+    let err = jt::write_to_bytes(&file, &data, &options)
+        .expect_err("the server sample has open edges, so its shapes cannot be re-encoded");
+    let message = err.to_string();
+    assert!(
+        message.contains("cannot be written as JT 10.3")
+            && message.contains("the mesh is not a closed two-manifold"),
+        "unexpected message: {message}"
+    );
+}
+
+/// Leaving `version` out keeps the revision of the source, which is what makes
+/// the rewrite lossless: the segments in between are copied byte for byte.
+#[test]
+fn no_revision_keeps_the_revision_of_the_source() {
+    for path in samples() {
+        let (file, again, _) = round_trip(&path, &lossless_variants()[0].1);
+        let label = name(&path);
+        assert_eq!(
+            (file.header.major, file.header.minor),
+            (again.header.major, again.header.minor),
+            "{label}: the banner"
+        );
+        assert_eq!(contents(&file), contents(&again), "{label}: segments");
+    }
+}
+
+/// An unsupported revision is refused before anything is written, and a bare
+/// major version means the default minor of that revision.
+#[test]
+fn an_unsupported_revision_is_refused() {
+    // The version is rejected where it is parsed, so nothing is written.
+    for bad in ["7", "7.5", "11", "11.0"] {
+        let err = bad
+            .parse::<JtVersion>()
+            .expect_err("JT {bad} cannot be written");
+        assert!(
+            err.to_string()
+                .contains("cannot be written, only 8.x, 9.x and 10.x"),
+            "{bad}: unexpected message: {err}"
+        );
+    }
+    assert!("nonsense".parse::<JtVersion>().is_err());
+
+    // A bare major picks the default minor of that revision.
+    assert_eq!(
+        "9".parse::<JtVersion>().expect("a version").to_string(),
+        "9.5".parse::<JtVersion>().expect("a version").to_string()
+    );
+    assert_eq!(
+        "10".parse::<JtVersion>().expect("a version").to_string(),
+        "10.3".parse::<JtVersion>().expect("a version").to_string()
+    );
+    assert_eq!(JtVersion::default().to_string(), "10.3");
+}
+
+/// A write that keeps only the finest tier leaves a coarse `Shape` node with
+/// no late loads at all, so its dump has attributes but no geometry. The
+/// attribute list must not end in a dangling comma there: none of the five
+/// reference dumps has such a node, which is why the reference comparison
+/// cannot catch it.
+#[test]
+fn a_shape_without_geometry_still_dumps_as_valid_json() {
+    let path = sample("example_block_jt9.5.jt");
+    let (file, again, _) = round_trip(&path, &WriteOptions::default());
+    assert_eq!(
+        representation_count(&file),
+        3,
+        "the source keeps every tier"
+    );
+    assert_eq!(representation_count(&again), 1, "only the finest tier");
+
+    let text = dump(&again);
+    let value: serde_json::Value =
+        serde_json::from_str(&text).expect("the dump of a filtered write must be JSON");
+
+    // The geometry of the tier that survived is still there, and nothing else
+    // gained or lost a representation.
+    let root = value.get("LSG").expect("the scene graph");
+    let counted = |key: &str| -> usize {
+        let mut stack = vec![root];
+        let mut found = 0;
+        while let Some(node) = stack.pop() {
+            found += usize::from(node.get(key).is_some());
+            if let Some(children) = node.get("children").and_then(serde_json::Value::as_array) {
+                stack.extend(children);
+            }
+        }
+        found
+    };
+    assert_eq!(
+        counted("jt_type"),
+        10,
+        "every node of the graph is still dumped"
+    );
+    assert_eq!(
+        counted("NumIndices"),
+        1,
+        "only the finest tier of the block carries geometry"
+    );
+
+    // The nodes that lost their representation are still nodes, and they still
+    // carry their material attribute — that is the attribute list which must
+    // not end in a dangling comma when no geometry follows it.
+    let shapes: Vec<&serde_json::Value> = {
+        let mut stack = vec![root];
+        let mut found = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.get("jt_type").and_then(serde_json::Value::as_str) == Some("TriStripSet") {
+                found.push(node);
+            }
+            if let Some(children) = node.get("children").and_then(serde_json::Value::as_array) {
+                stack.extend(children);
+            }
+        }
+        found
+    };
+    assert_eq!(shapes.len(), 3, "all three LOD shapes of the block survive");
+    let with_material = shapes
+        .iter()
+        .filter(|shape| shape.get("Attribute_MaterialDiffuseColor").is_some())
+        .count();
+    assert_eq!(
+        with_material, 3,
+        "a shape that lost its geometry keeps its attributes"
+    );
+    let with_geometry = shapes
+        .iter()
+        .filter(|shape| shape.get("NumIndices").is_some())
+        .count();
+    assert_eq!(with_geometry, 1, "only the finest tier kept geometry");
 }

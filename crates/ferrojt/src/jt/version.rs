@@ -104,6 +104,28 @@ impl JtVersion {
     pub const fn has_topological_representation(&self) -> bool {
         self.major >= 9
     }
+
+    /// True when a file written at `self` may be rewritten at `other`.
+    ///
+    /// JT stores triangle data either in the vertex-based lossless
+    /// representation (up to JT 8.x) or in the topologically compressed one
+    /// (from JT 9.0 on), and a file carries only the coder of its own era.
+    /// Re-encoding across that boundary needs a mesh that is a closed
+    /// two-manifold without degenerate triangles, which most real CAD
+    /// tessellations are not, so it is not offered: the 8.x family and the
+    /// 9.x/10.x family are the only mutually compatible groups.
+    ///
+    /// ```
+    /// use ferrojt::jt::JtVersion;
+    ///
+    /// assert!(JtVersion::V8_1.compatible(JtVersion::V8_0));
+    /// assert!(JtVersion::V9_5.compatible(JtVersion::V10_3));
+    /// assert!(!JtVersion::V8_1.compatible(JtVersion::V10_3));
+    /// ```
+    #[must_use]
+    pub const fn compatible(&self, other: Self) -> bool {
+        (self.major < 9) == (other.major < 9)
+    }
 }
 
 impl Default for JtVersion {

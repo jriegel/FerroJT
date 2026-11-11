@@ -8,7 +8,7 @@ JT. Read this before changing code; the design detail lives in `docs/`.
 
 | Path | What it is |
 | --- | --- |
-| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `jt/write.rs` the JT writer, `jt/build.rs` the builder that creates a file from nothing, and `export/` glTF/GLB writer and the ASCII USD writer. |
+| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `jt/version.rs` the `JtVersion` a file is read or written at, `jt/encode.rs` the topological (dual vertex-face) encoder, `jt/write.rs` the JT writer, `jt/build.rs` the builder that creates a file from nothing, and `export/` glTF/GLB writer and the ASCII USD writer. |
 | `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `write`, `ls`. |
 | `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `lib.rs` is the export view (`Model`) plus `lsg.rs` the file view (`JtLsg`/`JtNode`/`JtMesh`/`JtArray`) and `build.rs` the builder (`JtBuilder`/`NodeHandle`/`MeshHandle`/`MeshData`/`MaterialData`); `pyproject.toml` + `python/ferrojt/` + `tests/`. |
 | `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `details.rs` key/value pane for the selected row, `backdrop.rs` viewport gradient, `camera.rs` `Camera3d` wrapper that places the backdrop, `picking.rs`, `trihedron.rs`. |
@@ -33,6 +33,13 @@ sweep needs `--force`):
 
 ```powershell
 cargo run -p ferrojt-cli -- write data\ExampleFiles\example_block_jt9.5.jt -o target\out.jt --force
+```
+
+The same at another revision — `--jt-version` (8.x/9.x/10.x, and a family change
+is refused, see below):
+
+```powershell
+cargo run -p ferrojt-cli -- write data\ExampleFiles\example_block_jt9.5.jt -o target\out103.jt --force --jt-version 10.3
 ```
 
 Build a file from nothing (the builder, not the writer):
@@ -65,7 +72,7 @@ without it):
 ```
 
 Interactive viewer (also needs `open3d`; it is a tool, not a test — nothing in it
-is named `test_*`, so pytest still collects 80 tests):
+is named `test_*`, so pytest still collects 91 tests):
 
 ```powershell
 .\.venv\Scripts\python.exe tests\test_viewer.py data\ExampleFiles\example_block_jt9.5.jt
@@ -660,10 +667,81 @@ Upload with `python -m twine upload dist\*`.
   therefore compares `values()` (every property that is *not* a late load) for
   equality and `late_loads()` as `<=` — asserting the whole property list equal
   is wrong.
-- **The builder (`jt/build.rs`) emits JT 8.1 only.** The dual vertex-face coder
-  of JT 9.x/10.x has no encoder here, so a from-scratch file uses the
-  vertex-based **lossless** representation (`params[0] == 0`), the null codec
-  (byte 0) for the strip offsets, and DEFLATE for the payload. `Format::Jt`
+- **The revision a file is written at is `jt::JtVersion`** (`jt/version.rs`,
+  re-exported, `Default = V10_3`). Consts `V8_0/V8_1/V9_5/V10_3`; the gates are
+  methods — `offsets_are_32_bit()` (<10), `versions_are_bytes()` (≥10),
+  `has_object_versions()` (>8), `has_attribute_trailer()` (≥10),
+  `has_vertex_based_representation()` (<9), `has_topological_representation()` (≥9)
+  — and `compatible(other)` is `(major < 9) == (other.major < 9)`. **`FromStr`
+  calls `validate()` itself**, so `"7".parse::<JtVersion>()` is an `Err` and a
+  bare major fills in 8.1 / 9.5 / 10.3; CLI `--jt-version` and Python
+  `version=` therefore never see an unsupported value.
+- **The writer keeps the revision of the source when `version` is `None`** —
+  that is what makes the rewrite lossless, so do not "make it consistent" with
+  the builder's 10.3 default. A **family change** (8.x ↔ 9.x/10.x) is refused:
+  `a JT {src} file cannot be written as JT {v}: JT 8.x stores its triangles in
+  the vertex based representation, JT 9.x and 10.x in the topologically
+  compressed one, and only the coder of the revision of the source file is
+  available`. A **major** change sets `restructured = version.major !=
+  source.major`, which re-names the shape segments (`segment_kinds`) and
+  re-encodes them; a same-revision write must leave both alone or the server
+  sample's kind-7 rows become 6 and the write tests fail.
+- **"9.x names every shape segment type 6" is per file, not per revision.**
+  `example_block_jt9.5` stores 6,6,6 and plate1-9.5 six kind-6 rows, but
+  `SampleJT_Server.jt` is a 9.5 file storing its 106 shape segments as kind 7.
+  That is why the whole restructure is gated on `restructured`.
+- **A non-LSG element envelope carries an object id from JT 9.x on**: pass
+  `element_stores_object_id(major)` (i.e. `major > 8`) to
+  `read_element_envelope`, never a literal `false` — reverting that breaks the
+  builder's 9.x/10.x output in 6 tests. It is re-exported from `jt/mod.rs`
+  because rustdoc warns about intra-doc links to private items.
+- **`write.rs::write_property_atom` parses an atom with the framing of the
+  SOURCE revision** (`self.file.header.major`) and re-serialises it with the
+  target's. Parsing with the target gates gives
+  `length N exceeds the remaining M bytes` (`reader.rs::read_len`).
+- **The topological coder explodes and re-orders the vertex table.** For
+  block-9.5 → 10.3 the float count goes 72 → 108 per representation and
+  `JtMesh.vertex_count` (the **unique** count) 24 → 36; index counts do not
+  change. Never compare geometry across revisions as bytes, as a digest of
+  `indices/vertices/normals`, or order-sensitively — compare an
+  **order-insensitive set of triangles** (`tests/write.rs::triangles`,
+  `tests/test_ferrojt.py::triangle_set`). `normal_binding` is `Some(1)` for an
+  8.x shape and `None` for a 9.x/10.x one.
+- **`jt/encode.rs` builds the fan order around a coder vertex by crossing
+  shared edges** (`across: HashMap<(i32,i32), Vec<i32>>`), never by sorting the
+  triangles by angle in a tangent plane: a screw thread projects onto its own
+  fan, an angular sort names non-adjacent triangles, and the dual walk dies with
+  "the dual walk placed a triangle twice". Encodability is
+  `bad_edges == 0 && doubled == 0 && unused == 0 && low_degree == 0` on welded
+  positions — `euler == 2` is **not** the criterion (plate1's screws are genus 1,
+  `euler = -2`, and encode fine). `SampleJT_Server.jt` has thousands of bad
+  edges, so it can only be written as 9.x, never 10.x.
+- **A written file is framed tighter than its source**: `ferrojt-cli info` warns
+  35 "bytes remained" times on source plate1-9.5 and 23 on the written 10.3
+  file, because the source declares trailing bytes no reader reads. Documented,
+  deliberately not reproduced — the pictures are identical (1.00000).
+- **A filtered write leaves a `Shape` node with zero late loads** (`walk()` skips
+  the coarse tiers), and `dump.rs` must not then emit a dangling comma: the
+  `ShapeTriStripSet` branch collects its geometry up front and passes a `comma`
+  flag to `handle_attributes`, whose terminators come from
+  `terminator(comma, following)`. None of the five reference dumps hits the case
+  (their `TriStripSet` count equals their `NumIndices` count), so this fix cannot
+  break byte parity — and `JtFile.toc()` returns invalid JSON without it.
+- **`JtMesh.vertex_count` (unique) ≠ `LodGeometry.vertices.len()` (floats).**
+  Pinning the wrong one makes a Python test assert 72/108 where the API reports
+  24/36.
+- **A bare `write` of block-9.5** (no options) keeps the revision but only the
+  finest tier: 6 TOC rows `[1,3,4,4,6,17]`, 10 nodes, 1 representation,
+  12 triangles. Pinned in both `tests/write.rs` and `tests/test_ferrojt.py` —
+  a "keeps the revision" test must pass `all_lods=True, all_layers=True` to see
+  all 8 rows.
+- **The builder (`jt/build.rs`) defaults to JT 10.3** and emits the topological
+  (tri-strip-set) representation there; `set_version`/`version` (Rust) and the
+  `version` property plus `set_version()` (Python) pick 8.x/9.x instead. Banner
+  `Version 10.3 JT`, header 109 bytes (LSG at 109) for 10.x against 105 for
+  8.x/9.x. A 9.x/10.x mesh must be a **closed two-manifold** — an open shell is
+  refused with "the mesh is not a closed two-manifold, so it cannot be written
+  as JT 9.x/10.x", and only JT 8.x can hold it. `Format::Jt`
   stays `Error::UnsupportedFormat("jt (write)")` in `export/mod.rs` — the
   builder builds its own graph, it does not consume a `Model`.
 - **A JT 8.x shape cannot share a vertex slot, and the strip walk renumbers the
@@ -689,6 +767,12 @@ Upload with `python -m twine upload dist\*`.
   accessor is `class_of` (`#[pyo3(name = "class_of")]`) and `add_node`'s
   parameter is `class_name`; `add_shape(parent, mesh, *, name=None)`.
   `MeshData.bounds` returns a **list** of six, not a tuple.
+- **Python writing entry points**: `JtFile.write_jt(path, *, layer_filter=None,
+  all_layers=False, all_lods=False, compress=False, version=None)` and
+  `JtBuilder.version` / `set_version()`. `version` is a **string** (`"10.3"`,
+  `"9"` → 9.5) because pyo3 0.30 cannot express a tri-state `Option<Option<&str>>`
+  keyword. `JtFile.model()` and `ferrojt.open/read` still have **no `all_lods`** —
+  every LOD tier is only reachable through `jt.lsg.meshes()` in Python.
 - **Picture parity for a written file must be measured one process per picture**
   and compared as PNGs: for the ~1M-triangle server mesh Open3D returns
   permanent all-zero frames partway through a process, so retrying inside one
@@ -727,6 +811,6 @@ representation codecs re-encoded, so `Format::Jt` stays
 `Error::UnsupportedFormat("jt (write)")` in `export/mod.rs`), and keeping the
 source TOC position instead of always appending the table —
 `docs/jt-writer.md` holds the details. The builder (`jt/build.rs`) creates a file
-from nothing but only as JT 8.1 — `docs/jt-builder.md` lists what is still open
-there (9.x/10.x coders, XZ, key/value properties, layer filters).
+from nothing at JT 10.3 by default (8.x/9.x on request) — `docs/jt-builder.md`
+lists what is still open there (XZ, key/value properties, layer filters).
 macOS and ARM wheels need CI (`maturin generate-ci github`).

@@ -48,6 +48,17 @@ const BASE_PROPERTY_LATE_LOADED: u8 = 8;
 /// Base type byte of an element atom.
 const BASE_ELEMENT: u8 = 4;
 /// Segment type of the representation segments the builder emits.
+///
+/// JT 9.x names every representation segment type 6 ("Shape"); JT 8.x and
+/// 10.x number them by level of detail, and the builder writes only LOD0.
+fn shape_segment_kind(version: JtVersion) -> i32 {
+    if version.major == 9 {
+        6
+    } else {
+        SHAPE_SEGMENT_KIND
+    }
+}
+/// Segment type of the representation segments of a JT 8.x or 10.x file.
 const SHAPE_SEGMENT_KIND: i32 = 7;
 /// Bytes between the length field and the body of an atom outside the LSG.
 ///
@@ -55,7 +66,7 @@ const SHAPE_SEGMENT_KIND: i32 = 7;
 /// object id and counts 21 envelope bytes. A representation segment numbers
 /// its objects only from JT 9.x on, so its length counts only the GUID and the
 /// base type byte before that — see [`read_element_envelope`].
-fn element_envelope(major: u32) -> usize {
+pub(crate) fn element_envelope(major: u32) -> usize {
     if major > 8 { 16 + 1 + 4 } else { 16 + 1 }
 }
 /// Bytes between the body of a segment and its declared size when the segment
@@ -721,9 +732,10 @@ impl JtBuilder {
         let payload = if self.compress { deflate(&body)? } else { body };
 
         let mut segments: Vec<Vec<u8>> = Vec::with_capacity(plan.shapes.len() + 1);
+        let kind = shape_segment_kind(version);
         segments.push(segment_bytes(ORDER, &lsg_guid, 1, &payload, self.compress)?);
         for (shape, element) in plan.shapes.iter().zip(&plan.representations) {
-            segments.push(shape_segment(shape.guid, element));
+            segments.push(shape_segment(shape.guid, kind, element));
         }
 
         let sizes: usize = segments.iter().map(|bytes| bytes.len()).sum();
@@ -744,7 +756,7 @@ impl JtBuilder {
                 guid: self.segment_guid(pos),
                 offset: offset as u64,
                 length: bytes.len() as u32,
-                kind: if pos == 0 { 1 } else { 7 },
+                kind: if pos == 0 { 1 } else { kind },
             });
             offset += bytes.len();
             out.extend_from_slice(bytes);
@@ -942,7 +954,11 @@ impl JtBuilder {
                     guid: types::PROPERTY_LATE_LOADED,
                     base: BASE_PROPERTY_LATE_LOADED,
                     id: value,
-                    body: late_load_body(&shape.guid, SHAPE_SEGMENT_KIND, self.version)?,
+                    body: late_load_body(
+                        &shape.guid,
+                        shape_segment_kind(self.version),
+                        self.version,
+                    )?,
                 });
                 pairs.push((shape_key, value));
             }
@@ -1060,12 +1076,15 @@ impl JtBuilder {
 }
 
 /// Frame one representation as the body of a shape segment.
-fn shape_segment(guid: Guid, element: &[u8]) -> Vec<u8> {
+///
+/// `kind` is the segment type of the TOC row: JT 9.x uses 6 ("Shape") for
+/// every level of detail, JT 8.x and 10.x use 7 to 16 for LOD0 to LOD9.
+pub(crate) fn shape_segment(guid: Guid, kind: i32, element: &[u8]) -> Vec<u8> {
     let mut segment: Vec<u8> = Vec::new();
     let total = PLAIN_SEGMENT_ENVELOPE + element.len() + 20;
     write_guid(&mut segment, ORDER, &guid).expect("writing to a vector cannot fail");
     segment
-        .write_i32_value(7, ORDER)
+        .write_i32_value(kind, ORDER)
         .expect("writing to a vector cannot fail");
     segment
         .write_i32_value(total as i32, ORDER)
@@ -1376,7 +1395,7 @@ fn late_load_body(segment: &Guid, kind: i32, version: JtVersion) -> Result<Vec<u
 /// representation, JT 9.x and 10.x the topologically compressed one. A
 /// representation segment numbers its objects only from JT 9.x on, so its atom
 /// carries an object id only there — and the length counts it accordingly.
-fn representation(mesh: &MeshData, version: JtVersion) -> Result<Vec<u8>> {
+pub(crate) fn representation(mesh: &MeshData, version: JtVersion) -> Result<Vec<u8>> {
     let body = if version.has_topological_representation() {
         topological_body(mesh, version)?
     } else {
@@ -1400,7 +1419,7 @@ fn representation(mesh: &MeshData, version: JtVersion) -> Result<Vec<u8>> {
 /// The encoder writes everything up to the two payloads; the element appends
 /// its own trailing version after the representation, which is the order the
 /// reader uses.
-fn topological_body(mesh: &MeshData, version: JtVersion) -> Result<Vec<u8>> {
+pub(crate) fn topological_body(mesh: &MeshData, version: JtVersion) -> Result<Vec<u8>> {
     let mut body: Vec<u8> = Vec::new();
     write_topological_body(mesh, version, &mut body)?;
     write_version(&mut body, ORDER, version.major, 1)?;
@@ -1408,7 +1427,7 @@ fn topological_body(mesh: &MeshData, version: JtVersion) -> Result<Vec<u8>> {
 }
 
 /// The body of a JT 8.x vertex based representation, envelope excluded.
-fn vertex_body(mesh: &MeshData, version: JtVersion) -> Result<Vec<u8>> {
+pub(crate) fn vertex_body(mesh: &MeshData, version: JtVersion) -> Result<Vec<u8>> {
     let major = version.major;
     let strips = mesh.indices().len() / 3;
     let with_normals = !mesh.normals().is_empty();

@@ -82,6 +82,16 @@ class JtFile:
         layer_filter: str | None = ...,
         all_layers: bool = ...,
     ) -> bool: ...
+    def write_jt(
+        self,
+        path: str,
+        *,
+        layer_filter: str | None = ...,
+        all_layers: bool = ...,
+        all_lods: bool = ...,
+        compress: bool = ...,
+        version: str | None = ...,
+    ) -> bool: ...
     def model(
         self, *, layer_filter: str | None = ..., all_layers: bool = ...
     ) -> Model: ...
@@ -364,7 +374,8 @@ class JtBuilder:
 
     The graph starts as a root ``Partition``; add nodes with :meth:`add_node`,
     shapes with :meth:`add_shape`, and share a subtree with
-    :meth:`instance_of`. :meth:`save` writes the file as JT 8.1.
+    :meth:`instance_of`. :meth:`save` writes the file at the revision of
+    :attr:`version`, which is JT 10.3 until it is changed.
     """
 
     def __init__(self) -> None: ...
@@ -377,6 +388,19 @@ class JtBuilder:
     def compress(self) -> bool: ...
     @compress.setter
     def compress(self, value: bool) -> None: ...
+    @property
+    def version(self) -> str:
+        """The JT revision the file is written at, as ``"major.minor"``."""
+    @version.setter
+    def version(self, value: str) -> None: ...
+    def set_version(self, value: str) -> None:
+        """Write the file at revision `value`: ``"8.0"``, ``"8.1"``, ``"9.5"``
+        or ``"10.3"``, or a bare major for the default minor of that revision.
+
+        A mesh of a 9.x or 10.x file has to be a closed two-manifold, since
+        that is the only thing the topologically compressed coder accepts; a
+        mesh that is not can still be written as 8.x.
+        """
 
     def root(self) -> NodeHandle: ...
     def add_node(

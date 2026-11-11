@@ -7,8 +7,8 @@ does. They are not a specification of the JT format itself.
 | --- | --- |
 | [architecture.md](architecture.md) | How the crates, the neutral model and the readers/writers fit together. |
 | [jt-reader.md](jt-reader.md) | The contract the OpenJT reader satisfies: entry points, submodules, output rules, layer filters and tests. |
-| [jt-writer.md](jt-writer.md) | Writing a JT file back out: what is re-serialised and what is copied, the renumbering rules, the framing facts and the round-trip contract. |
-| [jt-builder.md](jt-builder.md) | Creating a JT file from nothing: the JT 8.1 layout, why a mesh is exploded, the strip permutation and what a builder rejects. |
+| [jt-writer.md](jt-writer.md) | Writing a JT file back out: what is re-serialised and what is copied, the renumbering rules, choosing the JT revision, the framing facts and the round-trip contract. |
+| [jt-builder.md](jt-builder.md) | Creating a JT file from nothing: the default JT 10.3 layout and the 8.x one, why a mesh is exploded, the strip permutation and what a builder rejects. |
 | [dump.md](dump.md) | The JT native JSON dump: config bits, `%g` formatting and how the reference dumps are compared. |
 | [usd-writer.md](usd-writer.md) | The model → USD mapping, how meshes are written once and referenced, and how materials are deduplicated. |
 

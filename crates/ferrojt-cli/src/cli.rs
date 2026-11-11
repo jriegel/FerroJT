@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use ferrojt::jt::JtVersion;
 use ferrojt::model::Format;
 use ferrojt::{Error, Model};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -149,9 +150,23 @@ pub struct WriteArgs {
     #[arg(long)]
     pub compress: bool,
 
+    /// Rewrite the file at another JT revision: 8.0, 8.1, 9.5 or 10.3. Without
+    /// this the file keeps the revision it was read at, which is lossless. Only
+    /// revisions of the same family can be exchanged: an 8.x file stores its
+    /// triangles in the vertex based representation, a 9.x or 10.x file in the
+    /// topologically compressed one, and only the coder of the source revision
+    /// is available.
+    #[arg(long, value_name = "VERSION", value_parser = parse_jt_version)]
+    pub jt_version: Option<JtVersion>,
+
     /// Replace the output file if it exists.
     #[arg(short = 'y', long)]
     pub force: bool,
+}
+
+/// Parse a JT revision for `--jt-version`.
+fn parse_jt_version(text: &str) -> Result<JtVersion, String> {
+    text.parse::<JtVersion>().map_err(|err| err.to_string())
 }
 
 /// Formats `ferrojt` can write.
@@ -334,6 +349,7 @@ pub fn write(args: &WriteArgs) -> Result<()> {
         no_layer_filter: args.no_layer_filter,
         layer_filter: args.layer_filter.clone(),
         compress: args.compress,
+        version: args.jt_version,
     };
     let bar = spinner("JT");
     ferrojt::jt::write_to_file(&file, &output, &options)

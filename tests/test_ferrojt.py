@@ -794,3 +794,203 @@ def test_the_file_view_keeps_a_representation_without_vertices() -> None:
         assert data.size == 0
         assert data.dtype == (numpy.int32 if name == "indices" else numpy.float32)
         assert memoryview(array).nbytes == 0
+
+
+# ---------------------------------------------------------------------------
+# Writing a file back out at the revision of the caller's choice.
+#
+# JT frames nearly everything by major version and stores its triangles in one
+# of two representations: 8.x uses the vertex-based lossless one, 9.x and 10.x
+# the topologically compressed coder. A rewrite therefore stays inside the
+# family of the source, and inside a family it only moves the version gates.
+# ---------------------------------------------------------------------------
+
+
+def triangle_set(path: str) -> list[tuple[bytes, bytes, bytes]]:
+    """Every triangle of a file as the bytes of its three corner positions.
+
+    Each triangle is rotated to start at its smallest corner and the whole list
+    is sorted, so the set does not depend on how a representation lays out its
+    vertex table. That is the only comparison that survives a revision change:
+    the topological coder of JT 9.x and 10.x keeps one vertex instance per
+    triangle corner and orders them differently from the source.
+    """
+    numpy = pytest.importorskip("numpy")
+    jt = ferrojt.JtFile(path)
+    assert jt.open()
+    out = []
+    for mesh in jt.lsg.meshes():
+        if mesh.is_empty:
+            continue
+        vertices = numpy.asarray(mesh.array("vertices")).reshape(-1, 3)
+        for triangle in numpy.asarray(mesh.array("indices")).reshape(-1, 3):
+            corners = [vertices[index].tobytes() for index in triangle]
+            start = min(range(3), key=lambda at: corners[at])
+            out.append(tuple(corners[(start + at) % 3] for at in range(3)))
+    return sorted(out)
+
+
+def toc_of(path: str) -> dict[str, object]:
+    """The version banner and the segment types of a file."""
+    jt = ferrojt.JtFile(path)
+    assert jt.open()
+    return json.loads(jt.toc())
+
+
+@needs_sample
+def test_a_write_without_a_revision_keeps_the_revision_of_the_source(tmp_path) -> None:
+    source = tmp_path / "block.jt"
+    source.write_bytes(BLOCK_95.read_bytes())
+
+    jt = ferrojt.JtFile(str(source))
+    assert jt.open()
+    target = tmp_path / "again.jt"
+    assert jt.write_jt(str(target), all_lods=True, all_layers=True) is True
+
+    toc = toc_of(str(target))
+    assert (toc["MajorVersion"], toc["MinorVersion"]) == ("9", "5")
+    assert len(toc["TocTable"]) == 8
+    assert triangle_set(str(target)) == triangle_set(str(BLOCK_95))
+
+
+@needs_sample
+def test_a_write_without_a_revision_drops_the_coarse_levels_of_detail(
+    tmp_path,
+) -> None:
+    """The default is the export view, not a copy.
+
+    Leaving ``all_lods`` out keeps only the finest tier, which is what an
+    exporter wants — and it is what makes the rewrite smaller than the source.
+    The revision still stays at 9.5, because keeping it is what allows the
+    segments in between to be copied byte for byte.
+    """
+    jt = ferrojt.JtFile(str(BLOCK_95))
+    assert jt.open()
+    target = tmp_path / "finest.jt"
+    assert jt.write_jt(str(target)) is True
+
+    toc = toc_of(str(target))
+    assert (toc["MajorVersion"], toc["MinorVersion"]) == ("9", "5")
+    assert len(toc["TocTable"]) == 6, "two shape segments less than the source"
+
+    again = ferrojt.JtFile(str(target))
+    assert again.open()
+    assert again.lsg.node_count == 10, "no node is ever dropped"
+    assert again.lsg.representation_count == 1
+    assert again.model().triangle_count == 12
+    # The nodes that lost their representation are still dumped, and their
+    # attributes still close the object cleanly.
+    assert json.loads(again.json())["LSG"] is not None
+
+
+@needs_plate95
+def test_a_file_can_be_written_at_another_revision(tmp_path) -> None:
+    jt = ferrojt.JtFile(str(PLATE_95))
+    assert jt.open()
+    target = tmp_path / "plate10.jt"
+    assert jt.write_jt(str(target), all_lods=True, all_layers=True, version="10.3") is True
+
+    toc = toc_of(str(target))
+    assert (toc["MajorVersion"], toc["MinorVersion"]) == ("10", "3")
+    assert len(toc["TocTable"]) == 15
+    # JT 10.x names its levels of detail by segment type 7, 8 and 9; the 9.5
+    # source calls all six of them type 6.
+    kinds = sorted(row[1] for row in toc["TocTable"])
+    assert kinds == [1, 3, 3, 4, 4, 4, 4, 7, 7, 8, 8, 9, 9, 17, 17]
+
+    again = ferrojt.JtFile(str(target))
+    assert again.open()
+    assert again.lsg.node_count == 21
+    assert again.lsg.representation_count == 6
+    assert sum(mesh.triangle_count for mesh in again.lsg.meshes()) == 922
+    assert triangle_set(str(target)) == triangle_set(str(PLATE_95))
+
+
+@needs_sample
+def test_a_revision_change_explodes_the_vertex_table(tmp_path) -> None:
+    numpy = pytest.importorskip("numpy")
+    jt = ferrojt.JtFile(str(BLOCK_95))
+    assert jt.open()
+    target = tmp_path / "block10.jt"
+    assert jt.write_jt(str(target), all_lods=True, all_layers=True, version="10.3") is True
+
+    again = ferrojt.JtFile(str(target))
+    assert again.open()
+    before = sorted(mesh.index_count for mesh in jt.lsg.meshes())
+    after = sorted(mesh.index_count for mesh in again.lsg.meshes())
+    assert before == after, "the coder keeps the triangle count"
+
+    # The vertex table is what the coder changes: a 24-corner cube comes back
+    # as 36 instances per representation, because the dual walk keeps one
+    # vertex instance per triangle corner. The index count, and therefore the
+    # triangle count, is untouched.
+    def tables(graph) -> list[int]:
+        return sorted(mesh.vertex_count for mesh in graph.meshes())
+
+    assert tables(jt.lsg) == [24, 24, 24]
+    assert tables(again.lsg) == [36, 36, 36]
+    assert numpy.asarray(again.lsg.meshes()[0].array("indices")).tolist() == list(range(36))
+
+
+@needs_sample
+def test_the_two_representation_families_cannot_be_exchanged(tmp_path) -> None:
+    want = "only the coder of the revision of the source file"
+    for name, revision in [
+        ("example_block_jt8.1.jt", "10.3"),
+        ("example_block_jt9.5.jt", "8.1"),
+        ("opening_protection_plate1_jt8.0.jt", "9.5"),
+    ]:
+        jt = ferrojt.JtFile(str(SAMPLES / name))
+        assert jt.open()
+        with pytest.raises(ValueError, match=want):
+            jt.write_jt(str(tmp_path / f"{name}-{revision}.jt"), version=revision)
+
+
+@needs_server
+def test_a_mesh_the_coder_cannot_hold_is_refused(tmp_path) -> None:
+    """The topological coder needs a closed two-manifold.
+
+    ``SampleJT_Server.jt`` is a real CAD assembly with open edges, so its
+    shapes cannot be re-encoded — the write is refused rather than producing a
+    file whose shapes come back empty.
+    """
+    jt = ferrojt.JtFile(str(SERVER))
+    assert jt.open()
+    with pytest.raises(ValueError, match="not a closed two-manifold"):
+        jt.write_jt(str(tmp_path / "server10.jt"), version="10.3")
+
+    # A segment whose framing depends on the revision cannot be copied either:
+    # JT 10.x added the info segment, which no 9.x file can hold.
+    block = ferrojt.JtFile(str(SAMPLES / "example_block_jt10.3.jt"))
+    assert block.open()
+    with pytest.raises(ValueError, match="segment type 31"):
+        block.write_jt(str(tmp_path / "block95.jt"), version="9.5")
+
+
+@needs_sample
+def test_an_unsupported_revision_is_refused(tmp_path) -> None:
+    jt = ferrojt.JtFile(str(BLOCK_95))
+    assert jt.open()
+
+    with pytest.raises(ValueError, match="cannot be written"):
+        jt.write_jt(str(tmp_path / "nope.jt"), version="11")
+    with pytest.raises(ValueError, match="is not a JT version number"):
+        jt.write_jt(str(tmp_path / "nope.jt"), version="nonsense")
+
+    # A bare major picks the minor this crate writes for that revision.
+    target = tmp_path / "bare.jt"
+    assert jt.write_jt(str(target), version="9") is True
+    assert toc_of(str(target))["MinorVersion"] == "5"
+
+
+@needs_sample
+def test_write_jt_rejects_an_impossible_layer_choice(tmp_path) -> None:
+    jt = ferrojt.JtFile(str(BLOCK_95))
+    assert jt.open()
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        jt.write_jt(str(tmp_path / "clash.jt"), layer_filter="ALL", all_layers=True)
+    with pytest.raises(ValueError, match="nope"):
+        jt.write_jt(str(tmp_path / "nope.jt"), layer_filter="nope")
+    assert not (tmp_path / "clash.jt").exists()
+    assert not (tmp_path / "nope.jt").exists()

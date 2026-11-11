@@ -1558,11 +1558,15 @@ pub struct RawElement {
 
 /// Read the envelope of one element, leaving the cursor on its body.
 ///
-/// `lsg` selects the LSG segment layout, which always stores an object id;
-/// other segments store one only from JT 9.x on.
+/// `store_object_id` says whether the table stores an object id after the
+/// base type tag: the LSG segment always does, other segments only from
+/// JT 9.x on. Pass [`element_stores_object_id`] for a non-LSG segment.
 ///
 /// Returns `None` at the end-of-element marker.
-pub fn read_element_envelope(cursor: &mut Cursor<'_>, lsg: bool) -> Result<Option<RawElement>> {
+pub fn read_element_envelope(
+    cursor: &mut Cursor<'_>,
+    store_object_id: bool,
+) -> Result<Option<RawElement>> {
     let length = cursor.read_i32()?;
     let start = cursor.position();
     if length < 0 {
@@ -1574,7 +1578,7 @@ pub fn read_element_envelope(cursor: &mut Cursor<'_>, lsg: bool) -> Result<Optio
     }
     let known = class_of(&guid).is_some();
     let base_type = if known { cursor.read_u8()? } else { 0 };
-    let object_id = if known && (lsg || cursor.major() > 8) {
+    let object_id = if known && store_object_id {
         cursor.read_i32()?
     } else {
         0
@@ -1603,6 +1607,14 @@ pub fn skip_element(cursor: &mut Cursor<'_>, element: &RawElement) -> Result<()>
         .checked_add(element.body_len)
         .ok_or_else(|| cursor.error("element length overflow"))?;
     cursor.seek(end)
+}
+
+/// True when a known element class stores an object id in a non-LSG segment.
+///
+/// JT 8.x does not write one there, JT 9.x and 10.x do.
+#[must_use]
+pub fn element_stores_object_id(major: u32) -> bool {
+    major > 8
 }
 
 /// The class a GUID stands for.

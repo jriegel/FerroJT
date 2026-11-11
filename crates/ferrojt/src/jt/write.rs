@@ -6,26 +6,42 @@
 //! expects it, so reading the result again yields the same scene graph, the
 //! same geometry and the same metadata — the same dump and the same picture.
 //!
-//! Only the logical scene graph is re-serialised. Every other segment — the
-//! shape representations, the meta data, the PMI and the B-rep segments — is
-//! copied out of the source file byte for byte, because a representation is
-//! stored in one of the quantised or topologically compressed encodings the
-//! reader decodes but does not re-encode. Such a segment is left out only when
-//! every node that referenced it is gone.
+//! By default only the logical scene graph is re-serialised. Every other
+//! segment — the shape representations, the meta data, the PMI and the B-rep
+//! segments — is copied out of the source file byte for byte, because a
+//! representation is stored in one of the quantised or topologically compressed
+//! encodings the reader decodes but does not re-encode. Such a segment is left
+//! out only when every node that referenced it is gone.
+//!
+//! [`WriteOptions::version`] can ask for another JT revision. Rewriting the
+//! scene graph at another revision is a matter of the version gates the reader
+//! uses, and the segments in between are copied unchanged — that works for the
+//! meta data, PMI and B-rep segments. A shape representation cannot be copied,
+//! because the revision decides which coder holds its triangles, so it is
+//! rebuilt from the decoded geometry with the encoder of the target revision.
+//! That is lossy in a hard way: the topological coder of JT 9.x and 10.x only
+//! accepts a closed two-manifold without degenerate triangles, which most
+//! tessellations are not, and JT 8.x has no coder at all for such a mesh. A
+//! rewrite that a representation cannot survive is refused rather than written
+//! as a file whose shapes come back empty, and the 8.x and the 9.x/10.x
+//! families are therefore not offered to each other — see
+//! [`JtVersion::compatible`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use crate::codec::{ByteOrder, WriterExt, deflate};
 use crate::error::{Error, Result};
 use crate::jt::Cursor;
+use crate::jt::build::{MeshData, representation, shape_segment};
 use crate::jt::guid::{Guid, types};
 use crate::jt::model::{JtFile, LayerFilter, LodWalk, ObjectRef, SceneGraph};
 use crate::jt::object::{
-    Attribute, LateLoad, Node, NodeBase, Property, RawElement, Shape, class_of,
-    read_element_envelope,
+    Attribute, Class, LateLoad, LateLoaded, Node, NodeBase, Property, RawElement, Shape,
+    StringProperty, class_of, read_element_envelope,
 };
 use crate::jt::segment::{FileHeader, TocEntry, has_compression_header, read_segment};
+use crate::jt::version::JtVersion;
 
 /// Base type byte of an instance atom.
 pub(crate) const BASE_INSTANCE: u8 = 0;
@@ -44,6 +60,11 @@ const KNOWN_ENVELOPE: usize = 4 + 16 + 1 + 4;
 const UNKNOWN_ENVELOPE: usize = 4 + 16;
 /// Offset of the object id inside an atom of a known class.
 const OBJECT_ID_OFFSET: usize = 4 + 16 + 1;
+/// The state every property atom stores.
+///
+/// The reader keeps it without interpreting it, and the reference writes this
+/// value for every property it emits.
+const PROPERTY_STATE: u32 = 0x4000_0000;
 /// Envelope of a segment whose type carries a compression header.
 ///
 /// The declared size counts the four bytes of the size field itself, the GUID,
@@ -67,23 +88,56 @@ pub struct WriteOptions {
     pub layer_filter: Option<String>,
     /// Compress the rebuilt scene graph instead of storing it uncompressed.
     pub compress: bool,
+    /// Write the file at this JT revision instead of the one it has.
+    ///
+    /// `None`, the default, keeps the revision of the source file, which is
+    /// what makes the rewrite lossless: every segment that is not the scene
+    /// graph is then copied byte for byte. `Some` rebuilds the scene graph, the
+    /// header and the TOC table at that revision, copies the segments whose
+    /// framing does not depend on it, and re-encodes every shape
+    /// representation with the coder of the target revision.
+    ///
+    /// Only revisions of the same representation family can be exchanged: JT
+    /// 8.x stores its triangles in the vertex based lossless representation,
+    /// JT 9.x and 10.x in the topologically compressed one, and a file carries
+    /// only the coder of its own era. See [`JtVersion::compatible`].
+    ///
+    /// [`JtVersion::compatible`]: crate::jt::JtVersion::compatible
+    pub version: Option<JtVersion>,
 }
 
 /// Rebuild a JT file.
 ///
 /// `data` is the content of the file `file` was read from: its banner is
-/// reused and the segments that are not rebuilt are copied out of it unchanged.
+/// reused and the segments that are not rebuilt are copied out of it unchanged,
+/// unless [`WriteOptions::version`] asks for another revision.
 ///
 /// # Errors
 ///
 /// [`Error::Invalid`] is returned when the file has no logical scene graph,
-/// when a named layer filter does not exist, or when the scene graph holds a
-/// class the writer does not model.
+/// when a named layer filter does not exist, when the requested revision is
+/// unsupported or of another representation family than the source, when a
+/// representation cannot be re-encoded for the requested revision, or when the
+/// scene graph holds a class the writer does not model.
 pub fn write_to_bytes(file: &JtFile, data: &[u8], options: &WriteOptions) -> Result<Vec<u8>> {
     if options.no_layer_filter && options.layer_filter.is_some() {
         return Err(Error::invalid(
             0,
             "a layer filter cannot be named and ignored at the same time",
+        ));
+    }
+    let source = JtVersion::new(file.header.major, file.header.minor);
+    let version = options.version.unwrap_or(source);
+    version.validate()?;
+    if !source.compatible(version) {
+        return Err(Error::invalid(
+            0,
+            format!(
+                "a JT {source} file cannot be written as JT {version}: JT 8.x stores its \
+                 triangles in the vertex based representation, JT 9.x and 10.x in the \
+                 topologically compressed one, and only the coder of the revision of the \
+                 source file is available"
+            ),
         ));
     }
     let graph = file.lsg.as_ref().ok_or_else(|| {
@@ -94,6 +148,16 @@ pub fn write_to_bytes(file: &JtFile, data: &[u8], options: &WriteOptions) -> Res
     })?;
     let filter = resolve_filter(file, options)?;
     let plan = Plan::build(graph, options, filter.as_ref());
+    // The segment type of a representation follows its level of detail, which
+    // JT never stores — it is the position under the range LOD. Only a write
+    // that changes the major revision has to work it out: otherwise the types
+    // of the source file are kept as they are.
+    let restructured = version.major != source.major;
+    let kinds = if restructured {
+        segment_kinds(graph, &plan, version)?
+    } else {
+        BTreeMap::new()
+    };
 
     let lsg_offset = file
         .segment_offset(&file.header.lsg_guid)
@@ -106,6 +170,8 @@ pub fn write_to_bytes(file: &JtFile, data: &[u8], options: &WriteOptions) -> Res
         graph,
         options,
         plan: &plan,
+        version,
+        kinds,
         ids: HashMap::new(),
         atoms,
         rows,
@@ -141,6 +207,138 @@ fn resolve_filter(file: &JtFile, options: &WriteOptions) -> Result<Option<LayerF
         Some(name) => file.layer_filter(Some(name)),
         None => file.layer_filter(None),
     }
+}
+
+/// The segment type each surviving segment gets in the target revision.
+///
+/// A shape segment is named by the level of detail it holds: JT 9.x calls every
+/// one of them type 6 ("Shape"), JT 8.x and 10.x number them 7 to 16 for LOD0
+/// to LOD9. JT never stores that tier — it is the position of the group under
+/// its range LOD — so it is taken from the walk that decides which tiers to
+/// keep, exactly as [`JtFile::to_model`] records it on a mesh. A segment no
+/// surviving node references is left out, and its type stays as the source
+/// named it.
+///
+/// [`JtFile::to_model`]: crate::jt::JtFile::to_model
+fn segment_kinds(
+    graph: &SceneGraph,
+    plan: &Plan,
+    version: JtVersion,
+) -> Result<BTreeMap<Guid, i32>> {
+    let mut kinds: BTreeMap<Guid, i32> = BTreeMap::new();
+    let Some(root) = graph.root else {
+        return Ok(kinds);
+    };
+    collect_kinds(
+        graph,
+        plan,
+        root,
+        LodWalk::ROOT,
+        version,
+        &mut kinds,
+        &mut HashSet::new(),
+    )?;
+    Ok(kinds)
+}
+
+/// Walk the surviving nodes once per path and record the type of each segment.
+///
+/// A subtree reached more than once is walked again on purpose: the tier of a
+/// representation depends on where it is reached from, and a file that
+/// instantiates one shape under two range LODs at different tiers names its
+/// segment accordingly. `path` is the cycle guard — a reference cycle is
+/// walked once per branch, never forever.
+fn collect_kinds(
+    graph: &SceneGraph,
+    plan: &Plan,
+    pos: usize,
+    tier: LodWalk,
+    version: JtVersion,
+    kinds: &mut BTreeMap<Guid, i32>,
+    path: &mut HashSet<usize>,
+) -> Result<()> {
+    let Some(&index) = plan.index_of.get(&pos) else {
+        return Ok(());
+    };
+    if !path.insert(pos) {
+        return Ok(());
+    }
+    let kept = &plan.kept[index];
+    let node = &graph.nodes[kept.pos].node;
+    for load in &kept.loads {
+        let Some(at) = graph.loaded_pos(load) else {
+            continue;
+        };
+        let stored = &graph.loaded[at];
+        if stored.element.geometry().is_none() {
+            continue;
+        }
+        let kind = match tier.level() {
+            Some(_) if version.major == 9 => 6,
+            Some(level) if level >= 10 => {
+                return Err(Error::invalid(
+                    0,
+                    "a level of detail beyond LOD9 has no segment type",
+                ));
+            }
+            Some(level) => 7 + level as i32,
+            None => {
+                if version.major == 9 {
+                    6
+                } else {
+                    stored.segment_type
+                }
+            }
+        };
+        if let Some(&known) = kinds.get(&stored.segment) {
+            if known != kind {
+                return Err(Error::invalid(
+                    0,
+                    format!(
+                        "the representation {} is used at two different levels of detail, so its \
+                         segment type cannot be chosen",
+                        stored.segment
+                    ),
+                ));
+            }
+        }
+        kinds.insert(stored.segment, kind);
+    }
+    let mut tier = if matches!(node, Node::RangeLod(_)) {
+        LodWalk::FIRST
+    } else {
+        tier
+    };
+    for child in &kept.children {
+        let Some(child) = child else {
+            continue;
+        };
+        let child_pos = plan.kept[*child].pos;
+        collect_kinds(graph, plan, child_pos, tier, version, kinds, path)?;
+        tier.next_tier(graph.nodes[child_pos].node.class_name());
+    }
+    if let Some(target) = kept.target {
+        let target_pos = plan.kept[target].pos;
+        collect_kinds(graph, plan, target_pos, tier, version, kinds, path)?;
+    }
+    path.remove(&pos);
+    Ok(())
+}
+
+/// `true` for a segment holding a shape representation: types 6 to 16.
+fn is_shape_segment(kind: i32) -> bool {
+    (6..=16).contains(&kind)
+}
+
+/// `true` when the framing of a segment type does not depend on the revision.
+///
+/// The logical scene graph is rebuilt from scratch and a shape representation
+/// is re-encoded, so neither counts here. Everything else the reader models
+/// either carries no version-gated field at all — a wireframe, ULP, LWPA or
+/// AEC segment — or stores its revision inside its own body, as an extended
+/// B-rep does in its version triplet.
+fn is_copyable_segment(kind: i32) -> bool {
+    matches!(kind, 2 | 3 | 4 | 17 | 18 | 20 | 23 | 24 | 30 | 32 | 33)
 }
 
 /// One node that survives, with the references it still has.
@@ -285,6 +483,11 @@ struct Writer<'a> {
     graph: &'a SceneGraph,
     options: &'a WriteOptions,
     plan: &'a Plan,
+    /// Revision the file is written at.
+    version: JtVersion,
+    /// Segment type each surviving segment gets in the target revision, keyed
+    /// by segment GUID.
+    kinds: BTreeMap<Guid, i32>,
     /// Old object id to new object id, for every object that survives.
     ids: HashMap<i32, i32>,
     /// Property atoms of the source scene graph, in file order.
@@ -393,7 +596,7 @@ impl Writer<'_> {
     fn build(&self, data: &[u8]) -> Result<Vec<u8>> {
         let header = &self.file.header;
         let order = header.order;
-        let major = header.major;
+        let major = self.version.major;
         let lsg_guid = header.lsg_guid;
 
         let body = self.lsg_body()?;
@@ -411,8 +614,13 @@ impl Writer<'_> {
         let lsg = segment_bytes(order, &lsg_guid, kind, &payload, self.options.compress)?;
 
         // Every other segment is copied out of the source file, except one no
-        // surviving node references any more.
+        // surviving node references any more. A shape representation cannot be
+        // copied when the major revision changes — its triangles live in the
+        // coder of the revision of the source file — so it is rebuilt from the
+        // decoded geometry. A different minor revision changes no framing at
+        // all: every version gate of the specification looks at the major.
         let dropped = self.dropped_segments();
+        let restructured = self.version.major != header.major;
         let mut segments: Vec<(Guid, i32, Vec<u8>)> = Vec::with_capacity(self.file.toc.len());
         for entry in &self.file.toc {
             if entry.guid == lsg_guid {
@@ -422,6 +630,26 @@ impl Writer<'_> {
             if dropped.contains(&entry.guid) {
                 tracing::debug!(guid = %entry.guid, "a segment no node references is left out");
                 continue;
+            }
+            let kind = if restructured {
+                self.kinds.get(&entry.guid).copied().unwrap_or(entry.kind)
+            } else {
+                entry.kind
+            };
+            if restructured && is_shape_segment(entry.kind) {
+                let bytes = self.representation_segment(&entry.guid, kind)?;
+                segments.push((entry.guid, kind, bytes));
+                continue;
+            }
+            if restructured && !is_copyable_segment(entry.kind) {
+                return Err(Error::invalid(
+                    0,
+                    format!(
+                        "the segment {} has segment type {}, whose framing depends on the JT \
+                         revision, so it cannot be rewritten as JT {}",
+                        entry.guid, entry.kind, self.version
+                    ),
+                ));
             }
             let end = entry
                 .offset
@@ -435,13 +663,17 @@ impl Writer<'_> {
                     "the TOC table points past the file",
                 ));
             }
-            segments.push((entry.guid, entry.kind, data[start..end as usize].to_vec()));
+            segments.push((entry.guid, kind, data[start..end as usize].to_vec()));
         }
 
         let header_len = header_length(major);
         let total = header_len + segments.iter().map(|entry| entry.2.len()).sum::<usize>();
         let mut out: Vec<u8> = Vec::with_capacity(total + 64);
-        write_banner(&mut out, data, header, total)?;
+        if self.version != JtVersion::new(header.major, header.minor) {
+            write_generated_banner(&mut out, order, self.version, &lsg_guid, total)?;
+        } else {
+            write_banner(&mut out, data, header, total)?;
+        }
         let mut offset = header_len;
         let mut toc: Vec<TocEntry> = Vec::with_capacity(segments.len());
         for (guid, kind, bytes) in &segments {
@@ -456,6 +688,41 @@ impl Writer<'_> {
         }
         write_toc(&mut out, &toc, order, major)?;
         Ok(out)
+    }
+
+    /// Rebuild one shape representation segment for the target revision.
+    ///
+    /// The geometry is the one the reader decoded from the source file, so the
+    /// triangles are the same; only the coder changes. A mesh the coder of the
+    /// target revision cannot hold is an error rather than a segment whose
+    /// shape comes back empty.
+    fn representation_segment(&self, guid: &Guid, kind: i32) -> Result<Vec<u8>> {
+        let stored = self
+            .graph
+            .loaded
+            .iter()
+            .find(|stored| stored.segment == *guid)
+            .ok_or_else(|| {
+                Error::invalid(0, format!("the segment {guid} holds no representation"))
+            })?;
+        let Some(geometry) = stored.element.geometry() else {
+            return Err(Error::invalid(
+                0,
+                format!("the segment {guid} holds no shape representation"),
+            ));
+        };
+        let mesh = MeshData::from_geometry(geometry);
+        let element = representation(&mesh, self.version).map_err(|err| match err {
+            Error::Invalid { message, .. } => Error::invalid(
+                0,
+                format!(
+                    "the representation {guid} cannot be written as JT {}: {message}",
+                    self.version
+                ),
+            ),
+            err => err,
+        })?;
+        Ok(shape_segment(*guid, kind, &element))
     }
 
     /// Segments the source file references but no surviving node does.
@@ -476,7 +743,7 @@ impl Writer<'_> {
     /// the properties, then the table that ties them together.
     fn lsg_body(&self) -> Result<Vec<u8>> {
         let order = self.file.header.order;
-        let major = self.file.header.major;
+        let major = self.version.major;
         let mut body: Vec<u8> = Vec::new();
 
         let kept_ids: Vec<i32> = self
@@ -531,10 +798,15 @@ impl Writer<'_> {
         }
         write_end_of_elements(&mut body, order)?;
 
+        let restructured = self.version.major != self.file.header.major;
         for atom in &self.atoms {
             let Some(new) = self.ids.get(&atom.object_id) else {
                 continue;
             };
+            if restructured {
+                self.write_property_atom(&mut body, atom, *new)?;
+                continue;
+            }
             let mut bytes = atom.bytes.clone();
             let start = OBJECT_ID_OFFSET;
             bytes[start..start + 4].copy_from_slice(&ordered_i32(*new, order));
@@ -564,6 +836,58 @@ impl Writer<'_> {
             body.write_i32_value(0, order)?;
         }
         Ok(body)
+    }
+
+    /// Write one property atom for the target revision.
+    ///
+    /// The property classes of the specification are re-serialised with the
+    /// version gates of the target revision, and the segment type of a late
+    /// load is the one the target revision gives that segment. A property of a
+    /// class the reader does not know cannot be parsed, so it keeps its bytes
+    /// and only its object id moves — such an atom is framed the same way in
+    /// every revision, which is what the reader relies on as well.
+    ///
+    /// The bytes are those of the source file, so they are parsed with the
+    /// framing of that revision: reading a JT 9.x atom with the gates of JT
+    /// 10.x would misalign the cursor before anything is rewritten.
+    fn write_property_atom(&self, out: &mut Vec<u8>, atom: &Atom, new: i32) -> Result<()> {
+        let order = self.file.header.order;
+        let source_major = self.file.header.major;
+        let mut cursor = Cursor::new(&atom.bytes, order, source_major);
+        let Some(element) = read_element_envelope(&mut cursor, true)? else {
+            return Err(Error::invalid(0, "a property atom has no envelope"));
+        };
+        let known = class_of(&element.guid) == Some(Class::Property);
+        let body = &atom.bytes[element.body_offset..element.body_offset + element.body_len];
+        let parsed = if known {
+            Some(Property::read(
+                &element.guid,
+                &mut Cursor::new(body, order, source_major),
+            )?)
+        } else {
+            None
+        };
+        let new_body = match parsed.as_ref() {
+            Some(Property::String(value)) => {
+                Some(string_property_body(value, order, self.version)?)
+            }
+            Some(Property::LateLoaded(load)) => Some(late_loaded_property_body(
+                load,
+                order,
+                self.version,
+                &self.kinds,
+            )?),
+            _ => None,
+        };
+        let Some(new_body) = new_body else {
+            // Nothing to re-serialise: keep the atom as the source wrote it.
+            let mut bytes = atom.bytes.clone();
+            let start = OBJECT_ID_OFFSET;
+            bytes[start..start + 4].copy_from_slice(&ordered_i32(new, order));
+            out.extend_from_slice(&bytes);
+            return Ok(());
+        };
+        write_atom(out, order, &element.guid, element.base_type, new, &new_body)
     }
 }
 
@@ -684,6 +1008,99 @@ fn write_banner(
 /// Length of the fixed header of a JT `major` version.
 pub(crate) fn header_length(major: u32) -> usize {
     80 + 1 + 4 + if major >= 10 { 8 } else { 4 } + 16
+}
+
+/// Write a banner for a file of another revision.
+///
+/// The banner of the source declares the revision it holds, so it cannot be
+/// copied when the target differs — the reader takes the version from the
+/// second word of that line. A banner in the shape the writer of this crate
+/// produces replaces it, with the target revision named in it.
+fn write_generated_banner(
+    out: &mut Vec<u8>,
+    order: ByteOrder,
+    version: JtVersion,
+    lsg: &Guid,
+    toc_offset: usize,
+) -> Result<()> {
+    let text = format!(
+        "Version {} JT  FerroJT {}",
+        version,
+        env!("CARGO_PKG_VERSION")
+    );
+    let mut banner = [b' '; 80];
+    let bytes = text.as_bytes();
+    if bytes.len() > 78 {
+        return Err(Error::invalid(0, "internal: the banner does not fit"));
+    }
+    banner[..bytes.len()].copy_from_slice(bytes);
+    banner[78] = b'\n';
+    banner[79] = b'\r';
+    out.write_bytes(&banner)?;
+    out.write_u8_value(if order == ByteOrder::Big { 1 } else { 0 })?;
+    out.write_i32_value(0, order)?;
+    if version.offsets_are_32_bit() {
+        out.write_i32_value(toc_offset as i32, order)?;
+    } else {
+        out.write_u64_value(toc_offset as u64, order)?;
+    }
+    write_guid(out, order, lsg)?;
+    if out.len() != header_length(version.major) {
+        return Err(Error::invalid(0, "internal: the fixed header is malformed"));
+    }
+    Ok(())
+}
+
+/// The body of a string property at `version`.
+///
+/// A class version precedes the state and another one follows it from JT 9.x
+/// on; JT 8.x stores only the state and the string.
+fn string_property_body(
+    property: &StringProperty,
+    order: ByteOrder,
+    version: JtVersion,
+) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    if version.has_object_versions() {
+        write_version(&mut out, order, version.major, property.version)?;
+    }
+    out.write_u32_value(PROPERTY_STATE, order)?;
+    if version.has_object_versions() {
+        write_version(&mut out, order, version.major, property.version)?;
+    }
+    write_mb_string(&mut out, order, &property.value)?;
+    Ok(out)
+}
+
+/// The body of a late loaded property at `version`.
+///
+/// The segment type is the one the target revision gives that segment, and the
+/// object id of the element inside it moves with the element itself. JT 9.x
+/// appends a reserved word after the id, JT 10.x does not.
+fn late_loaded_property_body(
+    load: &LateLoaded,
+    order: ByteOrder,
+    version: JtVersion,
+    kinds: &BTreeMap<Guid, i32>,
+) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    if version.has_object_versions() {
+        write_version(&mut out, order, version.major, load.version)?;
+    }
+    out.write_u32_value(PROPERTY_STATE, order)?;
+    if version.has_object_versions() {
+        write_version(&mut out, order, version.major, load.version)?;
+    }
+    write_guid(&mut out, order, &load.guid)?;
+    let kind = kinds.get(&load.guid).copied().unwrap_or(load.segment_type);
+    out.write_i32_value(kind, order)?;
+    if version.has_object_versions() {
+        out.write_i32_value(load.object_id, order)?;
+        if version.major < 10 {
+            out.write_i32_value(0, order)?;
+        }
+    }
+    Ok(out)
 }
 
 /// Write the TOC table at the end of the file.

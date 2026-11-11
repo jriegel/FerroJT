@@ -8,6 +8,8 @@
 //! a glTF file. [`Model`] is the FerroJT side of the same thing and is what the
 //! exporters consume.
 
+use std::path::Path;
+
 use pyo3::exceptions::{PyNotImplementedError, PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -322,6 +324,60 @@ impl JtFile {
         all_layers: bool,
     ) -> PyResult<bool> {
         self.write_gl_tf(py, path, layer_filter, all_layers)
+    }
+
+    /// Write the file back out as JT and return `True`, or `False` while the
+    /// file is closed.
+    ///
+    /// Only the finest tier of a range LOD is kept unless `all_lods` is set, and
+    /// the layer filters of the file are applied unless `all_layers` is set —
+    /// the same selection [`JtFile::model`] makes. The scene graph is stored
+    /// uncompressed unless `compress` is set.
+    ///
+    /// `version` asks for another JT revision, `"8.0"`, `"8.1"`, `"9.5"` or
+    /// `"10.3"`; leaving it out keeps the revision of the source file, which is
+    /// what makes the rewrite lossless. Only revisions of the same representation
+    /// family can be exchanged — JT 8.x stores its triangles in the vertex based
+    /// representation and JT 9.x/10.x in the topologically compressed one — and a
+    /// revision change re-encodes every shape, which a mesh that is not a closed
+    /// two-manifold does not survive. Such a rewrite raises `ValueError` rather
+    /// than writing a file whose shapes come back empty.
+    #[pyo3(signature = (path, *, layer_filter = None, all_layers = false, all_lods = false,
+                        compress = false, version = None))]
+    fn write_jt(
+        &self,
+        path: &str,
+        layer_filter: Option<&str>,
+        all_layers: bool,
+        all_lods: bool,
+        compress: bool,
+        version: Option<&str>,
+    ) -> PyResult<bool> {
+        let Some(file) = self.parsed() else {
+            return Ok(false);
+        };
+        if layer_filter.is_some() && all_layers {
+            return Err(PyValueError::new_err(
+                "layer_filter and all_layers cannot be combined",
+            ));
+        }
+        let options = ferrojt::jt::WriteOptions {
+            all_lods,
+            no_layer_filter: all_layers,
+            layer_filter: layer_filter.map(str::to_string),
+            compress,
+            version: match version {
+                Some(text) => Some(
+                    text.parse::<ferrojt::jt::JtVersion>()
+                        .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                ),
+                None => None,
+            },
+        };
+        let target = Path::new(path);
+        Python::attach(|py| py.detach(|| ferrojt::jt::write_to_file(file, target, &options)))
+            .map_err(py_err)?;
+        Ok(true)
     }
 
     /// The scene as a [`Model`], which is what the exporters consume.

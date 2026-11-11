@@ -9,6 +9,8 @@ cube.
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -230,11 +232,12 @@ def test_a_placement_with_rotation_and_scale_survives(tmp_path) -> None:
         builder.set_placement(part, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0])
 
 
-def test_a_built_file_reads_back_as_jt_8_1(tmp_path) -> None:
+def test_a_built_file_reads_back_as_jt_10_3(tmp_path) -> None:
     builder, _ = build()
+    assert builder.version == "10.3", "the newest revision is the default"
     data = builder.to_bytes()
     assert isinstance(data, bytes)
-    assert data.startswith(b"Version 8.1 JT"), "the JT banner"
+    assert data.startswith(b"Version 10.3 JT"), "the JT banner"
     assert data[80] == 0, "little endian"
 
     path = tmp_path / "built.jt"
@@ -245,8 +248,45 @@ def test_a_built_file_reads_back_as_jt_8_1(tmp_path) -> None:
 
     file = ferrojt.JtFile(str(path))
     file.open()
-    toc = [line for line in file.toc().splitlines() if line.strip()]
-    assert len(toc) >= 3, "the table of contents lists both segments"
+    toc = json.loads(file.toc())
+    assert toc["MajorVersion"] == "10"
+    assert toc["MinorVersion"] == "3"
+    assert len(toc["TocTable"]) == 2, "the scene graph and its one shape segment"
+
+
+def test_every_supported_revision_reaches_its_own_banner(tmp_path) -> None:
+    # The revision is not only a banner string: it names the shape segments the
+    # way that revision does, and it decides which coder holds the triangles.
+    for revision, major, minor, shape_kinds in [
+        ("8.1", "8", "1", {7}),
+        ("9.5", "9", "5", {6}),
+        ("10.3", "10", "3", {7}),
+    ]:
+        builder, _ = build()
+        builder.version = revision
+        assert builder.version == revision, "the builder keeps it"
+        data = builder.to_bytes()
+        assert data.startswith(f"Version {revision} JT".encode()), "the JT banner"
+
+        path = tmp_path / f"built-{revision}.jt"
+        builder.save(str(path))
+        assert path.read_bytes() == data, "save and to_bytes agree"
+
+        file = ferrojt.JtFile(str(path))
+        assert file.open() is True
+        toc = json.loads(file.toc())
+        assert (toc["MajorVersion"], toc["MinorVersion"]) == (major, minor)
+        assert {row[1] for row in toc["TocTable"]} & {6, 7, 8} == shape_kinds
+        assert file.lsg.node_count == 5
+        assert file.lsg.representation_count == 1
+        assert file.model().triangle_count == 12
+
+    builder = ferrojt.JtBuilder()
+    builder.set_version("9")
+    assert builder.version == "9.5", "a bare major picks the minor of that revision"
+    with pytest.raises(ValueError, match="cannot be written"):
+        builder.version = "11"
+    assert builder.version == "9.5", "a refused revision leaves the builder alone"
 
 
 def test_the_scene_graph_survives_the_round_trip(tmp_path) -> None:
@@ -277,8 +317,9 @@ def test_the_scene_graph_survives_the_round_trip(tmp_path) -> None:
     assert nodes[3].instance_target() == nodes[1]
 
 
-def test_the_cube_comes_back_triangle_for_triangle(tmp_path) -> None:
+def test_the_cube_of_a_jt_8x_file_comes_back_in_strip_order(tmp_path) -> None:
     builder, _ = build()
+    builder.version = "8.1"
     path = tmp_path / "cube.jt"
     builder.save(str(path))
 
@@ -310,6 +351,57 @@ def test_the_cube_comes_back_triangle_for_triangle(tmp_path) -> None:
         0, 1, 2, 3, 5, 4, 6, 7, 8, 9, 11, 10, 12, 13, 14, 15, 17, 16,
         18, 19, 20, 21, 23, 22, 24, 25, 26, 27, 29, 28, 30, 31, 32, 33, 35, 34,
     ]
+
+
+def test_the_cube_of_a_jt_10x_file_comes_back_through_the_coder(tmp_path) -> None:
+    builder, _ = build()
+    path = tmp_path / "cube10.jt"
+    builder.save(str(path))
+
+    file = ferrojt.JtFile(str(path))
+    file.open()
+    mesh = file.lsg.meshes()[0]
+    assert mesh.triangle_count == 12
+    assert mesh.vertex_count == 36
+    assert mesh.normal_count == 36
+    # The 64-bit vertex binding of a topological shape has no per-slot flag.
+    assert mesh.normal_binding is None
+
+    # The dual walk of the coder emits its own corner order, so it numbers the
+    # slots as it goes rather than keeping the strip order of the source.
+    assert np.asarray(mesh.array("indices")).tolist() == list(range(36))
+
+    source = cube()
+    positions = np.asarray(mesh.array("vertices")).reshape(-1, 3)
+    normals = np.asarray(mesh.array("normals")).reshape(-1, 3)
+    assert sorted(map(tuple, positions.tolist())) == sorted(
+        tuple(point) for point in np.reshape(source.vertices, (-1, 3)).tolist()
+    )
+    assert sorted(map(tuple, normals.tolist())) == sorted(
+        tuple(point) for point in np.reshape(source.normals, (-1, 3)).tolist()
+    )
+    assert file.model().triangle_count == 12
+
+
+def test_an_open_mesh_needs_the_vertex_based_representation(tmp_path) -> None:
+    # The topological coder of JT 9.x and 10.x only accepts a closed
+    # two-manifold; the vertex-based representation of 8.x has no such rule.
+    open_shell = ferrojt.MeshData(
+        [0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0],
+        [0, 1, 2, 3, 4, 5],
+    )
+    for revision in ["9.5", "10.3"]:
+        builder = ferrojt.JtBuilder()
+        builder.version = revision
+        builder.add_shape(builder.root(), open_shell, name="open")
+        with pytest.raises(ValueError, match="not a closed two-manifold"):
+            builder.save(str(tmp_path / f"open{revision}.jt"))
+
+    builder = ferrojt.JtBuilder()
+    builder.version = "8.1"
+    builder.add_shape(builder.root(), open_shell, name="open")
+    builder.save(str(tmp_path / "open8.jt"))
+    assert ferrojt.open(str(tmp_path / "open8.jt")).triangle_count == 2
 
 
 def test_both_instances_share_one_representation(tmp_path) -> None:

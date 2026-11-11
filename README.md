@@ -70,8 +70,8 @@ FerroJT is a Rust workspace with four parts:
 | JT decode codecs (Huffman, range/CDP, vertex and mesh coders) | done |
 | glTF 2.0 / GLB writer | done |
 | USD writer (ASCII `.usda`) | done — each mesh written once and referenced, materials deduplicated by value |
-| JT writer (rebuild a read file, LOD and layer filtered) | done — a round trip re-reads to the same dump, structure and picture |
-| JT builder (create a file from nothing, meshes and instances) | done — JT 8.1, `tests/test_build.py` builds a cube and reads it back |
+| JT writer (rebuild a read file, LOD and layer filtered) | done — a round trip re-reads to the same dump, structure and picture; `--jt-version` rewrites it as 8.x, 9.x or 10.x |
+| JT builder (create a file from nothing, meshes and instances) | done — JT 10.3 by default, `tests/test_build.py` builds a cube at each revision and reads it back |
 | CLI | done |
 | Python bindings | done (packaged with `maturin`) |
 | Visual regression (rendered export vs. reference picture) | done (`tests/test_visual.py`, Open3D) |
@@ -138,6 +138,7 @@ cargo run -p ferrojt-cli -- convert gear.jt --no-layer-filter -o gear.glb
 cargo run -p ferrojt-cli -- write    gear.jt -o gear.out.jt
 cargo run -p ferrojt-cli -- write    gear.jt --all-lods --no-layer-filter
 cargo run -p ferrojt-cli -- write    gear.jt --layer-filter LAYCUR --compress
+cargo run -p ferrojt-cli -- write    gear.jt -o gear10.jt --jt-version 10.3
 ```
 
 `dump` writes the same JSON the reference JT dump tool produces: the header, the
@@ -153,8 +154,14 @@ of the declared filters, and `--no-layer-filter` exports every part.
 applies — the finest tier below a range LOD and the active layer filter —
 unless `--all-lods` or `--no-layer-filter` says otherwise, and it copies every
 segment but the scene graph out of the source unchanged. The result is re-read
-and reported, so the second line of output says what the filters cost. See
-[docs/jt-writer.md](docs/jt-writer.md).
+and reported, so the second line of output says what the filters cost.
+
+`--jt-version 9.5` writes the result at another revision instead of the one of
+the source. JT stores its triangles in one of two families — 8.x in the
+vertex-based representation, 9.x and 10.x in the topologically compressed coder —
+so a rewrite stays inside the family of the source, and a shape the coder cannot
+hold (a CAD assembly with open edges) is refused rather than written as a file
+whose shapes come back empty. See [docs/jt-writer.md](docs/jt-writer.md).
 
 ## Rust viewer
 
@@ -232,10 +239,15 @@ if jt.open():
     print(jt.toc())                # header + TOC table as JSON
     print(jt.json())               # the full dump
     jt.writeGlTf("gear")           # writes gear.gltf
+    jt.write_jt("gear.out.jt")     # the file back out as JT
     print(jt.model())              # the neutral Model, for the exporters
 
 print(ferrojt.dump("gear.jt"))     # one line shortcut for the same dump
 ```
+
+`write_jt` takes the same selection keywords as the exporters plus `all_lods`,
+`compress` and `version="10.3"` to rewrite the file at another revision; without
+`version` it keeps the revision of the source.
 
 The export honours the layer filters of the file. `layer_filters()` lists the
 names it declares and `active_layer_filter()` the one applied by default;
@@ -306,8 +318,9 @@ Requires Python 3.11 or newer.
 
 `JtBuilder` is the way in: it starts as an empty file holding only its root
 `Partition`, you fill the scene graph node by node, and `save` writes it as
-JT 8.1. The nodes are opaque handles that belong to their builder, so a handle
-of another builder is refused.
+JT 10.3 — `builder.version = "8.1"` asks for another revision. The nodes are
+opaque handles that belong to their builder, so a handle of another builder is
+refused.
 
 ```python
 import ferrojt
@@ -327,9 +340,11 @@ builder.save("cube.jt")
 
 A mesh is handed over the way a modeller emits one — shared corners and all —
 and the builder explodes it to one slot per triangle corner, because a JT 8.x
-faceted shape stores the normal per slot and cannot share a corner. Read the
-file back with `ferrojt.open` or `ferrojt.JtFile` like any other: the graph, the
-names, the placements and the triangles come back unchanged, and the two
+faceted shape stores the normal per slot and cannot share a corner. At JT 9.x and
+10.x the coder does that explosion itself, so the vertex table of a representation
+comes back larger and in a different order while the triangles do not change. Read
+the file back with `ferrojt.open` or `ferrojt.JtFile` like any other: the graph,
+the names, the placements and the triangles come back unchanged, and the two
 instances still share one representation. `docs/jt-builder.md` holds the layout
 the writer emits and what it leaves open.
 

@@ -1,9 +1,10 @@
 //! Building a JT file from nothing: the Python view of [`ferrojt::jt::JtBuilder`].
 //!
 //! [`Builder`] creates an empty file and fills its scene graph with nodes,
-//! meshes and instances, then writes the result as a JT 8.1 file. It is the
-//! mirror of the read-only [`crate::lsg`] view: the handles here address slots
-//! of the graph being *built*, not positions of a file that was read.
+//! meshes and instances, then writes the result as a JT file — JT 10.3 unless
+//! [`Builder.version`] asks for another revision. It is the mirror of the
+//! read-only [`crate::lsg`] view: the handles here address slots of the graph
+//! being *built*, not positions of a file that was read.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -13,7 +14,7 @@ use pyo3::types::PyBytes;
 
 use ferrojt::jt::{
     BuildNode as RustClass, JtBuilder as RustBuilder, JtMesh as MeshId, JtNode as NodeId,
-    MaterialData as RustMaterial, MeshData as RustMesh,
+    JtVersion as RustVersion, MaterialData as RustMaterial, MeshData as RustMesh,
 };
 
 use crate::py_err;
@@ -442,7 +443,12 @@ impl MeshHandle {
 ///
 /// The graph starts as a root `Partition`; add nodes with [`Builder::add_node`],
 /// shapes with [`Builder::add_shape`], and share a subtree with
-/// [`Builder::instance_of`]. [`Builder::save`] writes the file as JT 8.1.
+/// [`Builder::instance_of`]. [`Builder::save`] writes the file at the revision
+/// of [`Builder.version`], which is JT 10.3 until it is changed.
+///
+/// JT 9.x and 10.x store their triangles in the topologically compressed
+/// representation, which only accepts a closed two-manifold; JT 8.x stores them
+/// in the vertex based one and accepts anything. See [`Builder.version`].
 #[pyclass(name = "JtBuilder")]
 pub struct Builder {
     inner: RustBuilder,
@@ -519,6 +525,35 @@ impl Builder {
     #[setter]
     fn set_compress(&mut self, compress: bool) {
         let _ = self.inner.set_compress(compress);
+    }
+
+    /// The JT revision the file is written at, as `"major.minor"`.
+    ///
+    /// JT 10.3 until [`Builder.set_version`] says otherwise.
+    #[getter]
+    fn version(&self) -> String {
+        self.inner.version().to_string()
+    }
+
+    /// Write the file at revision `value`: `"8.0"`, `"8.1"`, `"9.5"` or
+    /// `"10.3"`, or a bare major to take the default minor of that revision.
+    ///
+    /// A mesh of a 9.x or 10.x file has to be a closed two-manifold, since that
+    /// is the only thing the topologically compressed coder accepts; a mesh
+    /// that is not can still be written as 8.x.
+    #[pyo3(name = "set_version")]
+    fn set_version_name(&mut self, value: &str) -> PyResult<()> {
+        let version = value
+            .parse::<RustVersion>()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        self.inner.set_version(version).map_err(py_err)?;
+        Ok(())
+    }
+
+    /// Setter of [`Builder.version`], so `builder.version = "9.5"` works.
+    #[setter]
+    fn set_version(&mut self, value: &str) -> PyResult<()> {
+        self.set_version_name(value)
     }
 
     /// Add a node of `class_name` under `parent` and return its handle.

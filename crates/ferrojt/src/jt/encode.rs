@@ -209,39 +209,70 @@ impl Target {
         }
 
         // The counter-clockwise ring of triangles around each welded vertex.
+        // The order comes from walking the fan across its shared edges rather
+        // than sorting the triangles by their angle about the vertex: a screw
+        // thread projects onto its own fan, so an angular order can name
+        // triangles that do not share an edge, which the dual walk cannot
+        // follow.
         let mut ring: Vec<Vec<i32>> = vec![Vec::new(); positions.len()];
         for (tri, welded) in tri_welded.iter().enumerate() {
             for corner in 0..3 {
                 ring[welded[corner] as usize].push(tri as i32);
             }
         }
-        for (welded, ring) in ring.iter_mut().enumerate() {
-            if ring.len() < 3 {
+        let mut across: HashMap<(i32, i32), Vec<i32>> = HashMap::new();
+        for (tri, welded) in tri_welded.iter().enumerate() {
+            for corner in 0..3 {
+                let a = welded[corner];
+                let b = welded[(corner + 1) % 3];
+                let key = if a < b { (a, b) } else { (b, a) };
+                across.entry(key).or_default().push(tri as i32);
+            }
+        }
+        for (vertex, fan) in ring.iter_mut().enumerate() {
+            if fan.len() < 3 {
                 return Err(Error::invalid(
                     0,
                     "a vertex of the mesh has fewer than three faces, so it cannot be written \
                      as JT 9.x/10.x",
                 ));
             }
-            let normal = vertex_normal(&tri_welded, &positions, ring);
-            let (axis_u, axis_v) = tangent_basis(normal);
-            let center = positions[welded];
-            let mut angles: Vec<(i32, f64)> = ring
-                .iter()
-                .map(|&tri| {
-                    let (du, dv) = ring_angle(
-                        &tri_welded[tri as usize],
-                        welded as i32,
-                        &positions,
-                        center,
-                        axis_u,
-                        axis_v,
-                    );
-                    (tri, dv.atan2(du))
-                })
-                .collect();
-            angles.sort_by(|a, b| a.1.total_cmp(&b.1));
-            *ring = angles.into_iter().map(|(tri, _)| tri).collect();
+            let welded = vertex as i32;
+            let start = fan[0];
+            let mut order: Vec<i32> = Vec::with_capacity(fan.len());
+            let mut current = start;
+            while !order.contains(&current) {
+                order.push(current);
+                let corners = tri_welded[current as usize];
+                let at = (0..3)
+                    .find(|&corner| corners[corner] == welded)
+                    .expect("a triangle of the fan holds the vertex of the fan");
+                // The winding is counter-clockwise about the outward normal, so
+                // the next triangle of the fan shares the edge arriving at the
+                // vertex: the one leaving the corner before it.
+                let other = corners[(at + 2) % 3];
+                let key = if welded < other {
+                    (welded, other)
+                } else {
+                    (other, welded)
+                };
+                let Some(pair) = across.get(&key).filter(|pair| pair.len() == 2) else {
+                    return Err(Error::invalid(
+                        0,
+                        "an edge of the mesh is not shared by exactly two triangles, so it \
+                         cannot be written as JT 9.x/10.x",
+                    ));
+                };
+                current = if pair[0] == current { pair[1] } else { pair[0] };
+            }
+            if order.len() != fan.len() {
+                return Err(Error::invalid(
+                    0,
+                    "the triangles around a vertex of the mesh do not form a single ring, so \
+                     it cannot be written as JT 9.x/10.x",
+                ));
+            }
+            *fan = order;
         }
 
         Ok(Self {
@@ -266,87 +297,6 @@ impl Target {
             .find(|&corner| self.triangles[tri as usize][corner] == welded)
             .map_or(-1, |corner| corner as i32)
     }
-}
-
-/// The angle of triangle `tri` about `center`, measured in the tangent plane of
-/// `center` from the midpoints of the two edges leaving that vertex.
-fn ring_angle(
-    corners: &[i32; 3],
-    center: i32,
-    positions: &[[f32; 3]],
-    origin: [f32; 3],
-    axis_u: [f64; 3],
-    axis_v: [f64; 3],
-) -> (f64, f64) {
-    let mut du = 0.0;
-    let mut dv = 0.0;
-    for &other in corners {
-        if other == center {
-            continue;
-        }
-        let point = positions[other as usize];
-        let dx = f64::from(point[0] - origin[0]);
-        let dy = f64::from(point[1] - origin[1]);
-        let dz = f64::from(point[2] - origin[2]);
-        du += dx * axis_u[0] + dy * axis_u[1] + dz * axis_u[2];
-        dv += dx * axis_v[0] + dy * axis_v[1] + dz * axis_v[2];
-    }
-    (du, dv)
-}
-
-/// The summed face normal of the triangles in `ring`.
-fn vertex_normal(triangles: &[[i32; 3]], positions: &[[f32; 3]], ring: &[i32]) -> [f64; 3] {
-    let mut sum = [0.0f64; 3];
-    for &tri in ring {
-        let [a, b, c] = triangles[tri as usize];
-        let pa = positions[a as usize];
-        let pb = positions[b as usize];
-        let pc = positions[c as usize];
-        let ux = f64::from(pb[0] - pa[0]);
-        let uy = f64::from(pb[1] - pa[1]);
-        let uz = f64::from(pb[2] - pa[2]);
-        let vx = f64::from(pc[0] - pa[0]);
-        let vy = f64::from(pc[1] - pa[1]);
-        let vz = f64::from(pc[2] - pa[2]);
-        sum[0] += uy * vz - uz * vy;
-        sum[1] += uz * vx - ux * vz;
-        sum[2] += ux * vy - uy * vx;
-    }
-    sum
-}
-
-/// Two unit vectors spanning the plane perpendicular to `normal`.
-fn tangent_basis(normal: [f64; 3]) -> ([f64; 3], [f64; 3]) {
-    let len = vec_len(normal);
-    let n = if len > 0.0 {
-        [normal[0] / len, normal[1] / len, normal[2] / len]
-    } else {
-        [0.0, 0.0, 1.0]
-    };
-    let helper = if n[2].abs() < 0.9 {
-        [0.0, 0.0, 1.0]
-    } else {
-        [1.0, 0.0, 0.0]
-    };
-    let u = cross(helper, n);
-    let ulen = vec_len(u);
-    if ulen == 0.0 {
-        return ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
-    }
-    let u = [u[0] / ulen, u[1] / ulen, u[2] / ulen];
-    (u, cross(n, u))
-}
-
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-fn vec_len(a: [f64; 3]) -> f64 {
-    (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
 }
 
 /// `IncModN`: `value + 1`, wrapping to zero at `len - 1`.
