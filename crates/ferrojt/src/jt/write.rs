@@ -239,19 +239,23 @@ impl Plan {
             self.kept[index].loads.push(*load);
         }
 
-        let mut tier = if matches!(node, Node::RangeLod(_)) {
-            LodWalk::FIRST
-        } else {
-            tier
-        };
+        // Every resolved child of a range LOD is one tier, whatever its class,
+        // counted the way `build_node` counts them.
+        let range_lod = matches!(node, Node::RangeLod(_));
+        let mut position = 0;
         for child in graph.children_of(node) {
             let Some(child) = child else {
                 self.kept[index].children.push(None);
                 continue;
             };
-            let kept = self.walk(graph, options, filter, child, tier);
+            let walk = if range_lod {
+                LodWalk::tier(position)
+            } else {
+                tier
+            };
+            position += 1;
+            let kept = self.walk(graph, options, filter, child, walk);
             self.kept[index].children.push(Some(kept));
-            tier.next_tier(graph.nodes[child].node.class_name());
         }
         if let Some(target) = graph.instance_target(node) {
             let kept = self.walk(graph, options, filter, target, tier);

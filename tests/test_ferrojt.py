@@ -749,11 +749,12 @@ def test_shapes_without_vertices_are_left_out_of_the_export() -> None:
     """
     model = ferrojt.read(str(SERVER))
     assert model.node_count == 2158
-    assert model.mesh_count == 105
-    assert model.triangle_count == 124154
+    assert model.mesh_count == 106
+    assert model.triangle_count == 129067
 
     document = glb_json(model.to_bytes("glb"))
-    assert len(document["nodes"]) == model.node_count
+    # Instanced subtrees are written once per path: glTF allows one parent.
+    assert len(document["nodes"]) > model.node_count
     assert len(document["meshes"]) == model.mesh_count
     for mesh in document["meshes"]:
         for primitive in mesh["primitives"]:
@@ -762,14 +763,14 @@ def test_shapes_without_vertices_are_left_out_of_the_export() -> None:
 
 
 @needs_server
-def test_the_file_view_keeps_a_representation_without_vertices() -> None:
-    """The export drops a shape with no vertices, the file view keeps it.
+def test_the_file_view_and_the_export_agree_on_the_server_sample() -> None:
+    """Every representation of the server sample carries geometry.
 
-    ``SampleJT_Server.jt`` declares 36 such shapes; they are instanced, so the
-    file has exactly one representation for them. The arrays stay empty rather
-    than missing, which lets a consumer walk the graph without special cases.
+    Its one shape with faces of more than 64 attributes is instanced 36 times,
+    so the file holds a single representation for it. Its wide masks used to
+    be misread and left it empty; read as a plain ``VecU32`` it has vertices
+    like the other 105, and the export keeps all 106.
     """
-    numpy = pytest.importorskip("numpy")
     jt = ferrojt.JtFile(str(SERVER))
     assert jt.open()
     graph = jt.lsg
@@ -778,19 +779,39 @@ def test_the_file_view_keeps_a_representation_without_vertices() -> None:
     assert len(graph.nodes()) == 2158
     assert len(graph.root().descendants()) == 2157
 
-    # 106 representations, one of them empty — the export keeps the other 105.
     assert graph.representation_count == 106
-    empty = [mesh.id for mesh in graph.meshes() if mesh.is_empty]
-    assert len(empty) == 1
-    assert len([mesh for mesh in graph.meshes() if not mesh.is_empty]) == 105
+    assert [mesh.id for mesh in graph.meshes() if mesh.is_empty] == []
+    assert graph.representation_count == ferrojt.read(str(SERVER)).mesh_count
 
-    mesh = graph.mesh(empty[0])
-    assert mesh.vertex_count == 0
-    assert mesh.triangle_count == 0
-    for name in mesh.array_names:
-        array = mesh.array(name)
-        assert len(array) == 0
-        data = numpy.asarray(array)
-        assert data.size == 0
-        assert data.dtype == (numpy.int32 if name == "indices" else numpy.float32)
-        assert memoryview(array).nbytes == 0
+
+def test_a_channel_the_file_leaves_out_is_a_zero_length_array(tmp_path) -> None:
+    """A missing channel is an empty array of the right dtype, not an error.
+
+    A shape built without normals is written with no normal binding, so its
+    ``normals`` channel stays empty. The buffer still resolves, which lets
+    ``numpy`` hand out an empty ``float32`` array instead of falling back to a
+    zero-dimensional object array.
+    """
+    numpy = pytest.importorskip("numpy")
+    builder = ferrojt.JtBuilder()
+    part = builder.add_node(builder.root(), "Part", "triangle")
+    triangle = ferrojt.MeshData(
+        [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0], [0, 1, 2], normals=[]
+    )
+    builder.add_shape(part, triangle)
+    path = tmp_path / "no-normals.jt"
+    builder.save(str(path))
+
+    jt = ferrojt.JtFile(str(path))
+    assert jt.open()
+    (mesh,) = jt.lsg.meshes()
+    assert not mesh.is_empty
+    assert mesh.triangle_count == 1
+    assert mesh.normal_count == 0
+
+    array = mesh.array("normals")
+    assert len(array) == 0
+    data = numpy.asarray(array)
+    assert data.size == 0
+    assert data.dtype == numpy.float32
+    assert memoryview(array).nbytes == 0

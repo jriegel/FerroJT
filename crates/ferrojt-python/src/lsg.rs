@@ -799,8 +799,8 @@ impl JtMesh {
     }
 
     /// `True` when the representation declares no vertices at all. A JT file
-    /// may hold empty shapes — `SampleJT_Server.jt` has 36 of them — and an
-    /// export leaves those out because glTF requires positions.
+    /// may hold empty shapes, and an export leaves those out because glTF
+    /// requires positions.
     #[getter]
     fn is_empty(&self) -> bool {
         self.geometry()
@@ -1063,11 +1063,10 @@ impl JtArray {
 
     /// Resolve the channel against the geometry of the representation.
     ///
-    /// A representation without vertices (`SampleJT_Server.jt` has 36 of them)
-    /// still resolves: it yields a zero-length buffer, so `numpy.asarray` gets
-    /// an empty array of the right dtype instead of failing the buffer
-    /// protocol, which would make NumPy fall back to a zero-dimensional object
-    /// array.
+    /// An empty channel — no vertices at all, or no normals — still resolves:
+    /// it yields a zero-length buffer, so `numpy.asarray` gets an empty array
+    /// of the right dtype instead of failing the buffer protocol, which would
+    /// make NumPy fall back to a zero-dimensional object array.
     fn layout(&self) -> Option<Layout> {
         let geometry = self.mesh.get().geometry()?;
         let (values, count) = match self.channel {

@@ -28,6 +28,10 @@ const CODEC_HUFFMAN: u8 = 2;
 const CODEC_ARITHMETIC: u8 = 3;
 /// Mark 2 split value codec.
 const CODEC_CHOPPER: u8 = 4;
+/// JT 10.x move-to-front codec.
+const CODEC_MOVE_TO_FRONT: u8 = 5;
+/// The number of recent values a move-to-front package can refer back to.
+const MOVE_TO_FRONT_WINDOW: usize = 16;
 
 /// The bit-based codecs reachable from a package header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +81,14 @@ enum Payload {
         /// Bias added to the result.
         bias: i32,
     },
+    /// A JT 10.x move-to-front package.
+    MoveToFront {
+        /// The values that enter the window, in order of first use.
+        values: Box<Package>,
+        /// One entry per output value: `-1` takes the next value from `values`,
+        /// any other entry reuses the window slot at that position.
+        offsets: Box<Package>,
+    },
 }
 
 /// An integer codec package.
@@ -116,6 +128,7 @@ impl Package {
             Some(Payload::Null { words }) => words.len(),
             Some(Payload::Bits { out_count, .. }) => *out_count,
             Some(Payload::Chopper { msb, .. }) => msb.out_val_count(),
+            Some(Payload::MoveToFront { offsets, .. }) => offsets.out_val_count(),
         }
     }
 
@@ -243,6 +256,20 @@ impl Package {
             });
         }
 
+        if codec == CODEC_MOVE_TO_FRONT {
+            let values = Box::new(Self::load2(cursor)?);
+            let offsets = Box::new(Self::load2(cursor)?);
+            if offsets.out_val_count() != value_count {
+                return Err(cursor.error(format!(
+                    "move-to-front size mismatch: expected {value_count} offsets, got {}",
+                    offsets.out_val_count()
+                )));
+            }
+            return Ok(Self {
+                payload: Some(Payload::MoveToFront { values, offsets }),
+            });
+        }
+
         if codec != CODEC_NULL && codec != CODEC_BITLENGTH && codec != CODEC_ARITHMETIC {
             return Err(cursor.error(format!(
                 "unknown mark 2 codec {codec} in an integer codec package"
@@ -327,6 +354,14 @@ impl Package {
                     .map(|(hi, lo)| (hi.wrapping_shl(shift) | *lo).wrapping_add(bias))
                     .collect()
             }
+            Payload::MoveToFront {
+                mut values,
+                mut offsets,
+            } => {
+                let values = values.decode(order, Unpack::Null)?;
+                let offsets = offsets.decode(order, Unpack::Null)?;
+                move_to_front(&values, &offsets)?
+            }
             Payload::Bits {
                 kind,
                 contexts,
@@ -360,6 +395,42 @@ impl Package {
         unpack.apply(&mut values);
         Ok(values)
     }
+}
+
+/// Replays a move-to-front package.
+///
+/// The window holds the most recently used values, newest first. An offset of
+/// `-1` brings the next fresh value into the window; any other offset moves
+/// that window entry to the front. Either way the fronted value is emitted.
+fn move_to_front(values: &[i32], offsets: &[i32]) -> Result<Vec<i32>> {
+    let mut window: Vec<i32> = Vec::with_capacity(MOVE_TO_FRONT_WINDOW + 1);
+    let mut fresh = values.iter();
+    let mut out = Vec::with_capacity(offsets.len());
+    for &offset in offsets {
+        let value = if offset == -1 {
+            let value = *fresh
+                .next()
+                .ok_or_else(|| Error::corrupt("move-to-front package ran out of values"))?;
+            window.insert(0, value);
+            window.truncate(MOVE_TO_FRONT_WINDOW);
+            value
+        } else {
+            let slot = usize::try_from(offset)
+                .ok()
+                .filter(|slot| *slot < window.len())
+                .ok_or_else(|| {
+                    Error::corrupt(format!(
+                        "move-to-front offset {offset} outside a window of {}",
+                        window.len()
+                    ))
+                })?;
+            let value = window.remove(slot);
+            window.insert(0, value);
+            value
+        };
+        out.push(value);
+    }
+    Ok(out)
 }
 
 /// Reads `words` 32-bit words as raw bytes, keeping the file byte order.
@@ -449,6 +520,52 @@ mod tests {
             .expect("decode");
         assert_eq!(values, [104, 109]);
         assert_eq!(cursor.remaining(), 0);
+    }
+
+    /// A mark 2 null package holding `values`.
+    fn mark2_null(values: &[i32]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&(values.len() as i32).to_le_bytes());
+        data.push(CODEC_NULL);
+        data.extend_from_slice(&(values.len() as i32 * 32).to_le_bytes());
+        data.extend_from_slice(&little_endian(values));
+        data
+    }
+
+    #[test]
+    fn move_to_front_replays_the_window() {
+        // Fresh values 7 and 9; the offsets reuse them from the window.
+        let mut data = Vec::new();
+        data.extend_from_slice(&5i32.to_le_bytes()); // value count
+        data.push(CODEC_MOVE_TO_FRONT);
+        data.extend_from_slice(&mark2_null(&[7, 9]));
+        data.extend_from_slice(&mark2_null(&[-1, 0, -1, 1, 0]));
+        let mut cursor = Cursor::new(&data, ByteOrder::Little, 10);
+        let mut package = Package::load2(&mut cursor).expect("load");
+        assert_eq!(package.out_val_count(), 5);
+        assert_eq!(cursor.remaining(), 0);
+        let values = package
+            .decode(ByteOrder::Little, Unpack::Null)
+            .expect("decode");
+        assert_eq!(values, [7, 7, 9, 7, 7]);
+    }
+
+    #[test]
+    fn move_to_front_keeps_sixteen_values() {
+        let fresh: Vec<i32> = (100..117).collect();
+        let mut offsets = vec![-1; fresh.len()];
+        // The window is full after sixteen values, so the first one has left it
+        // and the oldest slot holds the second.
+        offsets.push(15);
+        assert_eq!(move_to_front(&fresh, &offsets).expect("decode")[17], 101);
+        offsets.push(16);
+        assert!(move_to_front(&fresh, &offsets).is_err());
+    }
+
+    #[test]
+    fn move_to_front_needs_a_fresh_value_per_escape() {
+        assert!(move_to_front(&[1], &[-1, -1]).is_err());
+        assert!(move_to_front(&[], &[0]).is_err());
     }
 
     #[test]

@@ -41,13 +41,16 @@ Submodules:
    declares no vertices at all contributes no mesh: glTF needs a `POSITION`
    attribute in every primitive, so there is nothing to write. The node that
    holds it is kept, exactly as for a filtered part or a coarse tier — the graph
-   keeps its shape, only the drawing is skipped. `SampleJT_Server.jt` declares
-   36 such empty shapes out of 850 representations.
+   keeps its shape, only the drawing is skipped. No sample has such a shape: the
+   36 empty ones `SampleJT_Server.jt` seemed to have were one instanced shape
+   whose wide attribute masks were misread.
 4. Only the finest level of detail of a range LOD. A `RangeLOD` lists its
    children from the finest tier down and JT does not store that tier, so it is
-   counted while walking: the first group below a `RangeLOD` is tier 0, the next
-   tier 1, and so on. A shape at any other tier contributes no mesh, which is
-   what the reference glTF writer does. The nodes themselves are all kept, so
+   counted while walking: the first child below a `RangeLOD` is tier 0, the next
+   tier 1, and so on, whatever the class of the child — the plate samples wrap
+   each tier in a group, the NIST parts list the finer tiers as bare shapes.
+   A shape at any other tier contributes no mesh, and the JT writer drops the
+   same representations. The nodes themselves are all kept, so
    the graph keeps its shape, and `Mesh::lod_level` records the tier a mesh came
    from. `jt::dump` is not filtered — a dump still reports every tier.
 5. An `Instance` node keeps the subtree it points at. JT stores an instantiated
@@ -70,8 +73,9 @@ Submodules:
     `Translation Date::`, `LAYER::`, the `LAYERFILTERnnn::` records and
     whatever else the CAD system wrote. The pairs come from
     `jt::key_value_pairs`, are stored as a sorted map, and stay `None` when the
-    stream is empty. Neither exporter emits them, so they are there for a
-    consumer that wants them — the viewer's detail pane shows them.
+    stream is empty. The glTF writer emits them as the `extras` of the node,
+    on every copy of an instanced subtree; the USD writer does not. The
+    viewer's detail pane shows them too.
 
 ## Materials and colours
 
@@ -179,9 +183,8 @@ its target share one id. That id is the instancing key:
   `[4, 5, 6]`, and `mesh(0)` is an `IndexError`.
 * Unlike `to_model()`, the file view **keeps** a representation with no vertices:
   glTF mandates a `POSITION` attribute and drops it, a python consumer may still
-  want to see it. `SampleJT_Server.jt` declares 36 such shapes, which collapse to
-  one shared representation because they are instanced — `representation_count`
-  is 106, the pinned 105 meshes plus that one.
+  want to see it. No sample has one: `SampleJT_Server.jt` has 106
+  representations and the export keeps all 106 meshes.
 
 ### Zero-copy arrays
 
@@ -233,7 +236,7 @@ slot then, so pyo3 compiles `__getbuffer__` out below it.
   diffuse colours of the file — both in the model and in the exported glTF — as
   one material per distinct colour, and exports to glTF for every sample: each
   primitive of each one has a non-empty `POSITION` attribute, which is what
-  `SampleJT_Server.jt` and its 36 empty representations used to break.
+  `SampleJT_Server.jt` broke while its wide attribute masks were misread.
 * `crates/ferrojt/tests/dump.rs` — every sample with a reference dump under
   `data/Reference` matches it semantically, and every dump is valid JSON.
 * Unit tests in `jt/decode` compare the codecs against the reference output byte

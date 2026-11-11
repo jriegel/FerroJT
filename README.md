@@ -135,6 +135,7 @@ cargo run -p ferrojt-cli -- convert gear.jt -f glb -o gear.glb
 cargo run -p ferrojt-cli -- convert gear.jt -f usd -o gear.usda
 cargo run -p ferrojt-cli -- convert gear.jt --layer-filter LAYCUR -o gear.glb
 cargo run -p ferrojt-cli -- convert gear.jt --no-layer-filter -o gear.glb
+cargo run -p ferrojt-cli -- convert gear.jt --require-geometry -o gear.glb
 cargo run -p ferrojt-cli -- write    gear.jt -o gear.out.jt
 cargo run -p ferrojt-cli -- write    gear.jt --all-lods --no-layer-filter
 cargo run -p ferrojt-cli -- write    gear.jt --layer-filter LAYCUR --compress
@@ -148,6 +149,8 @@ one JSON array. A dump is never filtered by layer.
 `convert` applies the layer filter the file declares as active, or its first
 filter when the file leaves that unset: `--layer-filter NAME` picks another one
 of the declared filters, and `--no-layer-filter` exports every part.
+A file that yields no mesh is still written, with a warning;
+`--require-geometry` makes that an error and writes nothing.
 
 `write` rebuilds the file as JT. It applies the same selection an export
 applies — the finest tier below a range LOD and the active layer filter —
@@ -189,8 +192,8 @@ key/value detail pane below, reporting what the selected row carries — its cla
 and name, transform, world box, meshes with triangle counts, materials and LOD
 tier, and the raw properties a JT file stores in the meta data stream of that
 node (`Name::`, `CAD_MASS::`, `LAYER::` and the rest). Those properties are read
-by the library and kept in `Node::extras`; neither the glTF nor the USD writer
-emits them, so the detail pane is their only exit.
+by the library and kept in `Node::extras`; the glTF writer emits them as the
+`extras` of the node, the USD writer does not.
 
 Hiding a node or filtering the tree never removes it from the graph: a hidden
 subtree keeps its rows, its place in the tree and its selection, and `View All`
