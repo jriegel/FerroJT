@@ -74,7 +74,7 @@ wrappers):
 | --- | --- | --- | --- | --- |
 | `example_block_jt9.5.jt` | 1 | 12 | 1 | 0 |
 | `opening_protection_plate1_jt9.5.jt` | 2 | 486 | 2 | 1 |
-| `SampleJT_Server.jt` | 105 | 124 154 | 23 | 529 |
+| `SampleJT_Server.jt` | 106 | 129 067 | 23 | 529 |
 
 ## Materials: deduplicated by value
 
