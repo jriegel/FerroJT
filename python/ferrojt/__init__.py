@@ -9,11 +9,35 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._ferrojt import JtFile, Model, __version__, detect_format, open
+from ._ferrojt import (
+    JtArray,
+    JtBuilder,
+    JtFile,
+    JtLsg,
+    JtMesh,
+    JtNode,
+    MaterialData,
+    MeshData,
+    MeshHandle,
+    Model,
+    NodeHandle,
+    __version__,
+    detect_format,
+    open,
+)
 
 __all__ = [
+    "JtArray",
+    "JtBuilder",
     "JtFile",
+    "JtLsg",
+    "JtMesh",
+    "JtNode",
+    "MaterialData",
+    "MeshData",
+    "MeshHandle",
     "Model",
+    "NodeHandle",
     "open",
     "detect_format",
     "__version__",

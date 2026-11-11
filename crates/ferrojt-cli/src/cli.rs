@@ -41,6 +41,8 @@ pub enum Command {
     Dump(DumpArgs),
     /// Convert a file to another format.
     Convert(ConvertArgs),
+    /// Write a file back out as JT, optionally filtered.
+    Write(WriteArgs),
     /// List the scene graph.
     Ls(LsArgs),
 }
@@ -122,6 +124,38 @@ pub struct LsArgs {
     /// Do not draw a progress bar.
     #[arg(long)]
     pub no_progress: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WriteArgs {
+    /// File to read.
+    pub input: PathBuf,
+
+    /// Output file. Defaults to the input name with `.out.jt` appended.
+    #[arg(short, long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Keep every level of detail. Without this only the finest tier of a
+    /// range LOD is written, which is what an export uses.
+    #[arg(long)]
+    pub all_lods: bool,
+
+    /// Named layer filter to apply. Defaults to the filter the file declares
+    /// as active, or to its first filter when the file leaves that unset.
+    #[arg(long, value_name = "NAME", conflicts_with = "no_layer_filter")]
+    pub layer_filter: Option<String>,
+
+    /// Write every part and ignore the layer filters of the file.
+    #[arg(long)]
+    pub no_layer_filter: bool,
+
+    /// Compress the rebuilt scene graph instead of storing it uncompressed.
+    #[arg(long)]
+    pub compress: bool,
+
+    /// Replace the output file if it exists.
+    #[arg(short = 'y', long)]
+    pub force: bool,
 }
 
 /// Formats `ferrojt` can write.
@@ -304,6 +338,67 @@ fn check_geometry(model: &Model, input: &Path, required: bool) -> Result<()> {
     Ok(())
 }
 
+/// Write a JT file back out, dropping what the filters reject.
+pub fn write(args: &WriteArgs) -> Result<()> {
+    let file = jt_file(&args.input)?;
+    let output = args
+        .output
+        .clone()
+        .unwrap_or_else(|| default_jt_output(&args.input));
+    if output.exists() && !args.force {
+        bail!("{} exists; pass --force to overwrite", output.display());
+    }
+
+    let options = ferrojt::jt::WriteOptions {
+        all_lods: args.all_lods,
+        no_layer_filter: args.no_layer_filter,
+        layer_filter: args.layer_filter.clone(),
+        compress: args.compress,
+    };
+    let bar = spinner("JT");
+    ferrojt::jt::write_to_file(&file, &output, &options)
+        .map_err(|err| map_error(&args.input, err))
+        .with_context(|| format!("writing {}", output.display()))?;
+    finish(bar);
+
+    let written = ferrojt::jt::JtFile::open(&output)
+        .map_err(|err| map_error(&output, err))
+        .with_context(|| format!("reading {} back", output.display()))?;
+    let before = summarize(&file)?;
+    let after = summarize(&written)?;
+    println!(
+        "{} -> {} [JT {}]  {} nodes, {} representations, {} segments",
+        args.input.display(),
+        output.display(),
+        written.header.version_text(),
+        after.0,
+        after.1,
+        written.toc.len()
+    );
+    if before != after {
+        println!(
+            "  filtered: {} nodes and {} representations dropped",
+            before.0.saturating_sub(after.0),
+            before.1.saturating_sub(after.1)
+        );
+    }
+    Ok(())
+}
+
+/// Nodes and representations a loaded file holds.
+fn summarize(file: &ferrojt::jt::JtFile) -> Result<(usize, usize)> {
+    let graph = file
+        .lsg
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("the file has no logical scene graph"))?;
+    let representations = graph
+        .loaded
+        .iter()
+        .filter(|stored| stored.element.geometry().is_some())
+        .count();
+    Ok((graph.nodes.len(), representations))
+}
+
 pub fn ls(args: &LsArgs) -> Result<()> {
     let model = load(&args.input)?;
     let bar = if args.no_progress {
@@ -412,6 +507,15 @@ fn print_summary(path: &Path, model: &Model, json: bool) -> Result<()> {
 fn default_output(input: &Path, format: Option<TargetFormat>) -> PathBuf {
     let format = format.map(Format::from).unwrap_or(Format::Glb);
     input.with_extension(format.extension())
+}
+
+/// Default name for a rewritten JT file.
+///
+/// `with_extension` cannot be used here: the sample files carry a dot in their
+/// stem (`example_block_jt9.5.jt`), which it would truncate at.
+fn default_jt_output(input: &Path) -> PathBuf {
+    let stem = input.file_stem().unwrap_or_default().to_string_lossy();
+    input.with_file_name(format!("{stem}.out.jt"))
 }
 
 fn spinner(label: &str) -> ProgressBar {

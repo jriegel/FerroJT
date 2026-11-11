@@ -19,13 +19,18 @@
 //! - the loader that ties it together: [`JtFile`], [`SceneGraph`], the
 //!   property table and the late-loaded representations [`LoadedElement`],
 //! - a JT native JSON writer that reports a file the way the classic JT
-//!   tooling does: [`dump`], [`write_model`] and [`recurse_down_the_tree`].
+//!   tooling does: [`dump`], [`write_model`] and [`recurse_down_the_tree`],
+//! - and a JT writer that rebuilds a file, optionally filtered: [`write_to_bytes`]
+//!   and [`WriteOptions`],
+//! - and a builder that creates a file from nothing: [`JtBuilder`], [`MeshData`]
+//!   and [`BuildNode`].
 
 use std::path::Path;
 
 use crate::error::Result;
 use crate::model::Model;
 
+mod build;
 mod decode;
 mod dump;
 mod guid;
@@ -33,7 +38,9 @@ mod model;
 mod object;
 mod reader;
 mod segment;
+mod write;
 
+pub use build::{BuildNode, JtBuilder, JtMesh, JtNode, MaterialData, MeshData};
 pub use decode::{
     Context, Decoded, ESCAPE, Entry, Kind, MeshInput, Package, PointQuantizer, Topology,
     UnifiedMesh, UniformQuantizer, Unpack, VertexData,
@@ -47,7 +54,7 @@ pub use dump::{
 pub use guid::Guid;
 pub use model::{
     JtFile, LayerFilter, LoadedElement, ObjectRef, SceneGraph, StoredAttribute, StoredNode,
-    StoredProperty,
+    StoredProperty, decompose_transform, transform_of,
 };
 pub use object::{
     Attribute, Class, Deferred, Element, GeometricTransform, LateLoad, LodGeometry, Material, Node,
@@ -56,6 +63,7 @@ pub use object::{
 };
 pub use reader::Cursor;
 pub use segment::{FileHeader, Segment, TocEntry, segment_type_name};
+pub use write::{WriteOptions, write_to_bytes, write_to_file};
 
 /// Open a JT file and translate it into a [`Model`].
 pub fn open(path: impl AsRef<Path>) -> Result<Model> {

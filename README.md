@@ -70,6 +70,8 @@ FerroJT is a Rust workspace with four parts:
 | JT decode codecs (Huffman, range/CDP, vertex and mesh coders) | done |
 | glTF 2.0 / GLB writer | done |
 | USD writer (ASCII `.usda`) | done — each mesh written once and referenced, materials deduplicated by value |
+| JT writer (rebuild a read file, LOD and layer filtered) | done — a round trip re-reads to the same dump, structure and picture |
+| JT builder (create a file from nothing, meshes and instances) | done — JT 8.1, `tests/test_build.py` builds a cube and reads it back |
 | CLI | done |
 | Python bindings | done (packaged with `maturin`) |
 | Visual regression (rendered export vs. reference picture) | done (`tests/test_visual.py`, Open3D) |
@@ -91,7 +93,8 @@ crates/
       model/               neutral scene graph (nodes, meshes, materials, ...)
       codec/               endian, bit reader, compression
       jt/                  OpenJT reader, segment/TOC table, element objects,
-                           decode codecs and the JSON dump writer
+                           decode codecs, the JSON dump writer, the JT writer
+                           and the builder that creates a file from nothing
       export/              gltf/glb writer, glb framing, ascii usd writer
       error.rs  lib.rs
   ferrojt-cli/             `ferrojt` binary
@@ -133,6 +136,9 @@ cargo run -p ferrojt-cli -- convert gear.jt -f usd -o gear.usda
 cargo run -p ferrojt-cli -- convert gear.jt --layer-filter LAYCUR -o gear.glb
 cargo run -p ferrojt-cli -- convert gear.jt --no-layer-filter -o gear.glb
 cargo run -p ferrojt-cli -- convert gear.jt --require-geometry -o gear.glb
+cargo run -p ferrojt-cli -- write    gear.jt -o gear.out.jt
+cargo run -p ferrojt-cli -- write    gear.jt --all-lods --no-layer-filter
+cargo run -p ferrojt-cli -- write    gear.jt --layer-filter LAYCUR --compress
 ```
 
 `dump` writes the same JSON the reference JT dump tool produces: the header, the
@@ -145,6 +151,13 @@ filter when the file leaves that unset: `--layer-filter NAME` picks another one
 of the declared filters, and `--no-layer-filter` exports every part.
 A file that yields no mesh is still written, with a warning;
 `--require-geometry` makes that an error and writes nothing.
+
+`write` rebuilds the file as JT. It applies the same selection an export
+applies — the finest tier below a range LOD and the active layer filter —
+unless `--all-lods` or `--no-layer-filter` says otherwise, and it copies every
+segment but the scene graph out of the source unchanged. The result is re-read
+and reported, so the second line of output says what the filters cost. See
+[docs/jt-writer.md](docs/jt-writer.md).
 
 ## Rust viewer
 
@@ -234,7 +247,94 @@ The keywords work on `ferrojt.open`, `ferrojt.read`, `JtFile.model`,
 `JtFile.writeGlTf` and `JtFile.write_gltf`; combining the two of them raises
 `ValueError`.
 
-Requires Python 3.10 or newer.
+### Walking the scene graph
+
+`Model` is what the exporters build: one node tree, only the finest LOD tier, the
+layer filter already applied. `JtFile.lsg` is the other view — the logical scene
+graph **of the file**, with every tier, the JT class names, the key/value
+properties a translator wrote, the layer tags and the attributes.
+
+```python
+jt = ferrojt.JtFile("gear.jt")
+jt.open()
+graph = jt.lsg                       # JtLsg: the LSG of the file
+
+root = graph.root()                  # JtNode
+print(root.class_name, root.name)    # 'Partition' 'gear.asm'
+for child in root:                   # iterate, len(), root[0], root[-1]
+    print(child.class_name, child.name, child.properties())
+
+node = graph.nodes()[2]              # every node, in file order
+print(node.class_name, node.bounds, node.area)
+print(node.properties())             # {'Name::': ..., 'CAD_MASS::': ...}
+print(node.layers, node.material())  # layer tags, shading of a shape
+print(node.transform)                # {'translation': ..., 'rotation': ..., 'scale': ...}
+```
+
+Meshes are the special case, because a JT file *instances* them: the plate
+samples hold one screw and place it twice. A representation is identified by its
+id — its position in the representation list of the file — so the two placements
+report the same ids and the geometry is read once.
+
+```python
+for mesh in graph.meshes():          # every representation of the file, once
+    print(mesh.id, mesh.vertex_count, mesh.triangle_count)
+
+for instance in (n for n in graph.nodes() if n.is_instance):
+    print(instance.name, instance.transform["translation"])
+    print(instance.mesh_ids)         # [] — an instance carries no geometry
+    print(instance.subtree_mesh_ids())   # the ids it shares with its twin
+```
+
+Each array of a representation implements the buffer protocol, so NumPy wraps it
+**without copying** — the view points straight at the decoded buffers of the file
+and keeps them alive. That is how a mesh gets to OpenMesh, trimesh or VTK without
+any C++ dependency.
+
+```python
+import numpy as np
+
+mesh = graph.mesh(4)
+vertices = np.asarray(mesh.array("vertices"))   # float32, (n, 3), read-only
+normals = np.asarray(mesh.array("normals"))     # float32, (n, 3)
+indices = np.asarray(mesh.array("indices"))     # int32, (m,)
+assert vertices.flags.owndata is False          # borrowed, not copied
+mesh.array_names                                # ['indices', 'vertices', 'normals']
+mesh.arrays()                                   # all three as a dict
+```
+
+Requires Python 3.11 or newer.
+
+### Building a file
+
+`JtBuilder` is the way in: it starts as an empty file holding only its root
+`Partition`, you fill the scene graph node by node, and `save` writes it as
+JT 8.1. The nodes are opaque handles that belong to their builder, so a handle
+of another builder is refused.
+
+```python
+import ferrojt
+
+builder = ferrojt.JtBuilder()
+root = builder.root()
+part = builder.add_node(root, "Part", "cube")
+shape = builder.add_shape(part, ferrojt.MeshData(vertices, indices), name="cube shape")
+builder.set_material(shape, ferrojt.MaterialData(diffuse=[0.2, 0.6, 0.9, 1.0]))
+builder.set_translation(part, [-20.0, 0.0, 0.0])
+
+left = builder.instance_of(root, part)     # shares the subtree of part
+right = builder.instance_of(root, part)    # ... and its geometry
+builder.set_translation(right, [20.0, 0.0, 0.0])
+builder.save("cube.jt")
+```
+
+A mesh is handed over the way a modeller emits one — shared corners and all —
+and the builder explodes it to one slot per triangle corner, because a JT 8.x
+faceted shape stores the normal per slot and cannot share a corner. Read the
+file back with `ferrojt.open` or `ferrojt.JtFile` like any other: the graph, the
+names, the placements and the triangles come back unchanged, and the two
+instances still share one representation. `docs/jt-builder.md` holds the layout
+the writer emits and what it leaves open.
 
 ### Visual regression
 
@@ -294,8 +394,8 @@ the same extra as the visual regression test, `pip install -e ".[test,visual]"`.
 
 ### Wheels
 
-`pyo3` is built with the `abi3-py310` feature, so the extension uses the stable
-ABI: **one wheel per platform covers every CPython from 3.10 upwards**, there is
+`pyo3` is built with the `abi3-py311` feature, so the extension uses the stable
+ABI: **one wheel per platform covers every CPython from 3.11 upwards**, there is
 no wheel per Python version. `build-wheel.bat` builds them all into `dist/`:
 
 ```bat
@@ -308,8 +408,8 @@ build-wheel.bat sdist      source distribution only
 It produces
 
 ```text
-ferrojt-0.1.0-cp310-abi3-win_amd64.whl                                    Windows
-ferrojt-0.1.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl   Linux, glibc >= 2.17
+ferrojt-0.1.0-cp311-abi3-win_amd64.whl                                    Windows
+ferrojt-0.1.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl   Linux, glibc >= 2.17
 ferrojt-0.1.0.tar.gz                                                      source distribution
 ```
 

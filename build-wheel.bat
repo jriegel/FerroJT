@@ -2,15 +2,16 @@
 setlocal EnableExtensions
 
 rem ===========================================================================
-rem  FerroJT - build the Python wheels for PyPI (stable ABI, abi3-py310)
+rem  FerroJT - build the Python wheels for PyPI (stable ABI, abi3-py311)
 rem
-rem  pyo3 is built with the "abi3-py310" feature, so ONE wheel per platform
-rem  covers every CPython from 3.10 upwards - there is no wheel per Python
-rem  version to build.
+rem  pyo3 is built with the "abi3-py311" feature, so ONE wheel per platform
+rem  covers every CPython from 3.11 upwards - there is no wheel per Python
+rem  version to build. 3.11 is the floor because the stable ABI only gained
+rem  the bf_getbuffer slot then, which the zero-copy arrays of JtArray need.
 rem
 rem  Output in dist/ :
-rem    ferrojt-<ver>-cp310-abi3-win_amd64.whl                       Windows
-rem    ferrojt-<ver>-cp310-abi3-manylinux_2_17_x86_64.whl           Linux (zig cross)
+rem    ferrojt-<ver>-cp311-abi3-win_amd64.whl                       Windows
+rem    ferrojt-<ver>-cp311-abi3-manylinux_2_17_x86_64.whl           Linux (zig cross)
 rem    ferrojt-<ver>.tar.gz                                        source distribution
 rem
 rem  Usage:
@@ -64,7 +65,7 @@ if exist "%OUT%" rmdir /s /q "%OUT%"
 mkdir "%OUT%"
 
 rem --------------------------------------------------------------------------
-rem 2. Windows wheel - stable ABI, one wheel for all Python >= 3.10
+rem 2. Windows wheel - stable ABI, one wheel for all Python >= 3.11
 rem --------------------------------------------------------------------------
 if "%WHAT%"=="linux" goto :linux
 if "%WHAT%"=="sdist" goto :sdist
@@ -81,7 +82,7 @@ echo.
 echo == Linux wheel, cross-compiled with zig ===================================
 rem -i is required: without an interpreter maturin probes "python3", which on
 rem Windows resolves to the Microsoft Store stub. The abi3 wheel is not bound to
-rem that version - it is tagged cp310-abi3 and serves CPython 3.10 and up.
+rem that version - it is tagged cp311-abi3 and serves CPython 3.11 and up.
 "%PY%" -m maturin build --release --locked --strip --target %LINUX_TARGET% --zig --compatibility manylinux_2_17 -i "%PY%" -o "%OUT%" || goto :linux_failed
 
 rem Optional musllinux (Alpine) wheel - uncomment if you want it.

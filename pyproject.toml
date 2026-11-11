@@ -7,7 +7,7 @@ name = "ferrojt"
 version = "0.1.0"
 description = "Read OpenJT (JT) files and convert them to glTF / USD."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT OR Apache-2.0"
 authors = [{ name = "Juergen Riegel" }]
 keywords = ["jt", "openjt", "cad", "gltf", "glb", "usd", "converter"]
@@ -20,7 +20,8 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+# numpy is a test dependency because the mesh arrays are checked through it.
+test = ["pytest>=8", "numpy>=1.26"]
 # Rendering the export for the visual regression tests (tests/test_visual.py).
 visual = ["open3d>=0.20", "numpy>=1.26"]
 

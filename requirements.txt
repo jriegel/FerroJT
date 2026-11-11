@@ -6,17 +6,17 @@
 # The ferrojt package itself is a Rust/pyo3 extension, not on PyPI yet — install
 # the locally built wheel (or `maturin develop`) before/after this file:
 #
-#   .\.venv\Scripts\python.exe -m pip install --force-reinstall dist\ferrojt-0.1.0-cp310-abi3-win_amd64.whl
+#   .\.venv\Scripts\python.exe -m pip install --force-reinstall dist\ferrojt-0.1.0-cp311-abi3-win_amd64.whl
 #
 # Versions below match the toolchain baseline in AGENTS.md (Python 3.13.7); the
 # lower bounds are the same as [project.optional-dependencies] in pyproject.toml.
 
 # --- the package under test -------------------------------------------------
-# Built by maturin from crates/ferrojt-python (abi3, CPython >= 3.10) and not on
+# Built by maturin from crates/ferrojt-python (abi3, CPython >= 3.11) and not on
 # PyPI yet, so it is not a resolvable requirement name here. Install the wheel
 # for your platform first — pip cannot pick the right one out of dist/ for you:
-#   Windows : .\.venv\Scripts\python.exe -m pip install --force-reinstall dist\ferrojt-0.1.0-cp310-abi3-win_amd64.whl
-#   Linux   : .venv/bin/python -m pip install --force-reinstall dist/ferrojt-0.1.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+#   Windows : .\.venv\Scripts\python.exe -m pip install --force-reinstall dist\ferrojt-0.1.0-cp311-abi3-win_amd64.whl
+#   Linux   : .venv/bin/python -m pip install --force-reinstall dist/ferrojt-0.1.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 #   or dev  : .\.venv\Scripts\python.exe -m maturin develop
 
 # --- test runner (tests/test_ferrojt.py, tests/test_visual.py) --------------

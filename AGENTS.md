@@ -1,22 +1,22 @@
 # FerroJT — agent notes
 
 Rust cargo workspace plus a Python wrapper that reads OpenJT (`.jt`) and exports
-glTF 2.0 / GLB and ASCII USD (`.usda`). Read this before changing code; the
-design detail lives in `docs/`.
+glTF 2.0 / GLB and ASCII USD (`.usda`), and can write a read file back out as
+JT. Read this before changing code; the design detail lives in `docs/`.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `export/` glTF/GLB writer and the ASCII USD writer. |
-| `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `ls`. |
-| `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `pyproject.toml` + `python/ferrojt/` + `tests/`. |
+| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `jt/write.rs` the JT writer, `jt/build.rs` the builder that creates a file from nothing, and `export/` glTF/GLB writer and the ASCII USD writer. |
+| `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `write`, `ls`. |
+| `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `lib.rs` is the export view (`Model`) plus `lsg.rs` the file view (`JtLsg`/`JtNode`/`JtMesh`/`JtArray`) and `build.rs` the builder (`JtBuilder`/`NodeHandle`/`MeshHandle`/`MeshData`/`MaterialData`); `pyproject.toml` + `python/ferrojt/` + `tests/`. |
 | `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `details.rs` key/value pane for the selected row, `backdrop.rs` viewport gradient, `camera.rs` `Camera3d` wrapper that places the backdrop, `picking.rs`, `trihedron.rs`. |
 | `python/ferrojt/` | Pure-Python package re-exporting `_ferrojt` (`__init__.py`, `_ferrojt.pyi`, `py.typed`). |
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
 | `data/Reference/` | Reference JSON dumps from the JT tooling **and** reference PNG pictures — **the oracle**. |
 | `example/` | GPL-2.0 C++ sources (TKJT, ToolsLib, JtDump, PyOpenJt). Behavioural reference only, never linked or copied; gitignored. |
-| `docs/` | `README.md` index, `architecture.md`, `jt-reader.md`, `dump.md`, `usd-writer.md` and `viewer.png` — the viewer picture shown at the top of the top-level `README.md` (Git LFS). |
+| `docs/` | `README.md` index, `architecture.md`, `jt-reader.md`, `jt-writer.md`, `jt-builder.md`, `dump.md`, `usd-writer.md` and `viewer.png` — the viewer picture shown at the top of the top-level `README.md` (Git LFS). |
 
 ## Commands
 
@@ -26,6 +26,20 @@ cargo test  --workspace --exclude ferrojt-python   # must exclude, see below
 cargo clippy --workspace --all-targets
 cargo fmt --all
 cargo doc --no-deps -p ferrojt
+```
+
+Round-trip a sample through the JT writer (`write` refuses to overwrite, so a
+sweep needs `--force`):
+
+```powershell
+cargo run -p ferrojt-cli -- write data\ExampleFiles\example_block_jt9.5.jt -o target\out.jt --force
+```
+
+Build a file from nothing (the builder, not the writer):
+
+```powershell
+cargo test -p ferrojt --test build          # the Rust side
+.\.venv\Scripts\python.exe -m pytest tests\test_build.py -q   # the Python side
 ```
 
 `ferrojt-python` must be excluded from `cargo test`: its default features enable
@@ -39,6 +53,9 @@ $env:VIRTUAL_ENV = "$PWD\.venv"
 .\.venv\Scripts\python.exe -m pytest
 ```
 
+`maturin develop` takes **no `-i`** — that flag belongs to `maturin build`. With
+`VIRTUAL_ENV` set it installs into the right environment on its own.
+
 Visual regression (needs `open3d`, `pip install -e ".[test,visual]"`; the tests skip
 without it):
 
@@ -48,7 +65,7 @@ without it):
 ```
 
 Interactive viewer (also needs `open3d`; it is a tool, not a test — nothing in it
-is named `test_*`, so pytest still collects 53 tests):
+is named `test_*`, so pytest still collects 80 tests):
 
 ```powershell
 .\.venv\Scripts\python.exe tests\test_viewer.py data\ExampleFiles\example_block_jt9.5.jt
@@ -265,9 +282,57 @@ Upload with `python -m twine upload dist\*`.
   with `Python::attach`); `Python::allow_threads` is gone. Optional args need
   `#[pyo3(signature = (path, format = None))]`. Error mapping:
   `Io`→`PyOSError`, `Invalid`→`PyValueError`, `NotImplemented`→`PyNotImplementedError`.
-- `pyo3` is built with `abi3-py310`, so one wheel per platform covers CPython
-  ≥ 3.10. Tags: `cp310-abi3-win_amd64`,
-  `cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64`.
+- `pyo3` is built with `abi3-py311`, so one wheel per platform covers CPython
+  ≥ 3.11. Tags: `cp311-abi3-win_amd64`,
+  `cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64`. **3.11 is the floor
+  because `__getbuffer__` is compiled out below it** — pyo3 gates the
+  `bf_getbuffer`/`bf_releasebuffer` trampolines on `Py_3_11` (the stable ABI only
+  gained the slot then), which is what `JtArray` is built on. Bumping back to
+  `abi3-py310` silently drops the buffer protocol.
+- **The LSG view (`crates/ferrojt-python/src/lsg.rs`).** `JtFile.lsg` is a
+  `JtLsg` handle holding the parsed `ferrojt::jt::JtFile`; `JtNode`/`JtMesh`/
+  `JtArray` are thin handles that keep it alive through a `Py<Lsg>`, so a handle
+  stays valid on its own and a NumPy view of an array keeps the whole file alive.
+  This is the **file** view (`SceneGraph`, every LOD tier, JT class names, the
+  whole key/value stream, layer tags, nothing filtered) — `Model` stays the
+  export view and is unchanged. The **representation id** is the position in
+  `SceneGraph::loaded` (`model.rs::loaded_pos`, keyed by `loaded_ids`/`property_id`
+  so an `Instance` and its target share it) and is the instancing key: an
+  `Instance` has `mesh_ids == []` and shares `subtree_mesh_ids()` with its twin.
+  The server sample's 36 instances of its wide-mask shape **collapse to one**
+  representation (id 164, one node) — `representation_count` is 106, equal to the
+  pinned 106 meshes. The file view would **keep** an empty representation that
+  `to_model()` drops (glTF mandates POSITION), but no sample has one since the
+  wide-mask fix.
+- **`Lsg::representations()` must filter `element.geometry().is_some()`.**
+  `SceneGraph::loaded` also holds Meta Data / `ProxyMetaData` late loads, so the
+  raw length counts too much: block 9.5 went 7 → 3. The ids are **not**
+  `0..count` — block 9.5 is `[4, 5, 6]`, plate1-9.5 `[4, 5, 6, 11, 12, 13]` — so
+  `mesh(id)` raises `IndexError` unless the id is in that list.
+- **`JtArray` zero copy.** `__getbuffer__(slf: Bound<'_, Self>, view, flags)` +
+  `slf.into_ptr()` as the owner, `__releasebuffer__(&self, view)` frees the
+  heap-owned `CString` in `view.format` and the `Box<[Py_ssize_t; 4]>` in
+  `view.internal` (shape/strides/format **must not** point at a local). Indices
+  are 1-D `(m,)` `int32`, vertices/normals 2-D `(n, 3)` `float32` with strides
+  `(12, 4)`; `readonly = 1` always, and `PyBUF_WRITABLE` is refused. An **empty**
+  channel still hands out a zero-length buffer pointed at a `static EMPTY`
+  array — returning `None` makes `numpy.asarray` fall back to a 0-d **object**
+  array instead of an empty `float32`. `__len__` is `dims[0]` (rows), not the
+  product, so it agrees with `len(memoryview(a))` and `len(np.asarray(a))`.
+  Proof: `flags.owndata is False`, `np.shares_memory` across two `asarray` calls,
+  and all 106 representations of the server sample in ~0.9 s. The empty case
+  has no sample any more, so `test_a_channel_the_file_leaves_out_is_a_zero_length_array`
+  builds a shape with `normals=[]` and reads its empty `normals` channel back.
+- **pyo3 0.30 handle classes.** `Py<T>` is **not** `Clone` — `impl<T> Clone for
+  Py<T>` sits behind the `py-clone` feature (`instance.rs:2127`), so never
+  `#[derive(Clone)]` a pyclass holding a `Py<_>`; use `clone_ref(py)`. `Py<Self>`
+  is a valid `#[pymethods]` receiver, and `Py::get(&self) -> &T` needs
+  `T: PyClass<Frozen = True> + Sync` — legal here because nothing in
+  `crates/ferrojt/src` has interior mutability. **`tp_iter` must return a real
+  iterator**: returning a `Py<PyList>` compiles but raises `TypeError: iter()
+  returned non-iterator of type 'list'`; use
+  `PyList::new(py, items)?.try_iter()?.into_any().unbind()` as `PyResult<Py<PyAny>>`
+  (`Py<PyIterator>` is not `Py<PyAny>`).
 - maturin on Windows: always pass `-i <venv python>` for a cross build (otherwise
   it probes the Microsoft Store `python3` stub), and put
   `.venv\Lib\site-packages\ziglang` on `PATH` — `ZIG=` is ignored.
@@ -556,7 +621,10 @@ Upload with `python -m twine upload dist\*`.
 - **JT 8.x samples and `SampleJT_Server.jt` declare NO layer filters**, so their layers
   record no `ferrojt:layer_filter` in `customLayerData` (that is how a consumer tells
   "unfiltered" from "filtered by a file with no layers"). block-9.5/10.3 and plate1-9.5
-  declare `ALL` (+ `LAYCUR`); plate1-9.5 tags its parts `LAYER:: = 20`. Recorded via
+  declare `ALL` (+ `LAYCUR`); plate1-9.5 tags the **instance target** (the `MetaData`
+  node the two `Instance`s point at, position 11) with `LAYER:: = 20`, **not** the
+  `Part` — the block 9.5 `Part` (position 2) is the sample where the tag sits on the
+  part itself. Recorded via
   `Model::extras["layer_filter"]` → `ferrojt:layer_filter` / `int[] ferrojt:layers`.
 - **usd-core 26.11 Python API** (for `target\usd_*.py` probes): no
   `Stage.GetCustomLayerData` — read `stage.GetRootLayer().customLayerData`; `Prim` has
@@ -570,6 +638,83 @@ Upload with `python -m twine upload dist\*`.
   `shoot` retries `MAX_FRAMES` but still loses occasionally, and a re-run picks a
   different sample. Re-run before investigating; `pytest tests\test_ferrojt.py` alone
   is the stable check.
+- **JT writer: only the LSG is re-serialised** (`jt/write.rs`). There is **no JT
+  writer anywhere in `example/`**, so the framing was read out of the sample
+  bytes. Representation/meta data/PMI/B-rep segments are copied byte for byte
+  out of the source (`write_to_bytes` therefore needs the source `data`), and a
+  segment is dropped only when every referrer is gone. The new TOC is always
+  appended at the **end**; 5 of 6 sources put it right after the header — both
+  legal.
+- **Writer version fields are gated per class**: `RangeLod` (its second
+  version), `Shape` and `Instance` only when `major > 8`, while `MetaData` and
+  `Part` write version/reserved fields **unconditionally**. Writing one extra
+  byte per node shifts everything and surfaces as
+  `element body read past its declared end` on JT 8.x.
+- **An attribute referenced by several nodes is written once**, under the first
+  referrer, and numbered once — dedup on the attribute position in **both**
+  `number_nodes_and_attributes()` (`seen`) and `lsg_body()` (`written`).
+- **An `Instance` target is one bare `i32`**, not a length-prefixed vector
+  (`Instance::read` reads a single `Deferred`). A wrong target makes
+  `jt::dump`'s `recurse_down_the_tree` (no cycle guard) stack-overflow.
+- **Compression must be written as flag 2 / algorithm 2** (zlib, i.e.
+  `codec::deflate`). XZ (flag 3) is read but never emitted, even though
+  block-10.3 and the server sample store their LSG that way.
+- **A property atom is emitted exactly when a surviving table row refers to it.**
+  Numbering and emission must use one rule (`collect_rows()` decides the
+  surviving rows *before* `number_properties()`), or a second write of an
+  already written file shrinks it — that is the fixed-point assert in
+  `a_lossless_round_trip_reproduces_the_file` (`bytes.len() == twice.len()`).
+- **`SampleJT_Server.jt` carries 55 property atoms of the unknown class
+  `10dd1019`** (not in `guid::types` nor in the C++ sources) that **are** framed
+  like known ones: `21 00 00 00 | <guid> | 05 | 57 0f 00 00 | <body>` — base
+  type 5 at offset 20, real object id 3927 at offset 21, length 33. But
+  `read_element_envelope` returns `object_id = 0` and a 20-byte envelope for an
+  unknown class, so `write.rs::read_property_atom` reads the id itself
+  (`UNKNOWN_ENVELOPE = 20`, `OBJECT_ID_OFFSET = 21`). Dropping those atoms lost
+  55 table pairs and, through `read_property_table`'s `JT_PROP_NAME` key lookup,
+  55 string values (`PROPERTY_STRING 4562 → 4507`).
+- **A filtered write legitimately drops `PROPERTY_LATE_LOAD` atoms** with their
+  representations (block-9.5: 47 → 45 atoms, rows stay 6). `tests/write.rs`
+  therefore compares `values()` (every property that is *not* a late load) for
+  equality and `late_loads()` as `<=` — asserting the whole property list equal
+  is wrong.
+- **The builder (`jt/build.rs`) emits JT 8.1 only.** The dual vertex-face coder
+  of JT 9.x/10.x has no encoder here, so a from-scratch file uses the
+  vertex-based **lossless** representation (`params[0] == 0`), the null codec
+  (byte 0) for the strip offsets, and DEFLATE for the payload. `Format::Jt`
+  stays `Error::UnsupportedFormat("jt (write)")` in `export/mod.rs` — the
+  builder builds its own graph, it does not consume a `Model`.
+- **A JT 8.x shape cannot share a vertex slot, and the strip walk renumbers the
+  indices.** `MeshData::new`/`with_normals` **explode** the mesh (one slot per
+  triangle corner — a cube becomes 36 vertices / 36 normals / 36 indices, and
+  `vertices()` comes back three times longer). `representation()` then builds
+  `emit` (the winding-alternating walk `expand_strips` in `object.rs` performs:
+  `0,1,2` then `3,5,4` then `6,7,8`) and its inverse `written`, and writes the
+  geometry per **written** slot. The slot number *is* the index the reader
+  emits, so assuming file slot == source slot panics with
+  `index out of bounds: the len is 24 but the index is 24`. `normal_binding` is
+  `u8::from(with_normals)`, not a hardcoded `1`. **A Rust fixture that is
+  always pre-exploded hides this** — `a_compact_mesh_is_exploded_and_comes_back_unchanged`
+  is the test that feeds the compact form.
+- **Builder handles are opaque tokens.** `JtNode(usize)`/`JtMesh(usize)` have
+  private fields, so outside the crate only `.index()` exists; `check_node` /
+  `check_mesh` reject a handle of another builder. Property ids must **continue**
+  the node+attribute numbering — the property table ends a row with key `0`, so a
+  property numbered 0 truncates its own row. `write_to_bytes` refuses a shape
+  with no mesh, an instance with no target, a cycle and unreachable nodes.
+- **Python names for the builder**: `JtBuilder`/`NodeHandle`/`MeshHandle` —
+  `JtNode` and `JtMesh` are already the LSG view. `class` is a keyword, so the
+  accessor is `class_of` (`#[pyo3(name = "class_of")]`) and `add_node`'s
+  parameter is `class_name`; `add_shape(parent, mesh, *, name=None)`.
+  `MeshData.bounds` returns a **list** of six, not a tuple.
+- **Picture parity for a written file must be measured one process per picture**
+  and compared as PNGs: for the ~1M-triangle server mesh Open3D returns
+  permanent all-zero frames partway through a process, so retrying inside one
+  process does not help. Probe: `target\rt_picture.py` (`render <glb> <png>`,
+  then `compare <stem>`). All six samples: source vs written **1.00000**.
+- **`multi_replace_string_in_file` needs `filePath` as the FIRST key** of each
+  replacement object — putting it last yields "must have required property
+  'filePath'".
 
 ## Language / platform gotchas hit before
 
@@ -595,4 +740,11 @@ pyo3 0.30 (`abi3-py310`). No USD crate — `export/usd.rs` writes `.usda` by han
 
 USD: `.usdc` (binary) and `.usdz` (packaged) output, and JT textures into the
 `UsdPreviewSurface` — `docs/usd-writer.md` holds the mapping and the open work.
+JT: writing from a neutral `Model` instead of a read `JtFile` (that needs the
+representation codecs re-encoded, so `Format::Jt` stays
+`Error::UnsupportedFormat("jt (write)")` in `export/mod.rs`), and keeping the
+source TOC position instead of always appending the table —
+`docs/jt-writer.md` holds the details. The builder (`jt/build.rs`) creates a file
+from nothing but only as JT 8.1 — `docs/jt-builder.md` lists what is still open
+there (9.x/10.x coders, XZ, key/value properties, layer filters).
 macOS and ARM wheels need CI (`maturin generate-ci github`).

@@ -13,6 +13,7 @@
 | `jt::read_header(path) -> Result<FileHeader>` | Parses only the header banner (version, byte order, TOC offset, LSG GUID) for `ferrojt info`. |
 | `jt::JtFile::open(path)` | The JT native view: header, TOC table and the decoded logical scene graph. This is what `ferrojt dump` and `ferrojt.JtFile` use. |
 | `jt::dump(file, config, indent) -> Result<String>` | The JSON layout the JT tooling writes; see [dump.md](dump.md). |
+| `ferrojt.JtFile.lsg` | The same native view as python objects — `JtLsg`, `JtNode`, `JtMesh`, `JtArray`; see "The file view" below. |
 
 Submodules:
 
@@ -40,13 +41,16 @@ Submodules:
    declares no vertices at all contributes no mesh: glTF needs a `POSITION`
    attribute in every primitive, so there is nothing to write. The node that
    holds it is kept, exactly as for a filtered part or a coarse tier — the graph
-   keeps its shape, only the drawing is skipped. `SampleJT_Server.jt` declares
-   36 such empty shapes out of 850 representations.
+   keeps its shape, only the drawing is skipped. No sample has such a shape: the
+   36 empty ones `SampleJT_Server.jt` seemed to have were one instanced shape
+   whose wide attribute masks were misread.
 4. Only the finest level of detail of a range LOD. A `RangeLOD` lists its
    children from the finest tier down and JT does not store that tier, so it is
-   counted while walking: the first group below a `RangeLOD` is tier 0, the next
-   tier 1, and so on. A shape at any other tier contributes no mesh, which is
-   what the reference glTF writer does. The nodes themselves are all kept, so
+   counted while walking: the first child below a `RangeLOD` is tier 0, the next
+   tier 1, and so on, whatever the class of the child — the plate samples wrap
+   each tier in a group, the NIST parts list the finer tiers as bare shapes.
+   A shape at any other tier contributes no mesh, and the JT writer drops the
+   same representations. The nodes themselves are all kept, so
    the graph keeps its shape, and `Mesh::lod_level` records the tier a mesh came
    from. `jt::dump` is not filtered — a dump still reports every tier.
 5. An `Instance` node keeps the subtree it points at. JT stores an instantiated
@@ -137,6 +141,75 @@ ones declare `ALL` and `LAYCUR` with an empty active name; every part of every
 sample survives its own default filter, so the pinned export counts do not
 change.
 
+## The file view (`JtLsg` / `JtNode` / `JtMesh` / `JtArray`)
+
+`Model` is the **export** view: one node tree, finest LOD tier only, the layer
+filter already applied, JT names normalised. `ferrojt.JtFile.lsg` is the **file**
+view — the decoded `SceneGraph` itself, exposed as python handles by
+`crates/ferrojt-python/src/lsg.rs`. Nothing is filtered and nothing is renamed:
+every LOD tier, the JT class name, the whole key/value stream, the layer tags and
+the attributes are reachable, which is what a python script that wants to pick
+and choose needs.
+
+* `JtLsg` is the handle on the parsed file: `root()`, `nodes()` (every node in
+  file order), `meshes()`, `mesh(id)`, `node_count`, `representation_count`.
+* `JtNode` is a position in the graph, not a copy of a subtree. It iterates
+  (`len()`, `node[i]` with negative indices, `for child in node`), compares and
+  hashes by that position, and reports `class_name`, `id`, `name`, `version`,
+  `flags`, `is_instance`, `is_tri_strip_set`, `layers`, `attribute_names`,
+  `properties()`, `material()`, `late_loads()`, the transform as `matrix` /
+  `transform` / `translation` / `rotation` / `scale`, plus the per-kind fields
+  `bounds`, `area`, `lod_limits`, `lod_signal`, `lod_center`, `up_axis` and
+  `partition_file_name`. Indexing and iteration keep a child reference that does
+  not resolve to a node — it comes back as `None`, and
+  `unresolved_children()` counts them; `children()` skips them.
+* Every handle keeps the file alive, so a node or an array stays valid on its own
+  and a NumPy view of an array keeps the whole file readable.
+
+### Representation ids
+
+A JT shape node does not own its geometry, it late-loads it, and an `Instance`
+refers to a subtree that is stored once. So the geometry is keyed by **position
+in the representation list of the file** — `SceneGraph::loaded`, resolved by
+`model.rs::loaded_pos`, which matches on the late-load ids so an `Instance` and
+its target share one id. That id is the instancing key:
+
+* `node.mesh_ids` is the geometry of that node alone — empty for an `Instance`.
+* `node.subtree_mesh_ids()` is everything below it, so the two placements of one
+  screw report the same ids and the geometry is read once.
+* `meshes()`, `mesh(id)` and `representation_count` only list entries that
+  actually carry geometry, because `SceneGraph::loaded` also holds meta data late
+  loads. The ids are **not** `0..count`: block 9.5 has three representations,
+  `[4, 5, 6]`, and `mesh(0)` is an `IndexError`.
+* Unlike `to_model()`, the file view **keeps** a representation with no vertices:
+  glTF mandates a `POSITION` attribute and drops it, a python consumer may still
+  want to see it. No sample has one: `SampleJT_Server.jt` has 106
+  representations and the export keeps all 106 meshes.
+
+### Zero-copy arrays
+
+`mesh.array("indices" | "vertices" | "normals")` returns a `JtArray` that
+implements the buffer protocol directly over the decoded `LodGeometry` of the
+file — no intermediate `bytes`, no copy, no C++ dependency:
+
+| Channel | Shape | Format | Strides |
+| --- | --- | --- | --- |
+| `indices` | `(m,)` | `int32` (`"i"`) | `(4,)` |
+| `vertices` | `(n, 3)` | `float32` (`"f"`) | `(12, 4)` |
+| `normals` | `(n, 3)` | `float32` (`"f"`) | `(12, 4)` |
+
+`memoryview(a)` and `numpy.asarray(a)` both borrow: `flags.owndata is False`, and
+`np.shares_memory` holds between two calls. The view is always read-only —
+requesting `PyBUF_WRITABLE` is a `BufferError`, because the arrays of a JT file
+are what the file says they are. An **empty** channel still hands out a
+zero-length buffer, pointed at a static stand-in since a `Vec` of length zero has
+a null pointer: returning nothing would make `numpy.asarray` fall back to a 0-d
+**object** array instead of an empty `float32`. `len(a)` is the number of rows, so
+it agrees with `len(memoryview(a))` and `len(np.asarray(a))`.
+
+Python 3.11 is the floor for this: the stable ABI only gained the `bf_getbuffer`
+slot then, so pyo3 compiles `__getbuffer__` out below it.
+
 ## Constraints
 
 * No `unsafe` — `crates/ferrojt` is `#![forbid(unsafe_code)]`.
@@ -163,14 +236,18 @@ change.
   diffuse colours of the file — both in the model and in the exported glTF — as
   one material per distinct colour, and exports to glTF for every sample: each
   primitive of each one has a non-empty `POSITION` attribute, which is what
-  `SampleJT_Server.jt` and its 36 empty representations used to break.
+  `SampleJT_Server.jt` broke while its wide attribute masks were misread.
 * `crates/ferrojt/tests/dump.rs` — every sample with a reference dump under
   `data/Reference` matches it semantically, and every dump is valid JSON.
 * Unit tests in `jt/decode` compare the codecs against the reference output byte
   for byte.
 * Unit tests in `jt/model` build a synthetic scene graph, because no sample has
   a part on a layer its filter rejects or a representation without vertices.
-* `tests/test_ferrojt.py` — the same reference dumps through the python bindings.
+* `tests/test_ferrojt.py` — the same reference dumps through the python bindings,
+  plus the file view: the node list and class names of a sample, its
+  representation ids, two `Instance` nodes sharing one representation, the JT 8.x
+  tier names carried by the segment type, and the zero-copy contract of `JtArray`
+  (`owndata is False`, `np.shares_memory`, read-only).
 * `tests/test_visual.py` — the export of every sample — the three
   `example_block` versions, the two `opening_protection_plate1` ones and
   `SampleJT_Server.jt` — is rendered offscreen and compared with a reference

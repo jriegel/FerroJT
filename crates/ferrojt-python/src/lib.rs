@@ -12,8 +12,14 @@ use pyo3::exceptions::{PyNotImplementedError, PyOSError, PyRuntimeError, PyValue
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+mod build;
+mod lsg;
+
+use build::Builder;
+use lsg::Lsg;
+
 /// Convert a FerroJT error into a Python exception.
-fn py_err(err: ferrojt::Error) -> PyErr {
+pub(crate) fn py_err(err: ferrojt::Error) -> PyErr {
     match err {
         ferrojt::Error::NotImplemented(what) => PyNotImplementedError::new_err(what),
         ferrojt::Error::Io(io) => PyOSError::new_err(io.to_string()),
@@ -154,10 +160,16 @@ fn serde_json_summary(model: &ferrojt::Model) -> ferrojt::Result<String> {
 ///     print(jt.json())
 ///     jt.writeGlTf("gear")
 /// ```
+///
+/// Once it is open, [`JtFile::lsg`] hands out the logical scene graph of the
+/// file as a `JtLsg`, and `root()` walks it — see [`lsg::Lsg`], [`lsg::JtNode`],
+/// [`lsg::JtMesh`] and [`lsg::JtArray`].
 #[pyclass(name = "JtFile")]
 pub struct JtFile {
     file_name: String,
-    inner: Option<ferrojt::jt::JtFile>,
+    /// The parsed file, kept alive inside the [`Lsg`] object every node handle
+    /// refers to, so that opening a file never copies its geometry.
+    lsg: Option<Py<Lsg>>,
 }
 
 #[pymethods]
@@ -167,7 +179,7 @@ impl JtFile {
     fn new(file_name: String) -> Self {
         JtFile {
             file_name,
-            inner: None,
+            lsg: None,
         }
     }
 
@@ -204,21 +216,56 @@ impl JtFile {
     fn open(&mut self, py: Python<'_>) -> PyResult<bool> {
         let name = self.file_name.clone();
         let loaded = py.detach(|| ferrojt::jt::JtFile::open(&name).ok());
-        self.inner = loaded;
-        Ok(self.inner.is_some())
+        self.lsg = match loaded {
+            Some(file) => Some(Py::new(py, Lsg::new(file))?),
+            None => None,
+        };
+        Ok(self.lsg.is_some())
     }
 
     /// `True` once the file has been read successfully.
     #[getter]
     fn is_open(&self) -> bool {
-        self.inner.is_some()
+        self.lsg.is_some()
+    }
+
+    /// The logical scene graph of the file as a `JtLsg`, or `None` while the
+    /// file is closed.
+    ///
+    /// Every `JtNode`, `JtMesh` and `JtArray` of the file keeps this object
+    /// alive, so a handle stays valid on its own and the arrays of a `JtMesh`
+    /// can be handed to NumPy without a copy.
+    #[getter]
+    fn lsg(&self, py: Python<'_>) -> Option<Py<Lsg>> {
+        self.lsg.as_ref().map(|graph| graph.clone_ref(py))
+    }
+
+    /// The root node of the logical scene graph, `None` while the file is
+    /// closed or when it has no LSG segment.
+    ///
+    /// Shorthand for `file.lsg.root()`.
+    fn root(&self, py: Python<'_>) -> PyResult<Option<Py<lsg::JtNode>>> {
+        match self.lsg.as_ref() {
+            Some(graph) => Lsg::root(graph.clone_ref(py), py),
+            None => Ok(None),
+        }
+    }
+
+    /// Every representation of the file as a `JtMesh`, ordered by id.
+    ///
+    /// Shorthand for `file.lsg.meshes()`; empty while the file is closed.
+    fn meshes(&self, py: Python<'_>) -> PyResult<Vec<Py<lsg::JtMesh>>> {
+        match self.lsg.as_ref() {
+            Some(graph) => Lsg::meshes(graph.clone_ref(py), py),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// The whole file as a JSON string, in the layout the JT tooling uses.
     ///
     /// Returns the empty string while the file is closed.
     fn json(&self, py: Python<'_>) -> PyResult<String> {
-        let Some(file) = self.inner.as_ref() else {
+        let Some(file) = self.parsed() else {
             return Ok(String::new());
         };
         let text = py
@@ -230,7 +277,7 @@ impl JtFile {
     /// The header and TOC table as a JSON string. Returns the empty string
     /// while the file is closed.
     fn toc(&self, py: Python<'_>) -> PyResult<String> {
-        let Some(file) = self.inner.as_ref() else {
+        let Some(file) = self.parsed() else {
             return Ok(String::new());
         };
         let text = py
@@ -254,7 +301,7 @@ impl JtFile {
         layer_filter: Option<&str>,
         all_layers: bool,
     ) -> PyResult<bool> {
-        let Some(file) = self.inner.as_ref() else {
+        let Some(file) = self.parsed() else {
             return Ok(false);
         };
         let target = gltf_target(path);
@@ -288,7 +335,7 @@ impl JtFile {
     /// Raises `RuntimeError` while the file is closed.
     #[pyo3(signature = (*, layer_filter = None, all_layers = false))]
     fn model(&self, layer_filter: Option<&str>, all_layers: bool) -> PyResult<Model> {
-        let Some(file) = self.inner.as_ref() else {
+        let Some(file) = self.parsed() else {
             return Err(PyRuntimeError::new_err(format!(
                 "{} is not open",
                 self.file_name
@@ -302,7 +349,7 @@ impl JtFile {
     /// The names of the layer filters the file declares, in name order.
     /// Returns an empty list while the file is closed or when it declares none.
     fn layer_filters(&self) -> Vec<String> {
-        let Some(file) = self.inner.as_ref() else {
+        let Some(file) = self.parsed() else {
             return Vec::new();
         };
         file.lsg
@@ -315,19 +362,27 @@ impl JtFile {
     /// The filter an export uses when none is asked for, or `None` when the
     /// file carries no layer information at all.
     fn active_layer_filter(&self) -> Option<String> {
-        self.inner
-            .as_ref()
+        self.parsed()
             .and_then(|file| file.layer_filter(None).ok())
             .flatten()
             .and_then(|filter| filter.name)
     }
 
     fn __repr__(&self) -> String {
-        if self.inner.is_some() {
+        if self.lsg.is_some() {
             format!("JtFile({:?}, open=True)", self.file_name)
         } else {
             format!("JtFile({:?}, open=False)", self.file_name)
         }
+    }
+}
+
+impl JtFile {
+    /// The parsed file behind the [`Lsg`] handle, `None` while the file is
+    /// closed. Borrowed, never copied — a server assembly holds about a million
+    /// triangles and cloning them per call is not acceptable.
+    fn parsed(&self) -> Option<&ferrojt::jt::JtFile> {
+        self.lsg.as_ref().map(|graph| graph.get().file())
     }
 }
 
@@ -369,6 +424,15 @@ fn _ferrojt(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(pyo3::wrap_pyfunction!(detect_format, module)?)?;
     module.add_class::<Model>()?;
     module.add_class::<JtFile>()?;
+    module.add_class::<Lsg>()?;
+    module.add_class::<lsg::JtNode>()?;
+    module.add_class::<lsg::JtMesh>()?;
+    module.add_class::<lsg::JtArray>()?;
+    module.add_class::<Builder>()?;
+    module.add_class::<build::NodeHandle>()?;
+    module.add_class::<build::MeshHandle>()?;
+    module.add_class::<build::MeshData>()?;
+    module.add_class::<build::MaterialData>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
