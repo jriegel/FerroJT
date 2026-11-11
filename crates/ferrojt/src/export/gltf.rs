@@ -17,7 +17,7 @@
 //! Component types that glTF cannot express (`F16`, `F64`, `I32`, `I64`, `U64`)
 //! are widened to a representable type by [`widen`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gltf_json::validation::{Checked, USize64};
@@ -48,13 +48,22 @@ impl GltfExporter {
     /// Serialize to `.glb` or `.gltf` bytes.
     pub fn to_bytes(&self, model: &Model) -> Result<Vec<u8>> {
         let document = build(model)?;
-        let root = document.root;
+        let mut root = document.root;
         if self.binary {
             let json = root
                 .to_vec()
                 .map_err(|err| Error::Unsupported(format!("serializing glTF JSON: {err}")))?;
             GlbBuilder::new(json).with_bin(document.bin).finish()
         } else {
+            // `.gltf` has no binary chunk, so inline the buffer as a data URI.
+            if !document.bin.is_empty() {
+                if let Some(buffer) = root.buffers.first_mut() {
+                    buffer.uri = Some(format!(
+                        "data:application/octet-stream;base64,{}",
+                        STANDARD.encode(&document.bin)
+                    ));
+                }
+            }
             let json = root
                 .to_vec_pretty()
                 .map_err(|err| Error::Unsupported(format!("serializing glTF JSON: {err}")))?;
@@ -84,9 +93,15 @@ fn build(model: &Model) -> Result<Document> {
     let mut bin: Vec<u8> = Vec::new();
 
     // --- accessors and buffer views ---------------------------------------
+    let index_attributes: BTreeSet<usize> = model
+        .meshes
+        .iter()
+        .flat_map(|mesh| mesh.primitives.iter().filter_map(|prim| prim.indices))
+        .collect();
     let mut accessor_of = Vec::with_capacity(model.accessors.attributes.len());
     for index in 0..model.accessors.attributes.len() {
-        accessor_of.push(push_accessor(&mut root, &mut bin, model, index)?);
+        let is_index = index_attributes.contains(&index);
+        accessor_of.push(push_accessor(&mut root, &mut bin, model, index, is_index)?);
     }
 
     // --- images and textures (model order, so material indices stay valid) --
@@ -213,16 +228,6 @@ fn build(model: &Model) -> Result<Document> {
         extras: None,
     });
     root.scene = Some(scene_index);
-
-    // `.gltf` has no binary chunk, so inline the buffer as a data URI.
-    if !bin.is_empty() {
-        if let Some(buffer) = root.buffers.first_mut() {
-            buffer.uri = Some(format!(
-                "data:application/octet-stream;base64,{}",
-                STANDARD.encode(&bin)
-            ));
-        }
-    }
 
     Ok(Document { root, bin })
 }
@@ -480,12 +485,14 @@ fn texture_info(root: &Root, index: Option<usize>, tex_coord: u8) -> Option<text
     })
 }
 
-/// Append one attribute as a buffer view plus accessor.
+/// Append one attribute as a buffer view plus accessor. `is_index` marks the
+/// view as an element array, whatever the attribute is called.
 fn push_accessor(
     root: &mut Root,
     bin: &mut Vec<u8>,
     model: &Model,
     handle: usize,
+    is_index: bool,
 ) -> Result<Index<accessor::Accessor>> {
     let attribute = model
         .accessors
@@ -497,7 +504,7 @@ fn push_accessor(
         .ok_or_else(|| Error::invalid(handle as u64, "attribute extends past its buffer"))?;
 
     let (component_type, bytes) = widen(attribute.component_type, source)?;
-    let target = if attribute.name.ends_with("_INDICES") || attribute.name == "INDICES" {
+    let target = if is_index {
         Some(Checked::Valid(buffer::Target::ElementArrayBuffer))
     } else {
         Some(Checked::Valid(buffer::Target::ArrayBuffer))
@@ -830,6 +837,38 @@ mod tests {
             serde_json::Value::Null
         );
         assert!(value["accessors"][0]["min"].is_array());
+    }
+
+    /// The buffer of a GLB is its BIN chunk; a `uri` would point readers
+    /// elsewhere and store the data twice.
+    #[test]
+    fn glb_buffer_is_the_bin_chunk() {
+        let bytes = GltfExporter::glb().to_bytes(&triangle_model()).unwrap();
+        let (json_len, bin) = crate::export::glb::parse_header(&bytes).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes[20..20 + json_len]).unwrap();
+        assert_eq!(value["buffers"][0]["uri"], serde_json::Value::Null);
+        assert_eq!(
+            value["buffers"][0]["byteLength"].as_u64(),
+            bin.map(|len| len as u64)
+        );
+    }
+
+    /// The JT reader names its index attribute `indices`; the view target
+    /// follows from the primitive, not from the name.
+    #[test]
+    fn index_views_are_element_arrays() {
+        let mut model = triangle_model();
+        model.accessors.attributes[1].name = "indices".into();
+        let bytes = GltfExporter::glb().to_bytes(&model).unwrap();
+        let (json_len, _) = crate::export::glb::parse_header(&bytes).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes[20..20 + json_len]).unwrap();
+        let targets: Vec<_> = value["bufferViews"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|view| view["target"].as_u64())
+            .collect();
+        assert_eq!(targets, [Some(34962), Some(34963)]);
     }
 
     #[test]
