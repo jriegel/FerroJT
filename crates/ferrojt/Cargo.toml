@@ -1,6 +1,6 @@
 [package]
 name = "ferrojt"
-description = "Format-agnostic CAD scene model plus OpenJT (JT) readers and glTF/USD exporters."
+description = "Format-agnostic CAD scene model with OpenJT (JT) and glTF readers and glTF/USD/JT writers."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

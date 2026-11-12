@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "ferrojt"
 version = "0.1.0"
-description = "Read OpenJT (JT) files and convert them to glTF / USD."
+description = "Read OpenJT (JT) and glTF files, and write glTF, USD and OpenJT."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT OR Apache-2.0"

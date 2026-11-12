@@ -1,6 +1,6 @@
 [package]
 name = "ferrojt-cli"
-description = "Command line tools for inspecting OpenJT files and converting them to glTF/USD."
+description = "Command line tools for inspecting OpenJT and glTF files and converting between them, glTF and USD."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
