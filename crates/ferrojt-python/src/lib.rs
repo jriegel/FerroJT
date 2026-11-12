@@ -21,6 +21,11 @@ use build::Builder;
 use lsg::Lsg;
 
 /// Convert a FerroJT error into a Python exception.
+///
+/// A refusal of the caller's request — a format that cannot be written, a
+/// revision that does not exist, a mesh the coder cannot hold — is a
+/// `ValueError`, because that is what the caller can act on. Only a file that
+/// is broken on disk stays a `RuntimeError`.
 pub(crate) fn py_err(err: ferrojt::Error) -> PyErr {
     match err {
         ferrojt::Error::NotImplemented(what) => PyNotImplementedError::new_err(what),
@@ -28,18 +33,40 @@ pub(crate) fn py_err(err: ferrojt::Error) -> PyErr {
         ferrojt::Error::Invalid { offset, message } => {
             PyValueError::new_err(format!("{message} at offset {offset}"))
         }
+        ferrojt::Error::UnsupportedFormat(what) => {
+            PyValueError::new_err(format!("format {what:?} is not supported"))
+        }
+        ferrojt::Error::Unsupported(what) => PyValueError::new_err(what),
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }
 
 /// Open a CAD file and return a [`Model`].
 ///
-/// `layer_filter` selects one of the named layer filters the file declares;
-/// leaving it out applies the filter the file marks as active. `all_layers`
-/// exports every part and ignores the filters of the file.
+/// The container is taken from the extension of `path`: `.jt` reads a JT
+/// package, `.gltf` and `.glb` a glTF 2.0 asset. The layer keywords only apply
+/// to JT, where `layer_filter` selects one of the named layer filters the file
+/// declares and leaving it out applies the filter the file marks as active;
+/// `all_layers` exports every part and ignores the filters of the file.
 #[pyfunction]
 #[pyo3(signature = (path, *, layer_filter = None, all_layers = false))]
 fn open(path: &str, layer_filter: Option<&str>, all_layers: bool) -> PyResult<Model> {
+    let format = ferrojt::Format::detect(path);
+    if !format.is_readable() {
+        return Err(PyValueError::new_err(format!(
+            "{format} files cannot be read by ferrojt"
+        )));
+    }
+    if format != ferrojt::Format::Jt {
+        if layer_filter.is_some() || all_layers {
+            return Err(PyValueError::new_err(
+                "layer_filter and all_layers only apply to JT files",
+            ));
+        }
+        return Ok(Model {
+            inner: ferrojt::open_format(format, path).map_err(py_err)?,
+        });
+    }
     let file = ferrojt::jt::JtFile::open(path).map_err(py_err)?;
     Ok(Model {
         inner: build_model(&file, layer_filter, all_layers)?,
@@ -50,6 +77,41 @@ fn open(path: &str, layer_filter: Option<&str>, all_layers: bool) -> PyResult<Mo
 #[pyfunction]
 fn detect_format(path: &str) -> PyResult<String> {
     Ok(ferrojt::Format::detect(path).to_string())
+}
+
+/// The JT revision `text` names, or `None` for "whatever holds the model".
+///
+/// `None` is a distinct answer from an unparseable text: a caller has to tell
+/// "pick the best revision" from "the caller named a revision that does not
+/// exist", and pyo3 cannot express that tri-state in one keyword.
+fn jt_version(text: Option<&str>) -> PyResult<Option<ferrojt::jt::JtVersion>> {
+    match text {
+        None => Ok(None),
+        Some(text) => text
+            .parse::<ferrojt::jt::JtVersion>()
+            .map(Some)
+            .map_err(py_err),
+    }
+}
+
+/// Serialize `model` to `format`, honouring the JT revision `version`.
+///
+/// JT cannot go through [`ferrojt::export::to_format`] for a requested revision:
+/// that entry point has no version to write at and always lets the writer pick.
+fn jt_bytes(
+    format: ferrojt::Format,
+    model: &ferrojt::Model,
+    version: Option<&str>,
+) -> PyResult<Vec<u8>> {
+    if format == ferrojt::Format::Jt {
+        return ferrojt::jt::model_to_bytes(model, jt_version(version)?).map_err(py_err);
+    }
+    if version.is_some() {
+        return Err(PyValueError::new_err(
+            "version only applies to the JT format",
+        ));
+    }
+    ferrojt::export::to_format(format, model).map_err(py_err)
 }
 
 /// A loaded scene.
@@ -99,24 +161,50 @@ impl Model {
             .collect()
     }
 
-    /// Serialize the model to `format` (`"gltf"`, `"glb"` or `"usd"`) and
-    /// return the bytes.
-    fn to_bytes(&self, format: &str) -> PyResult<Py<PyBytes>> {
+    /// The unit the model is declared in, e.g. `"millimeter"` for a JT file or
+    /// `"meter"` for a glTF one. `None` when the source declares nothing.
+    #[getter]
+    fn unit(&self) -> Option<&str> {
+        self.inner.unit.as_deref()
+    }
+
+    /// The up axis the model is declared with, e.g. `"+Z"` for a JT file or
+    /// `"+Y"` for a glTF one. `None` when the source declares nothing.
+    #[getter]
+    fn up_axis(&self) -> Option<&str> {
+        self.inner.up_axis.as_deref()
+    }
+
+    /// Serialize the model to `format` (`"jt"`, `"gltf"`, `"glb"` or `"usd"`)
+    /// and return the bytes.
+    ///
+    /// `version` picks the JT revision to write at: `"8.0"`, `"8.1"`, `"9.5"`
+    /// or `"10.3"`, where a bare major fills in the minor that revision
+    /// implies. Leaving it out writes JT 10.3 unless a mesh of the model is not
+    /// a closed two-manifold, in which case the file falls back to JT 8.1 — the
+    /// only revision that can hold such a shape. Naming a revision suppresses
+    /// that fallback and raises `ValueError` instead.
+    #[pyo3(signature = (format, *, version = None))]
+    fn to_bytes(&self, format: &str, version: Option<&str>) -> PyResult<Py<PyBytes>> {
         let format = format.parse::<ferrojt::Format>().map_err(py_err)?;
-        let bytes = ferrojt::export::to_format(format, &self.inner).map_err(py_err)?;
+        let bytes = jt_bytes(format, &self.inner, version)?;
         Python::attach(|py| Ok(PyBytes::new(py, &bytes).unbind()))
     }
 
     /// Serialize the model to `format` and write it to `path`.
     ///
     /// When `format` is omitted it is taken from the extension of `path`.
-    #[pyo3(signature = (path, format = None))]
-    fn save(&self, path: &str, format: Option<&str>) -> PyResult<()> {
+    /// `version` is the JT revision to write at, see [`Model::to_bytes`].
+    #[pyo3(signature = (path, format = None, *, version = None))]
+    fn save(&self, path: &str, format: Option<&str>, version: Option<&str>) -> PyResult<()> {
         let format = match format {
             Some(f) => f.parse::<ferrojt::Format>().map_err(py_err)?,
             None => ferrojt::Format::detect(path),
         };
-        ferrojt::export::write_to_file(format, &self.inner, path).map_err(py_err)
+        let bytes = jt_bytes(format, &self.inner, version)?;
+        std::fs::write(path, bytes)
+            .map_err(ferrojt::Error::from)
+            .map_err(py_err)
     }
 
     /// A JSON summary of the model, useful for debugging.
@@ -473,7 +561,7 @@ fn build_model(
     }
 }
 
-/// FerroJT: read OpenJT files and convert them to glTF / USD.
+/// FerroJT: read OpenJT and glTF files and convert them to JT / glTF / USD.
 #[pymodule]
 fn _ferrojt(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(pyo3::wrap_pyfunction!(open, module)?)?;

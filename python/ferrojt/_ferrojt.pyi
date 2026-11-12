@@ -20,10 +20,20 @@ class Model:
     def vertex_count(self) -> int: ...
     @property
     def triangle_count(self) -> int: ...
+    @property
+    def unit(self) -> str | None: ...
+    @property
+    def up_axis(self) -> str | None: ...
 
     def node_names(self) -> list[str]: ...
-    def to_bytes(self, format: str) -> bytes: ...
-    def save(self, path: str, format: str | None = None) -> None: ...
+    def to_bytes(self, format: str, *, version: str | None = ...) -> bytes: ...
+    def save(
+        self,
+        path: str,
+        format: str | None = None,
+        *,
+        version: str | None = ...,
+    ) -> None: ...
     def to_json(self) -> str: ...
 
 
@@ -35,10 +45,14 @@ def open(
 ) -> Model:
     """Read a CAD file into a :class:`Model`.
 
+    The container is taken from the extension of *path*: ``.jt`` reads a JT
+    package, ``.gltf`` and ``.glb`` a glTF 2.0 asset.
+
     *layer_filter* selects one of the named layer filters the file declares.
     Leaving it out applies the filter the file marks as active, which drops the
     meshes of every part that is not on one of its layers. *all_layers* keeps
-    every part and ignores the filters of the file.
+    every part and ignores the filters of the file. Both keywords only apply to
+    JT files.
     """
 
 

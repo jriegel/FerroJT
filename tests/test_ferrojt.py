@@ -814,12 +814,36 @@ def triangle_set(path: str) -> list[tuple[bytes, bytes, bytes]]:
     vertex table. That is the only comparison that survives a revision change:
     the topological coder of JT 9.x and 10.x keeps one vertex instance per
     triangle corner and orders them differently from the source.
+
+    It walks *every* level of detail, so it is only comparable between files
+    carrying the same tiers — [`finest_triangle_set`] is the one to use against
+    a file written with only the finest one.
     """
     numpy = pytest.importorskip("numpy")
     jt = ferrojt.JtFile(path)
     assert jt.open()
+    return _triangles(jt, jt.lsg.meshes())
+
+
+def finest_triangle_set(path: str) -> list[tuple[bytes, bytes, bytes]]:
+    """The triangles of the finest level of detail of a file.
+
+    JT never stores a tier: it is the position of the group under its
+    ``RangeLOD``, so the first group is the finest one. A file without an LOD
+    node holds one tier and yields all of its geometry.
+    """
+    jt = ferrojt.JtFile(path)
+    assert jt.open()
+    for node in jt.lsg.nodes():
+        if node.class_name in ("RangeLOD", "LOD"):
+            return _triangles(jt, node.children()[0].subtree_meshes())
+    return _triangles(jt, jt.lsg.meshes())
+
+
+def _triangles(jt: ferrojt.JtFile, meshes: list) -> list[tuple[bytes, bytes, bytes]]:
+    numpy = pytest.importorskip("numpy")
     out = []
-    for mesh in jt.lsg.meshes():
+    for mesh in meshes:
         if mesh.is_empty:
             continue
         vertices = numpy.asarray(mesh.array("vertices")).reshape(-1, 3)
@@ -994,3 +1018,159 @@ def test_write_jt_rejects_an_impossible_layer_choice(tmp_path) -> None:
         jt.write_jt(str(tmp_path / "nope.jt"), layer_filter="nope")
     assert not (tmp_path / "clash.jt").exists()
     assert not (tmp_path / "nope.jt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Reading glTF and writing JT.
+#
+# ``open`` dispatches on the extension and ``save``/``to_bytes`` accept "jt",
+# so a file can be moved between the two containers through the neutral model.
+# That path is not a copy: the model is rebuilt from the glTF document and the
+# JT file is built from nothing, so the scene graph gains the root partition of
+# the builder and the revision is chosen by the writer, not inherited.
+# ---------------------------------------------------------------------------
+
+
+def banner(path: str) -> str:
+    """The JT banner of a file, the first 14 bytes of its ASCII header."""
+    return Path(path).read_bytes()[:14].decode("ascii")
+
+
+@needs_sample
+def test_a_glb_file_opens_as_a_model(tmp_path) -> None:
+    """``open`` reads a glTF asset, not only a JT package."""
+    source = ferrojt.open(str(BLOCK_95))
+    glb = tmp_path / "block.glb"
+    source.save(str(glb))
+
+    assert ferrojt.detect_format(str(glb)) == "glb"
+    back = ferrojt.open(str(glb))
+    assert back.mesh_count == source.mesh_count
+    assert back.triangle_count == source.triangle_count
+    assert back.material_count == source.material_count
+    assert back.node_count == source.node_count
+
+    text = tmp_path / "block.gltf"
+    source.save(str(text))
+    assert json.loads(text.read_text(encoding="utf-8"))["asset"]["version"] == "2.0"
+    assert ferrojt.open(str(text)).triangle_count == source.triangle_count
+
+
+@needs_sample
+def test_a_glb_file_writes_back_out_as_jt(tmp_path) -> None:
+    """The whole chain: JT, glTF, model, JT, read again."""
+    source = ferrojt.open(str(BLOCK_95))
+    glb = tmp_path / "block.glb"
+    source.save(str(glb))
+
+    target = tmp_path / "block.jt"
+    ferrojt.open(str(glb)).save(str(target))
+    assert banner(str(target)).startswith("Version 10.3")
+
+    again = ferrojt.open(str(target))
+    # The builder adds its root partition, so the graph is one node deeper than
+    # the glTF document it was built from.
+    assert again.node_count == source.node_count + 1
+    assert again.mesh_count == source.mesh_count
+    assert again.triangle_count == source.triangle_count
+    # The export keeps only the finest tier, so that is the tier to compare.
+    # The three tiers of the source are *not* identical — they are the same
+    # cube at three quantisations — so the full set of the file cannot match.
+    assert finest_triangle_set(str(target)) == finest_triangle_set(str(BLOCK_95))
+
+
+@needs_sample
+def test_to_bytes_names_the_revision_of_a_jt_export(tmp_path) -> None:
+    model = ferrojt.open(str(BLOCK_95))
+
+    data = model.to_bytes("jt")
+    assert data[:14].decode("ascii").startswith("Version 10.3")
+    for text, want in (("9.5", "Version 9.5"), ("8", "Version 8.1"), ("9", "Version 9.5")):
+        named = model.to_bytes("jt", version=text)
+        assert named[: len(want)].decode("ascii") == want, text
+
+    target = tmp_path / "block95.jt"
+    model.save(str(target), version="9.5")
+    assert banner(str(target)).startswith("Version 9.5")
+    assert ferrojt.open(str(target)).triangle_count == model.triangle_count
+
+    with pytest.raises(ValueError, match="is not a JT version number"):
+        model.to_bytes("jt", version="nonsense")
+    with pytest.raises(ValueError, match="cannot be written"):
+        model.to_bytes("jt", version="11")
+    # A revision is a JT option, so naming one for another format is a mistake.
+    with pytest.raises(ValueError, match="only applies to the JT format"):
+        model.to_bytes("glb", version="9.5")
+
+
+@needs_server
+def test_a_model_falls_back_to_the_revision_that_holds_its_meshes(tmp_path) -> None:
+    """A mesh the coder cannot hold moves the whole file to JT 8.x.
+
+    ``SampleJT_Server.jt`` is a real CAD assembly with open edges, so the
+    topological coder of JT 9.x and 10.x refuses it. Writing it through the
+    neutral model does not fail: the vertex based representation of JT 8.x has
+    no such rule and holds the mesh, so the writer drops to that revision.
+    Naming a revision suppresses the fallback and is a clean refusal instead.
+    """
+    model = ferrojt.open(str(SERVER))
+
+    target = tmp_path / "server.jt"
+    model.save(str(target))
+    assert banner(str(target)).startswith("Version 8.1")
+    again = ferrojt.open(str(target))
+    assert again.mesh_count == model.mesh_count
+    assert again.triangle_count == model.triangle_count
+
+    with pytest.raises(ValueError, match="not a closed two-manifold"):
+        model.to_bytes("jt", version="10.3")
+
+
+@needs_sample
+def test_every_reader_declares_the_frame_of_its_model(tmp_path) -> None:
+    """A model states the unit and up axis it was read in.
+
+    JT stores neither in its scene graph — the root partition has no axis
+    indicator in the element the format defines — so the reader declares the
+    frame the format prescribes, which the samples confirm with
+    ``JT_PROP_MEASUREMENT_UNITS:: = "millimeters"``. glTF does declare metres
+    and +Y, and that declaration is what makes the writer insert the root
+    transform that converts to millimetres and +Z.
+    """
+    jt_model = ferrojt.open(str(BLOCK_95))
+    assert jt_model.unit == "millimeter"
+    assert jt_model.up_axis == "+Z"
+    assert json.loads(jt_model.to_json())["unit"] == "millimeter"
+
+    glb = tmp_path / "block.glb"
+    jt_model.save(str(glb))
+    gltf = ferrojt.open(str(glb))
+    assert gltf.unit == "meter"
+    assert gltf.up_axis == "+Y"
+
+    # Reading a JT file and writing it again needs no conversion at all, so the
+    # graph comes back exactly as deep as it went in.
+    target = tmp_path / "frame.jt"
+    jt_model.save(str(target))
+    assert ferrojt.open(str(target)).node_count == jt_model.node_count + 1
+
+
+@needs_sample
+def test_the_layer_keywords_only_apply_to_jt_files(tmp_path) -> None:
+    source = ferrojt.open(str(BLOCK_95))
+    glb = tmp_path / "block.glb"
+    source.save(str(glb))
+
+    with pytest.raises(ValueError, match="only apply to JT"):
+        ferrojt.open(str(glb), all_layers=True)
+    with pytest.raises(ValueError, match="only apply to JT"):
+        ferrojt.read(str(glb), layer_filter="ALL")
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ferrojt.open(str(BLOCK_95), layer_filter="ALL", all_layers=True)
+
+
+def test_a_format_without_a_reader_is_refused(tmp_path) -> None:
+    usd = tmp_path / "model.usda"
+    usd.write_text("#usda 1.0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="cannot be read"):
+        ferrojt.open(str(usd))

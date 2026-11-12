@@ -99,12 +99,21 @@ pub struct ConvertArgs {
     #[arg(short, long, value_enum)]
     pub format: Option<TargetFormat>,
 
+    /// Revision to write a JT file at: 8.0, 8.1, 9.5 or 10.3. Without this the
+    /// newest revision the meshes allow is used, which is 10.3 unless a mesh is
+    /// not a closed two-manifold and only the vertex based representation of
+    /// JT 8.x can hold it.
+    #[arg(long, value_name = "VERSION", value_parser = parse_jt_version)]
+    pub jt_version: Option<JtVersion>,
+
     /// Named layer filter to apply. Defaults to the filter the file declares
-    /// as active, or to its first filter when the file leaves that unset.
+    /// as active, or to its first filter when the file leaves that unset. Only
+    /// a JT input declares layer filters.
     #[arg(long, value_name = "NAME", conflicts_with = "no_layer_filter")]
     pub layer_filter: Option<String>,
 
-    /// Export every part and ignore the layer filters of the file.
+    /// Export every part and ignore the layer filters of the file. Only a JT
+    /// input declares layer filters.
     #[arg(long)]
     pub no_layer_filter: bool,
 
@@ -172,6 +181,8 @@ fn parse_jt_version(text: &str) -> Result<JtVersion, String> {
 /// Formats `ferrojt` can write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum TargetFormat {
+    /// OpenJT (JT) package.
+    Jt,
     /// glTF 2.0 binary container.
     Glb,
     /// glTF 2.0 JSON with a data URI buffer.
@@ -183,6 +194,7 @@ pub enum TargetFormat {
 impl From<TargetFormat> for Format {
     fn from(format: TargetFormat) -> Self {
         match format {
+            TargetFormat::Jt => Format::Jt,
             TargetFormat::Glb => Format::Glb,
             TargetFormat::Gltf => Format::Gltf,
             TargetFormat::Usd => Format::Usd,
@@ -294,23 +306,22 @@ pub fn dump(args: &DumpArgs) -> Result<()> {
 }
 
 pub fn convert(args: &ConvertArgs) -> Result<()> {
-    let file = jt_file(&args.input)?;
-    let model = if args.no_layer_filter {
-        file.to_model_unfiltered()
-    } else if let Some(name) = args.layer_filter.as_deref() {
-        file.to_model_with_filter(name)?
-    } else {
-        file.to_model()
-    };
-
-    let output = args
-        .output
-        .clone()
-        .unwrap_or_else(|| default_output(&args.input, args.format));
     let format = match args.format {
         Some(format) => format.into(),
-        None => Format::detect(&output),
+        None => args.output.as_ref().map_or(Format::Glb, Format::detect),
     };
+    // A JT file without an explicit name would land on its own input, so the
+    // rewrite gets a name of its own as `write` does.
+    let output = args.output.clone().unwrap_or_else(|| {
+        if format == Format::Jt {
+            default_jt_output(&args.input)
+        } else {
+            default_output(&args.input, args.format)
+        }
+    });
+    if !Format::detect(&args.input).is_readable() {
+        bail!("{} cannot be read by ferrojt", args.input.display());
+    }
     if !format.is_writable() {
         bail!("{format} cannot be written by ferrojt");
     }
@@ -318,19 +329,56 @@ pub fn convert(args: &ConvertArgs) -> Result<()> {
         bail!("{} exists; pass --force to overwrite", output.display());
     }
 
+    // The layer filters are a JT feature and only the JT reader knows the level
+    // of detail of a representation, so a JT input goes through that reader;
+    // every other input arrives as a neutral model.
+    let model = if Format::detect(&args.input) == Format::Jt {
+        let file = jt_file(&args.input)?;
+        if args.no_layer_filter {
+            file.to_model_unfiltered()
+        } else if let Some(name) = args.layer_filter.as_deref() {
+            file.to_model_with_filter(name)?
+        } else {
+            file.to_model()
+        }
+    } else {
+        if args.layer_filter.is_some() || args.no_layer_filter {
+            bail!(
+                "only a JT input declares layer filters, {} does not",
+                args.input.display()
+            );
+        }
+        load(&args.input)?
+    };
+
     let bar = spinner(&format.to_string());
-    ferrojt::export::write_to_file(format, &model, &output)
-        .map_err(|err| anyhow::anyhow!("{err}"))
-        .with_context(|| format!("writing {}", output.display()))?;
+    if format == Format::Jt {
+        ferrojt::jt::model_to_file(&model, &output, args.jt_version)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+            .with_context(|| format!("writing {}", output.display()))?;
+    } else {
+        ferrojt::export::write_to_file(format, &model, &output)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+            .with_context(|| format!("writing {}", output.display()))?;
+    }
     finish(bar);
 
     println!(
         "{} -> {} [{}]",
         args.input.display(),
         output.display(),
-        format
+        if format == Format::Jt {
+            jt_version_text(&output)?
+        } else {
+            format.to_string()
+        }
     );
     Ok(())
+}
+
+/// The revision a written JT file ended up at.
+fn jt_version_text(path: &Path) -> Result<String> {
+    Ok(ferrojt::jt::read_header(path)?.version_text())
 }
 
 /// Write a JT file back out, dropping what the filters reject.
@@ -502,7 +550,10 @@ fn print_summary(path: &Path, model: &Model, json: bool) -> Result<()> {
 
 fn default_output(input: &Path, format: Option<TargetFormat>) -> PathBuf {
     let format = format.map(Format::from).unwrap_or(Format::Glb);
-    input.with_extension(format.extension())
+    // `with_extension` cannot be used: the sample files carry a dot in their
+    // stem (`example_block_jt9.5.jt`), which it would truncate at.
+    let stem = input.file_stem().unwrap_or_default().to_string_lossy();
+    input.with_file_name(format!("{stem}.{}", format.extension()))
 }
 
 /// Default name for a rewritten JT file.
@@ -537,6 +588,7 @@ mod tests {
 
     #[test]
     fn target_format_maps_to_model_format() {
+        assert_eq!(Format::from(TargetFormat::Jt), Format::Jt);
         assert_eq!(Format::from(TargetFormat::Glb), Format::Glb);
         assert_eq!(Format::from(TargetFormat::Gltf), Format::Gltf);
         assert_eq!(Format::from(TargetFormat::Usd), Format::Usd);
@@ -552,6 +604,11 @@ mod tests {
         assert_eq!(
             default_output(path, Some(TargetFormat::Usd)),
             PathBuf::from("gear.usda")
+        );
+        // A dot inside the stem survives: the sample files are named that way.
+        assert_eq!(
+            default_output(Path::new("example_block_jt9.5.jt"), Some(TargetFormat::Glb)),
+            PathBuf::from("example_block_jt9.5.glb")
         );
     }
 
@@ -589,6 +646,14 @@ mod tests {
         let args = parse_convert(&["ferrojt", "convert", "gear.jt"]);
         assert_eq!(args.layer_filter, None);
         assert!(!args.no_layer_filter);
+        assert_eq!(args.jt_version, None);
+        assert_eq!(args.format, None);
+
+        let args = parse_convert(&["ferrojt", "convert", "gear.glb", "-f", "jt"]);
+        assert_eq!(args.format, Some(TargetFormat::Jt));
+
+        let args = parse_convert(&["ferrojt", "convert", "gear.jt", "--jt-version", "8.1"]);
+        assert_eq!(args.jt_version, Some(JtVersion::V8_1));
 
         let args = parse_convert(&["ferrojt", "convert", "gear.jt", "--layer-filter", "LAYCUR"]);
         assert_eq!(args.layer_filter.as_deref(), Some("LAYCUR"));

@@ -1,4 +1,4 @@
-"""FerroJT: read OpenJT (JT) files and convert them to glTF / USD.
+"""FerroJT: read OpenJT (JT) and glTF files and convert them to JT / glTF / USD.
 
 The heavy lifting happens in the compiled Rust extension module
 :mod:`ferrojt._ferrojt`; this package only re-exports it and adds a couple of
@@ -57,7 +57,7 @@ def read(path: str, **kwargs: Any) -> Model:
 
     Accepts the same keywords: ``layer_filter="NAME"`` selects one of the
     layer filters the file declares, and ``all_layers=True`` exports every
-    part instead of applying the filter of the file.
+    part instead of applying the filter of the file. Both only apply to JT.
     """
     return open(path, **kwargs)
 
