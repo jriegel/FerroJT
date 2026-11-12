@@ -51,12 +51,12 @@ impl Format {
 
     /// `true` if [`crate::open_format`] can read this format today.
     pub fn is_readable(self) -> bool {
-        matches!(self, Format::Jt)
+        matches!(self, Format::Jt | Format::Gltf | Format::Glb)
     }
 
     /// `true` if [`crate::export`] can write this format today.
     pub fn is_writable(self) -> bool {
-        matches!(self, Format::Gltf | Format::Glb | Format::Usd)
+        matches!(self, Format::Jt | Format::Gltf | Format::Glb | Format::Usd)
     }
 }
 
@@ -103,5 +103,20 @@ mod tests {
         for format in [Format::Jt, Format::Gltf, Format::Glb, Format::Usd] {
             assert_eq!(format.to_string().parse::<Format>().unwrap(), format);
         }
+    }
+
+    #[test]
+    fn every_format_can_be_written() {
+        for format in [Format::Jt, Format::Gltf, Format::Glb, Format::Usd] {
+            assert!(format.is_writable(), "{format} cannot be written");
+        }
+    }
+
+    #[test]
+    fn jt_gltf_and_glb_can_be_read() {
+        for format in [Format::Jt, Format::Gltf, Format::Glb] {
+            assert!(format.is_readable(), "{format} cannot be read");
+        }
+        assert!(!Format::Usd.is_readable(), "usd cannot be read yet");
     }
 }

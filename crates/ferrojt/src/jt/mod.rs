@@ -24,7 +24,9 @@
 //! - and a JT writer that rebuilds a file, optionally filtered: [`write_to_bytes`]
 //!   and [`WriteOptions`],
 //! - and a builder that creates a file from nothing: [`JtBuilder`], [`MeshData`]
-//!   and [`BuildNode`].
+//!   and [`BuildNode`],
+//! - and a writer that turns the neutral model of an imported file into JT:
+//!   [`model_to_bytes`] and [`model_to_file`].
 //!
 //! Both writers pick the file revision with [`JtVersion`]: 8.x, 9.x and 10.x
 //! differ in their version field widths, TOC offset width and — most
@@ -40,6 +42,7 @@ mod build;
 mod decode;
 mod dump;
 mod encode;
+mod from_model;
 mod guid;
 mod model;
 mod object;
@@ -59,6 +62,7 @@ pub use dump::{
     scan_for_layer, scan_for_layer_filter, write_key_value_stream, write_meshes_without_lsg,
     write_model,
 };
+pub use from_model::{model_to_bytes, model_to_file};
 pub use guid::Guid;
 pub use model::{
     JtFile, LayerFilter, LoadedElement, ObjectRef, SceneGraph, StoredAttribute, StoredNode,

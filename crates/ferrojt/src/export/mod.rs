@@ -2,7 +2,8 @@
 //!
 //! Every exporter consumes the same [`Model`], so adding a format means adding
 //! a module that implements [`Exporter`] and registering it in
-//! [`to_format`].
+//! [`to_format`]. JT is the exception: it is written by [`crate::jt`], which
+//! needs the revision to write at rather than a fixed container.
 
 mod glb;
 mod gltf;
@@ -12,7 +13,9 @@ pub use glb::{GLB_HEADER_MAGIC, GLB_VERSION, GlbBuilder, parse_header};
 pub use gltf::GltfExporter;
 pub use usd::UsdExporter;
 
-use crate::error::{Error, Result};
+pub(crate) use gltf::read_component;
+
+use crate::error::Result;
 use crate::model::{Format, Model};
 
 /// Writes a [`Model`] into some container format.
@@ -31,7 +34,7 @@ pub fn to_format(format: Format, model: &Model) -> Result<Vec<u8>> {
         Format::Gltf => GltfExporter::json().write(model, &mut out)?,
         Format::Glb => GltfExporter::glb().write(model, &mut out)?,
         Format::Usd => UsdExporter.write(model, &mut out)?,
-        Format::Jt => return Err(Error::UnsupportedFormat("jt (write)".into())),
+        Format::Jt => return crate::jt::model_to_bytes(model, None),
     }
     Ok(out)
 }

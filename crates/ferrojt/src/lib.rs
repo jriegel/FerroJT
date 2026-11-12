@@ -1,15 +1,15 @@
 //! FerroJT: read OpenJT (JT) files and convert them to other 3D formats.
 //!
-//! The crate is organised in four layers:
+//! The crate is organised in five layers:
 //!
 //! - [`model`] &mdash; a format agnostic scene model (the "IR" every reader produces
 //!   and every exporter consumes).
 //! - [`codec`] &mdash; low level binary helpers (byte order, segment framing,
 //!   DEFLATE) shared by format readers.
-//! - [`jt`] &mdash; the OpenJT reader. This is the insertion point for a JT
-//!   implementation: everything below it is already wired to consume it.
-//! - [`export`] &mdash; writers for the target formats: glTF/GLB and ASCII
-//!   USD (`.usda`).
+//! - [`jt`] &mdash; the OpenJT reader and writer.
+//! - [`import`] &mdash; readers for the source formats besides JT: glTF/GLB.
+//! - [`export`] &mdash; writers for the target formats: glTF/GLB, ASCII
+//!   USD (`.usda`) and JT.
 //!
 //! ```no_run
 //! use ferrojt::Format;
@@ -26,6 +26,7 @@
 pub mod codec;
 pub mod error;
 pub mod export;
+pub mod import;
 pub mod jt;
 pub mod model;
 
@@ -44,7 +45,7 @@ pub fn open_format(format: Format, path: impl AsRef<std::path::Path>) -> Result<
     tracing::debug!(%format, path = %path.display(), "opening");
     match format {
         Format::Jt => jt::open(path),
-        Format::Gltf | Format::Glb => Err(Error::UnsupportedFormat(format.to_string())),
+        Format::Gltf | Format::Glb => import::from_file(path),
         Format::Usd => Err(Error::UnsupportedFormat(format.to_string())),
     }
 }

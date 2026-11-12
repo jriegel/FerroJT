@@ -14,6 +14,13 @@
 //! | binary buffer, padded with 0x00 to a multiple of 4           |
 //! +---------------------------------------------------------------+
 //! ```
+//!
+//! The `length` of a chunk is the **padded** size, not the size of the payload:
+//! the spec says a chunk length must itself be a multiple of 4, and a reader
+//! that follows it strictly (the `gltf` crate does) lands on the next chunk
+//! header only if the padding is counted there. Declaring the payload length
+//! instead leaves the padding outside the chunk and the next header reads the
+//! padding bytes as its type.
 
 use crate::error::{Error, Result};
 
@@ -100,7 +107,7 @@ impl GlbBuilder {
 }
 
 fn write_chunk(out: &mut Vec<u8>, chunk_type: u32, payload: &[u8], pad: u8) {
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(pad4(payload.len()) as u32).to_le_bytes());
     out.extend_from_slice(&chunk_type.to_le_bytes());
     out.extend_from_slice(payload);
     let pad_len = pad4(payload.len()) - payload.len();
@@ -112,9 +119,10 @@ pub fn pad4(len: usize) -> usize {
     len.div_ceil(4) * 4
 }
 
-/// Parse the GLB header, returning `(json_len, bin_len)`.
+/// Parse the GLB header, returning the chunk lengths of `(json, bin)`.
 ///
-/// Used by tests and by a future glTF reader.
+/// The lengths are the declared ones, so they include the padding of the
+/// chunk. Used by tests and by a reader.
 pub fn parse_header(bytes: &[u8]) -> Result<(usize, Option<usize>)> {
     if bytes.len() < HEADER_LEN + CHUNK_HEADER_LEN {
         return Err(Error::invalid(0, "file too small to be a GLB"));
@@ -185,7 +193,7 @@ mod tests {
             .finish()
             .unwrap();
         let (json_len, bin) = parse_header(&file).unwrap();
-        assert_eq!(json_len, 27);
+        assert_eq!(json_len, 28);
         assert_eq!(bin, None);
         assert_eq!(file.len() % 4, 0);
     }
@@ -197,12 +205,36 @@ mod tests {
             .finish()
             .unwrap();
         let (json_len, bin) = parse_header(&file).unwrap();
-        assert_eq!(json_len, 27);
-        assert_eq!(bin, Some(3));
+        assert_eq!(json_len, 28);
+        assert_eq!(bin, Some(4));
         assert_eq!(
             file.len(),
             u32::from_le_bytes([file[8], file[9], file[10], file[11]]) as usize
         );
+    }
+
+    #[test]
+    fn a_chunk_length_counts_its_own_padding() {
+        // The JSON document below is 27 bytes, so its chunk is padded to 28.
+        // Declaring 27 would leave the pad byte outside the chunk and a strict
+        // reader would read it as the start of the BIN chunk header.
+        let file = GlbBuilder::new(br#"{"asset":{"version":"2.0"}}"#.to_vec())
+            .with_bin(vec![1, 2, 3])
+            .finish()
+            .unwrap();
+        for offset in [HEADER_LEN, HEADER_LEN + CHUNK_HEADER_LEN + pad4(27)] {
+            let length = u32::from_le_bytes([
+                file[offset],
+                file[offset + 1],
+                file[offset + 2],
+                file[offset + 3],
+            ]) as usize;
+            assert_eq!(length % 4, 0, "the chunk length at {offset} is not padded");
+            assert!(
+                offset + CHUNK_HEADER_LEN + length <= file.len(),
+                "the chunk at {offset} declares {length} bytes past the end of the file"
+            );
+        }
     }
 
     #[test]

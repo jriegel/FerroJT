@@ -466,10 +466,18 @@ impl JtFile {
 
     /// Walk the scene graph into a [`Model`], drawing only the parts the given
     /// filter accepts and keeping either the finest or every level of detail.
+    ///
+    /// The model is declared as millimetres and +Z up. JT stores no unit and no
+    /// up axis in the scene graph — the axis indicator of the root partition is
+    /// not part of the element the format defines — so this is the convention
+    /// the format prescribes, and every sample confirms it by carrying
+    /// `JT_PROP_MEASUREMENT_UNITS:: = "millimeters"` in its meta data.
     #[must_use]
     fn build_model(&self, filter: Option<&LayerFilter>, all_lods: bool) -> Model {
         let mut model = Model::new();
         model.source = Some(self.path.display().to_string());
+        model.unit = Some("millimeter".to_owned());
+        model.up_axis = Some("+Z".to_owned());
         let mut extras = json!({
             "format": "JT",
             "version": self.header.version_text(),
