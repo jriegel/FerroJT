@@ -6,8 +6,10 @@ flowchart LR
   JT -->|jt::JtFile::open| JN[JT native view]
   JN -->|jt::dump| JSON[JSON dump]
   JN -->|to_model| M
-  M -->|export::to_format| GLTF[glTF / GLB]
+  GLTF[glTF / GLB file] -->|import::from_file| M
+  M -->|export::to_format| GLTFW[glTF / GLB]
   M -->|export::to_format| USD[USD]
+  M -->|jt::model_to_bytes| JTW[OpenJT file]
   M -->|serde| JSON
   CLI[ferrojt CLI] --> M
   CLI --> JN
@@ -28,6 +30,12 @@ neutral model cannot. `JtFile::to_model()` then flattens that view into a
 `Model` for the exporters, and in doing so keeps only the finest level of
 detail of every range LOD: a glTF or USD file gets one mesh per part rather
 than one per tier. See [jt-reader.md](jt-reader.md).
+
+JT is written three ways, and only one of them is an exporter. `jt::write`
+re-serialises a file it has read, `jt::build` assembles one from nothing, and
+`jt::from_model` writes a neutral `Model` by handing it to the builder — which
+is how a glTF file becomes a `.jt` one. See [jt-writer.md](jt-writer.md),
+[jt-builder.md](jt-builder.md) and [jt-from-model.md](jt-from-model.md).
 
 ## The neutral model
 
@@ -74,12 +82,35 @@ Design rules:
 * `jt::decode` — Huffman, the range/CDP driver, the vertex coders and the mesh
   coder, verified byte for byte against the reference output.
 * `jt::model` — `JtFile` and `SceneGraph`, plus `to_model()` and the layer
-  filter that decides which parts an export keeps.
+  filter that decides which parts an export keeps. It declares `millimeter` /
+  `+Z` on the model it builds.
 * `jt::dump` — the JSON layout the JT tooling writes, including the C `%g`
   number formatting that `format_g` reproduces.
+* `jt::write` — re-serialises a file that was read, copying every segment but
+  the scene graph out of the source. See [jt-writer.md](jt-writer.md).
+* `jt::build` — assembles a file from nothing, JT 10.3 by default. See
+  [jt-builder.md](jt-builder.md).
+* `jt::from_model` — writes a neutral `Model` through the builder, choosing the
+  revision the meshes of the model can be coded at. See
+  [jt-from-model.md](jt-from-model.md).
 
 See [jt-reader.md](jt-reader.md) and [usd-writer.md](usd-writer.md) for the two
 contracts that bound the workspace.
+
+## Readers besides JT
+
+`import/` holds the readers that are not the JT one, and they are peers of
+`jt/`, not a layer under it:
+
+* `import::gltf` — `.gltf` and `.glb` in, `Model` out. Vertex data is kept
+  exactly as authored (one buffer block per glTF buffer, one attribute per
+  accessor), images are stored encoded rather than decoded, and a node matrix is
+  decomposed because JT and USD store translation, rotation and scale. It
+  declares `meter` / `+Y` on the model, because glTF 2.0 is metric and Y up by
+  contract. See [gltf-reader.md](gltf-reader.md).
+
+`crate::open` / `open_format` dispatch on `Format`, and `Format::is_readable`
+says what can be read. The CLI and the Python bindings call only those.
 
 ## Exporters
 
@@ -90,10 +121,14 @@ contracts that bound the workspace.
   the library) and merges every buffer into one BIN buffer. `.gltf` output inlines
   that buffer as a base64 data URI.
 * `export/glb.rs` does the GLB framing that `gltf-json` does not provide: header,
-  JSON chunk padded with `0x20`, BIN chunk padded with `0x00`.
+  JSON chunk padded with `0x20`, BIN chunk padded with `0x00`. A chunk's declared
+  length is the **padded** length, not the payload length.
 * `export/usd.rs` writes an ASCII `.usda` layer by hand: every mesh is authored
   once in an invisible geometry library and referenced by its consumers, and
   materials are collapsed by shading value. See [usd-writer.md](usd-writer.md).
+* `Format::Jt` is writable but deliberately bypasses the `Exporter` trait: the
+  trait has no place for the revision to write at, so `to_format` special-cases
+  it into `jt::model_to_bytes`. See [jt-from-model.md](jt-from-model.md).
 
 ## Error handling
 

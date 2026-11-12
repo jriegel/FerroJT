@@ -4,8 +4,9 @@
 > file from a [`JtFile`](../crates/ferrojt/src/jt/model.rs) that was read from
 > disk. `ferrojt write file.jt -o out.jt` uses it, and
 > `crates/ferrojt/tests/write.rs` pins the round trip. This is the only
-> direction the writer covers: it rewrites a file it has read, it does not
-> create one from a neutral `Model`.
+> direction *this* writer covers: it rewrites a file it has read and always
+> needs a source. Writing a neutral `Model` is a different path, in
+> [`jt::from_model`](jt-from-model.md).
 
 ## Why only the scene graph is re-serialised
 
@@ -202,8 +203,11 @@ source:
 
 ## Open work
 
-* Writing a file from a neutral `Model` rather than from a read `JtFile` —
-  `Format::Jt` stays non-writable for that reason.
-* Re-encoding representations, which would make a writer that does not need a
-  source file possible.
 * Preserving the source TOC position instead of always appending the table.
+* Re-encoding representations, which would let this writer change the
+  representation family inside one revision rather than only across a major.
+
+Writing a file from a neutral `Model` — the thing that used to be open work
+here — lives in [`jt::from_model`](jt-from-model.md) instead: it builds a new
+file through [`JtBuilder`](jt-builder.md) rather than copying segments out of a
+source, which is the right trade when the input never was a JT file.

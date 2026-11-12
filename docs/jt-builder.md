@@ -11,12 +11,13 @@
 
 [`jt::write_to_bytes`](jt-writer.md) rewrites a file it has read: it rebuilds the
 scene graph and copies every other segment out of the source byte for byte, so it
-needs a source. It also cannot write a neutral `Model`, which is why
-`Format::Jt` stays non-writable in `export/`.
+needs a source.
 
 The builder is the other direction. Nothing is copied — the banner, the table of
 contents, the scene graph, the property table and the shape segments are all
-emitted here, from the graph that was assembled by hand.
+emitted here, from the graph that was assembled by hand. A neutral `Model` is
+written by [`jt::from_model`](jt-from-model.md), which is a walk over the graph
+that ends up calling this builder.
 
 ## Which revision a built file uses
 
@@ -202,8 +203,10 @@ glTF and USD like any sample.
 * Key/value properties on a node, so a built file can carry `CAD_MASS::` and the
   like instead of only a name.
 * Layer filters: a built file declares none, so nothing gates on them.
-* Writing JT from `export/`, i.e. from a neutral `Model` — the builder is the
-  first half of that, but a `Model` has no representation ids to reattach.
+
+Writing a neutral `Model` is **not** open work any more — that is
+[`jt::from_model`](jt-from-model.md), which builds its own graph here rather than
+reattaching the representation ids of a source file.
 
 [`LodGeometry`]: ../crates/ferrojt/src/jt/object.rs
 [`JtBuilder::set_version`]: ../crates/ferrojt/src/jt/build.rs

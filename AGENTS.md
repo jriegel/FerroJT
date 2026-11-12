@@ -1,14 +1,15 @@
 # FerroJT — agent notes
 
-Rust cargo workspace plus a Python wrapper that reads OpenJT (`.jt`) and exports
-glTF 2.0 / GLB and ASCII USD (`.usda`), and can write a read file back out as
-JT. Read this before changing code; the design detail lives in `docs/`.
+Rust cargo workspace plus a Python wrapper that reads OpenJT (`.jt`) and glTF 2.0
+/ GLB, exports glTF 2.0 / GLB, ASCII USD (`.usda`) and JT, and can write a read
+file back out as JT. Read this before changing code; the design detail lives in
+`docs/`.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `jt/version.rs` the `JtVersion` a file is read or written at, `jt/encode.rs` the topological (dual vertex-face) encoder, `jt/write.rs` the JT writer, `jt/build.rs` the builder that creates a file from nothing, and `export/` glTF/GLB writer and the ASCII USD writer. |
+| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `import/` the glTF/GLB reader (`gltf.rs`), `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `jt/version.rs` the `JtVersion` a file is read or written at, `jt/encode.rs` the topological (dual vertex-face) encoder, `jt/write.rs` the JT writer, `jt/build.rs` the builder that creates a file from nothing, `jt/from_model.rs` (private) the writer that turns a neutral `Model` into a file, and `export/` glTF/GLB writer and the ASCII USD writer. |
 | `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `write`, `ls`. |
 | `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `lib.rs` is the export view (`Model`) plus `lsg.rs` the file view (`JtLsg`/`JtNode`/`JtMesh`/`JtArray`) and `build.rs` the builder (`JtBuilder`/`NodeHandle`/`MeshHandle`/`MeshData`/`MaterialData`); `pyproject.toml` + `python/ferrojt/` + `tests/`. |
 | `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `details.rs` key/value pane for the selected row, `backdrop.rs` viewport gradient, `camera.rs` `Camera3d` wrapper that places the backdrop, `picking.rs`, `trihedron.rs`. |
@@ -16,7 +17,7 @@ JT. Read this before changing code; the design detail lives in `docs/`.
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
 | `data/Reference/` | Reference JSON dumps from the JT tooling **and** reference PNG pictures — **the oracle**. |
 | `example/` | GPL-2.0 C++ sources (TKJT, ToolsLib, JtDump, PyOpenJt). Behavioural reference only, never linked or copied; gitignored. |
-| `docs/` | `README.md` index, `architecture.md`, `jt-reader.md`, `jt-writer.md`, `jt-builder.md`, `dump.md`, `usd-writer.md` and `viewer.png` — the viewer picture shown at the top of the top-level `README.md` (Git LFS). |
+| `docs/` | `README.md` index, `architecture.md`, `jt-reader.md`, `gltf-reader.md`, `jt-writer.md`, `jt-builder.md`, `jt-from-model.md`, `dump.md`, `usd-writer.md` and `viewer.png` — the viewer picture shown at the top of the top-level `README.md` (Git LFS). |
 
 ## Commands
 
@@ -49,6 +50,14 @@ cargo test -p ferrojt --test build          # the Rust side
 .\.venv\Scripts\python.exe -m pytest tests\test_build.py -q   # the Python side
 ```
 
+Convert a glTF file to JT (the neutral-`Model` writer, not the rewriter — it
+prints the revision the file actually landed on):
+
+```powershell
+cargo run -p ferrojt-cli -- convert target\block.glb -o target\block.jt --force
+cargo run -p ferrojt-cli -- info target\block.jt
+```
+
 `ferrojt-python` must be excluded from `cargo test`: its default features enable
 `pyo3/extension-module`, so a test binary cannot resolve the Python symbols.
 
@@ -72,7 +81,7 @@ without it):
 ```
 
 Interactive viewer (also needs `open3d`; it is a tool, not a test — nothing in it
-is named `test_*`, so pytest still collects 91 tests):
+is named `test_*`, so pytest still collects 98 tests):
 
 ```powershell
 .\.venv\Scripts\python.exe tests\test_viewer.py data\ExampleFiles\example_block_jt9.5.jt
@@ -95,7 +104,8 @@ Upload with `python -m twine upload dist\*`.
 - Errors: `Error::invalid(offset, message)` / `Error::Corrupt(String)`. `Error` is
   not const-constructible. A `write_all(..)` tail expression needs `?; Ok(())`.
 - Rustdoc warns on intra-doc links to private modules — link only to re-exported
-  public items.
+  public items. `jt::from_model` is a **private** module, so a doc comment on
+  `model_to_bytes` must link `[crate::jt]`, never `(self)`.
 - No `[workspace.lints]`; lints are per-crate.
 - Dual license `MIT OR Apache-2.0`. Author string is `Juergen Riegel` in both
   `Cargo.toml` and `pyproject.toml`.
@@ -741,9 +751,10 @@ Upload with `python -m twine upload dist\*`.
   `Version 10.3 JT`, header 109 bytes (LSG at 109) for 10.x against 105 for
   8.x/9.x. A 9.x/10.x mesh must be a **closed two-manifold** — an open shell is
   refused with "the mesh is not a closed two-manifold, so it cannot be written
-  as JT 9.x/10.x", and only JT 8.x can hold it. `Format::Jt`
-  stays `Error::UnsupportedFormat("jt (write)")` in `export/mod.rs` — the
-  builder builds its own graph, it does not consume a `Model`.
+  as JT 9.x/10.x", and only JT 8.x can hold it. `Format::Jt` **is** writable,
+  but `export::to_format` special-cases it (`Format::Jt =>
+  crate::jt::model_to_bytes(model, None)`) because the `Exporter` trait has no
+  revision parameter — it never goes through an `Exporter` impl.
 - **A JT 8.x shape cannot share a vertex slot, and the strip walk renumbers the
   indices.** `MeshData::new`/`with_normals` **explode** the mesh (one slot per
   triangle corner — a cube becomes 36 vertices / 36 normals / 36 indices, and
@@ -773,6 +784,51 @@ Upload with `python -m twine upload dist\*`.
   `"9"` → 9.5) because pyo3 0.30 cannot express a tri-state `Option<Option<&str>>`
   keyword. `JtFile.model()` and `ferrojt.open/read` still have **no `all_lods`** —
   every LOD tier is only reachable through `jt.lsg.meshes()` in Python.
+- **glTF is a reader now** (`import/gltf.rs`, `import::from_file`/`from_bytes`).
+  It fills the same `Model` and **declares** `unit = "meter"`, `up_axis = "+Y"`.
+  `Format::is_readable()` is `Jt | Gltf | Glb` and `crate::open_format` is the
+  single dispatch point — `ferrojt::open`, `ferrojt-cli` and `ferrojt.open` all go
+  through it, so a new reader needs no CLI or Python change beyond the format name.
+  `Model.unit` / `Model.up_axis` are Python properties.
+- **`jt/from_model.rs` is the neutral-`Model` JT writer** — a **private** module,
+  re-exported as `jt::model_to_bytes(model, Option<JtVersion>)` and
+  `jt::model_to_file`. It builds its own graph through `JtBuilder`; it does not
+  copy segments, so unlike `jt::write_to_bytes` it needs no source file.
+- **The two-manifold fallback is per file, not per mesh.** `model_to_bytes` probes
+  every mesh with `jt::encode::encode`; if one fails and `version` is `None` it
+  rebuilds the whole file at **JT 8.1**, and if `version` was asked for it refuses
+  with "a mesh with N triangles is not a closed two-manifold, so it cannot be
+  written as JT {v}; write it at JT 8.x or repair the mesh". Measured: block
+  8.1/9.5/10.3 and plate1-9.5 → 10.3; **plate1-8.0 and `SampleJT_Server.jt` → 8.1**.
+  The CLI prints the revision it landed on (`[8.1]`), which is how the fallback is
+  observable without a test.
+- **The frame is a declared convention, and the conversion lives on the root.**
+  `jt/model.rs::build_model` sets `millimeter` / `+Z` (JT stores no unit and
+  `Partition::read` hardcodes `up_axis: 0`, but every sample carries
+  `JT_PROP_MEASUREMENT_UNITS:: = "millimeters"`). So a JT→JT write is an identity
+  and a glTF→JT write puts `scale = 1000` plus a quarter turn about +X on the root
+  `Partition` (`root_transform`, quaternion `[0.70710678, 0, 0, 0.70710678]` in
+  `x y z w`) and leaves the geometry alone — bounds of a 100×80×60 mm block are
+  unchanged. Unknown unit/up axis → `Error::Unsupported`.
+- **A glTF hop erases every JT node class.** A file written from a `Model` is
+  exactly `Partition 1 · Shape = meshes · Group = nodes − meshes · Instance = extra`;
+  `Node::kind` is the free-form class carrier that round-trips through
+  `class_of`, and anything unknown becomes `Group`. Written LSG node count ==
+  `model.nodes.len() + 1 + instances`.
+- **`from_model` emits one material attribute per shape *node***, so the distinct
+  count is smaller than `Model::materials.len()` — the server sample writes 20
+  attributes for 23 materials.
+- **A GLB chunk length must be the *padded* length**, and the chunk header is
+  length **then** type. Pinned by `export/glb.rs::a_chunk_length_counts_its_own_padding`.
+- **`JtFile::lsg` is `Option<SceneGraph>` and `SceneGraph` has no `node_count()`** —
+  in Rust use `.as_ref().expect(..).nodes.len()`. The Python `JtLsg.node_count`
+  **is** a property (a different type), so the two do not mirror each other here.
+- **The pytest summary line never surfaces under redirection** (Open3D/Vulkan
+  native output interleaves), so `Select-String 'passed|failed'` finds nothing.
+  Trust `$LASTEXITCODE` plus `pytest --co -q` per file: 21 build + 66 ferrojt +
+  11 visual = **98**.
+- **Parallel tests need pid *and* an atomic counter in the temp file name** — the
+  pid alone collides across the worker processes of one run.
 - **Picture parity for a written file must be measured one process per picture**
   and compared as PNGs: for the ~1M-triangle server mesh Open3D returns
   permanent all-zero frames partway through a process, so retrying inside one
@@ -796,7 +852,8 @@ rustc/cargo 1.97.1, host `x86_64-pc-windows-msvc`, VS 2022 MSVC, Python 3.13.7,
 maturin 1.15.0, ziglang 0.16.0 (pip), open3d 0.20.0 (pip, newest for 3.13),
 git 2.50.1. Pinned deps in the root
 `Cargo.toml`: thiserror 2.0, serde 1.0, serde_json 1.0, flate2 1.1, half 2.7,
-bytemuck 1.25, tracing 0.1, rayon 1.12, gltf-json 1.4, gltf 1.4 (dev), base64 0.22,
+bytemuck 1.25, tracing 0.1, rayon 1.12, gltf-json 1.4, gltf 1.4 (now a **runtime**
+dep of `ferrojt` for the glTF reader, no longer dev-only), base64 0.22,
 lzma-rs 0.3, clap 4.6, anyhow 1.0, tracing-subscriber 0.3, indicatif 0.18,
 kiss3d 0.47 (`egui` feature) + egui 0.36 + rfd 0.17 + image 0.25 (no features) +
 webbrowser 1.2,
@@ -806,11 +863,10 @@ pyo3 0.30 (`abi3-py310`). No USD crate — `export/usd.rs` writes `.usda` by han
 
 USD: `.usdc` (binary) and `.usdz` (packaged) output, and JT textures into the
 `UsdPreviewSurface` — `docs/usd-writer.md` holds the mapping and the open work.
-JT: writing from a neutral `Model` instead of a read `JtFile` (that needs the
-representation codecs re-encoded, so `Format::Jt` stays
-`Error::UnsupportedFormat("jt (write)")` in `export/mod.rs`), and keeping the
-source TOC position instead of always appending the table —
+JT: keeping the source TOC position instead of always appending the table —
 `docs/jt-writer.md` holds the details. The builder (`jt/build.rs`) creates a file
 from nothing at JT 10.3 by default (8.x/9.x on request) — `docs/jt-builder.md`
-lists what is still open there (XZ, key/value properties, layer filters).
+lists what is still open there (XZ, key/value properties, layer filters). Writing
+a neutral `Model` (`jt/from_model.rs`, `docs/jt-from-model.md`) carries no LOD
+tiers, no key/value properties and no layer filters yet.
 macOS and ARM wheels need CI (`maturin generate-ci github`).

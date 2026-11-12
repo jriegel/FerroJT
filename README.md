@@ -2,7 +2,7 @@
 
 Read [OpenJT](https://www.jt-open.com/) (`.jt`) CAD files and convert them to
 [glTF 2.0](https://www.khronos.org/gltf/) (`.gltf` / `.glb`) and
-[USD](https://openusd.org/) (`.usda`).
+[USD](https://openusd.org/) (`.usda`) — or read glTF 2.0 and write OpenJT.
 
 ![The FerroJT viewer showing an opening protection plate](docs/viewer.png)
 
@@ -24,10 +24,14 @@ FerroJT is a Rust reader and exporter for it, written against the OpenJT
 specification with the reference tooling used only as an oracle — its sources are
 never linked or copied. It opens a `.jt` file, decodes the scene graph and its
 LOD geometry, and hands you a neutral `Model` of nodes, meshes, attributes and
-materials. Two writers turn that into the formats the rest of the pipeline
-consumes: glTF 2.0 for engines and the web, ASCII USD for stage tools. The same
-library is also a command line tool, a Python package and a desktop viewer, and
-the core crate is `#![forbid(unsafe_code)]` with no native dependencies.
+materials. That `Model` is the hinge of the library: three writers turn it into
+the formats the rest of the pipeline consumes — glTF 2.0 for engines and the web,
+ASCII USD for stage tools, and JT itself — and a glTF reader fills the same graph
+from the other side, so a `.glb` can be handed to a CAD tool. JT can also be
+produced from nothing at all, by a builder that assembles the scene graph by hand.
+The same library is also a command line tool, a Python package and a desktop
+viewer, and the core crate is `#![forbid(unsafe_code)]` with no native
+dependencies.
 
 Correctness is measured, not assumed. The JSON dump the library writes is
 compared **byte for byte** with the reference dumps of the JT tooling, and the
@@ -40,6 +44,7 @@ broken model downstream.
 
 ```sh
 cargo run -p ferrojt-cli -- convert data/ExampleFiles/example_block_jt9.5.jt -o block.glb
+cargo run -p ferrojt-cli -- convert block.glb -o block.jt
 cargo run -p ferrojt-viewer -- data/ExampleFiles/example_block_jt9.5.jt
 ```
 
@@ -47,14 +52,17 @@ cargo run -p ferrojt-viewer -- data/ExampleFiles/example_block_jt9.5.jt
 import ferrojt
 
 model = ferrojt.open("data/ExampleFiles/example_block_jt9.5.jt")
-model.save("block.glb")          # or "block.usda" for ASCII USD
+model.save("block.glb")          # or "block.usda" for ASCII USD, "block.jt" for JT
+
+model = ferrojt.open("block.glb")   # glTF in, JT out
+model.save("block.jt", version="10.3")
 ```
 
 FerroJT is a Rust workspace with four parts:
 
 | Crate | Purpose |
 | --- | --- |
-| [`crates/ferrojt`](crates/ferrojt) | The library: the neutral `Model` graph, binary codecs, the JT reader and the glTF/USD writers. |
+| [`crates/ferrojt`](crates/ferrojt) | The library: the neutral `Model` graph, binary codecs, the JT and glTF readers and the glTF/USD/JT writers. |
 | [`crates/ferrojt-cli`](crates/ferrojt-cli) | The `ferrojt` command line tool (`info`, `inspect`, `dump`, `convert`, `ls`). |
 | [`crates/ferrojt-python`](crates/ferrojt-python) | `pyo3` bindings, published as the Python package `ferrojt`. |
 | [`crates/ferrojt-viewer`](crates/ferrojt-viewer) | The `ferrojt-viewer` desktop app: an egui outliner next to a kiss3d viewport. |
@@ -68,10 +76,12 @@ FerroJT is a Rust workspace with four parts:
 | JT reader (7.x – 10.x: header, TOC, LSG, elements, LOD geometry) | done |
 | JT JSON dump (the layout the JT tooling uses) | done — byte for byte against the reference dumps in `data/Reference` |
 | JT decode codecs (Huffman, range/CDP, vertex and mesh coders) | done |
+| glTF 2.0 / GLB reader | done — `.gltf` / `.glb` into the same neutral `Model`, declaring `meter` / `+Y` |
 | glTF 2.0 / GLB writer | done |
 | USD writer (ASCII `.usda`) | done — each mesh written once and referenced, materials deduplicated by value |
 | JT writer (rebuild a read file, LOD and layer filtered) | done — a round trip re-reads to the same dump, structure and picture; `--jt-version` rewrites it as 8.x, 9.x or 10.x |
 | JT builder (create a file from nothing, meshes and instances) | done — JT 10.3 by default, `tests/test_build.py` builds a cube at each revision and reads it back |
+| JT writer from a neutral `Model` (glTF → JT) | done — `convert model.glb -o out.jt`, unit and up axis converted on the root, falling back to JT 8.x when a mesh is not a closed two-manifold |
 | CLI | done |
 | Python bindings | done (packaged with `maturin`) |
 | Visual regression (rendered export vs. reference picture) | done (`tests/test_visual.py`, Open3D) |
@@ -93,8 +103,10 @@ crates/
       model/               neutral scene graph (nodes, meshes, materials, ...)
       codec/               endian, bit reader, compression
       jt/                  OpenJT reader, segment/TOC table, element objects,
-                           decode codecs, the JSON dump writer, the JT writer
-                           and the builder that creates a file from nothing
+                           decode codecs, the JSON dump writer, the JT writer,
+                           the builder that creates a file from nothing and the
+                           writer that turns a neutral Model into a file
+      import/              glTF / GLB reader
       export/              gltf/glb writer, glb framing, ascii usd writer
       error.rs  lib.rs
   ferrojt-cli/             `ferrojt` binary
@@ -135,6 +147,8 @@ cargo run -p ferrojt-cli -- convert gear.jt -f glb -o gear.glb
 cargo run -p ferrojt-cli -- convert gear.jt -f usd -o gear.usda
 cargo run -p ferrojt-cli -- convert gear.jt --layer-filter LAYCUR -o gear.glb
 cargo run -p ferrojt-cli -- convert gear.jt --no-layer-filter -o gear.glb
+cargo run -p ferrojt-cli -- convert model.glb -o model.jt
+cargo run -p ferrojt-cli -- convert model.glb -o model.jt --jt-version 8.1
 cargo run -p ferrojt-cli -- write    gear.jt -o gear.out.jt
 cargo run -p ferrojt-cli -- write    gear.jt --all-lods --no-layer-filter
 cargo run -p ferrojt-cli -- write    gear.jt --layer-filter LAYCUR --compress
@@ -148,7 +162,12 @@ one JSON array. A dump is never filtered by layer.
 
 `convert` applies the layer filter the file declares as active, or its first
 filter when the file leaves that unset: `--layer-filter NAME` picks another one
-of the declared filters, and `--no-layer-filter` exports every part.
+of the declared filters, and `--no-layer-filter` exports every part. The input
+may also be a `.gltf` or `.glb` file, in which case the layer keywords are
+refused — only a JT file declares filters — and the output may be `-f jt`, which
+writes the model as OpenJT through the builder rather than the rewriter. The last
+line of output names the format, and for JT the revision the file actually landed
+on.
 
 `write` rebuilds the file as JT. It applies the same selection an export
 applies — the finest tier below a range LOD and the active layer filter —
@@ -162,6 +181,11 @@ vertex-based representation, 9.x and 10.x in the topologically compressed coder 
 so a rewrite stays inside the family of the source, and a shape the coder cannot
 hold (a CAD assembly with open edges) is refused rather than written as a file
 whose shapes come back empty. See [docs/jt-writer.md](docs/jt-writer.md).
+
+For `convert … -f jt` the same gate applies, but there is no source revision to
+stay inside: unless `--jt-version` says otherwise, a mesh the coder cannot hold
+moves the whole file down to JT 8.x instead of failing, and the output line says
+so. See [docs/jt-from-model.md](docs/jt-from-model.md).
 
 ## Rust viewer
 
@@ -225,9 +249,27 @@ model = ferrojt.open("gear.jt")
 print(model)                       # Model(nodes=..., meshes=..., ...)
 model.save("gear.glb")             # format inferred from the extension
 model.save("gear.usda")            # ASCII USD
+model.save("gear.jt")              # OpenJT, through the builder
 model.to_bytes("usd")              # the same layer as bytes
 glb_bytes = model.to_bytes("glb")
 ```
+
+A glTF file reads into the same `Model`, and `unit` and `up_axis` say what frame
+it was authored in — `meter` / `+Y` for glTF, `millimeter` / `+Z` for JT. Writing
+JT converts that frame on the root node, so the geometry keeps its shape:
+
+```python
+model = ferrojt.open("model.glb")
+print(model.unit, model.up_axis)   # meter +Y
+model.save("model.jt")                   # written as JT 10.3 when it fits
+model.save("model.jt", version="8.1")    # or insist on a revision
+model.to_bytes("jt", version="9.5")      # the same as bytes
+```
+
+`version` only applies to JT and is refused for the other formats. When a mesh is
+not a closed two-manifold the topological coder of JT 9.x and 10.x cannot hold
+it, so a write without `version` drops the file to JT 8.x and an explicit
+`version` raises instead.
 
 `JtFile` is the JT native view of the same file and mirrors the original C++
 `PyOpenJt` extension: it is constructed with a path, opened explicitly, and then
@@ -441,6 +483,11 @@ matrix instead.
 
 * **One neutral model.** Readers build a [`Model`](crates/ferrojt/src/model/scene.rs);
   writers consume it. Adding a format never touches the others.
+* **The frame is declared, not assumed.** A reader says what units and up axis it
+  read — JT reports `millimeter` / `+Z`, glTF `meter` / `+Y` — and a writer that
+  targets another frame converts on the root node instead of touching the
+  geometry. So a JT → JT write is an identity and a glTF → JT write costs one
+  scale and one quarter turn.
 * **Handles, not pointers.** Cross references (`node -> mesh`, `primitive ->
   attribute`) are `usize` indices into the owning `Vec` on `Model`. The graph is
   copyable, serializable to JSON and safe to walk in parallel.
@@ -466,8 +513,10 @@ matrix instead.
 
 The reasoning behind these choices is in [`docs/`](docs): the neutral model and
 the two-layer JT design in [architecture.md](docs/architecture.md), what the
-reader guarantees in [jt-reader.md](docs/jt-reader.md), and how the JSON dump
-reaches the reference output in [dump.md](docs/dump.md).
+reader guarantees in [jt-reader.md](docs/jt-reader.md), how the JSON dump
+reaches the reference output in [dump.md](docs/dump.md), and how a glTF file
+becomes a JT file in [gltf-reader.md](docs/gltf-reader.md) and
+[jt-from-model.md](docs/jt-from-model.md).
 
 ## License
 
