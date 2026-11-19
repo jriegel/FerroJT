@@ -389,7 +389,8 @@ class JtBuilder:
     The graph starts as a root ``Partition``; add nodes with :meth:`add_node`,
     shapes with :meth:`add_shape`, and share a subtree with
     :meth:`instance_of`. :meth:`save` writes the file at the revision of
-    :attr:`version`, which is JT 10.3 until it is changed.
+    :attr:`version`, which is JT 10.3 until it is changed, and names the root
+    partition after the path unless :meth:`set_file_name` said otherwise.
     """
 
     def __init__(self) -> None: ...
@@ -403,6 +404,14 @@ class JtBuilder:
     @compress.setter
     def compress(self, value: bool) -> None: ...
     @property
+    def file_name(self) -> str | None:
+        """The name the root partition of the file carries.
+
+        ``None`` while none was set, in which case :meth:`save` takes the name
+        of the path it writes to and :meth:`to_bytes` falls back to
+        ``"model.jt"``. A consumer that builds its own scene graph keys the root
+        node on that name and refuses a file whose partition is unnamed.
+        """
     def version(self) -> str:
         """The JT revision the file is written at, as ``"major.minor"``."""
     @version.setter
@@ -414,6 +423,12 @@ class JtBuilder:
         A mesh of a 9.x or 10.x file has to be a closed two-manifold, since
         that is the only thing the topologically compressed coder accepts; a
         mesh that is not can still be written as 8.x.
+        """
+
+    def set_file_name(self, value: str) -> None:
+        """Name the root partition of the file `value`, e.g. ``"assembly.jt"``.
+
+        An empty string clears the name again and lets the writer fall back.
         """
 
     def root(self) -> NodeHandle: ...

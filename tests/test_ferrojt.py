@@ -1080,6 +1080,36 @@ def test_a_glb_file_writes_back_out_as_jt(tmp_path) -> None:
 
 
 @needs_sample
+def test_a_written_file_names_its_root_partition(tmp_path) -> None:
+    """The root partition of a written file names the file it is in.
+
+    This is not decoration: a consumer that builds a scene graph of its own
+    creates the root node from that name and refuses a file whose partition is
+    unnamed, which reads as "Unable in find root node". A file written to a path
+    knows its own name; :meth:`Model.to_bytes` cannot know a destination and
+    names the root after the file the model was read from instead.
+    """
+    model = ferrojt.open(str(BLOCK_95))
+
+    target = tmp_path / "assembly.jt"
+    model.save(str(target))
+    file = ferrojt.JtFile(str(target))
+    file.open()
+    root = file.lsg.root()
+    assert root is not None
+    assert root.class_name == "Partition"
+    assert root.name == "assembly.jt"
+
+    # Bytes have no destination, so the name of the source is kept — including
+    # the dot inside its stem, which is why the extension is read off the last
+    # dot rather than the first.
+    (tmp_path / "sourced.jt").write_bytes(model.to_bytes("jt"))
+    file = ferrojt.JtFile(str(tmp_path / "sourced.jt"))
+    file.open()
+    assert file.lsg.root().name == "example_block_jt9.5.jt"
+
+
+@needs_sample
 def test_to_bytes_names_the_revision_of_a_jt_export(tmp_path) -> None:
     model = ferrojt.open(str(BLOCK_95))
 

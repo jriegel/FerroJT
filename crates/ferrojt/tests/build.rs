@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use ferrojt::codec::ByteOrder;
 use ferrojt::jt::{
-    Attribute, BuildNode, Element, JtBuilder, JtFile, JtVersion, MaterialData, MeshData, SceneGraph,
+    Attribute, BuildNode, Element, JtBuilder, JtFile, JtVersion, MaterialData, MeshData, Node,
+    SceneGraph,
 };
 
 /// Half the edge length of the test cube.
@@ -291,6 +292,106 @@ fn the_scene_graph_of_a_built_file_survives_the_round_trip() {
         assert_eq!(instance.class_name(), "Instance");
         assert_eq!(lsg.instance_target(instance), Some(1));
     }
+}
+
+#[test]
+fn the_root_partition_names_the_file_it_belongs_to() {
+    // A consumer that builds a scene graph of its own creates the root node
+    // from the file name of the root partition and refuses a file whose
+    // partition is unnamed, so both places a sample names its root have to be
+    // filled in: the field of the partition struct, and the property row of the
+    // object id the root node is stored under.
+    let mut build = builder();
+    build.set_file_name("assembly.jt");
+    assert_eq!(build.file_name(), Some("assembly.jt"));
+    let file = parse(&build.write_to_bytes().expect("the graph can be written"));
+    let lsg = graph(&file);
+
+    let Node::Partition(partition) = lsg.root().expect("a root node") else {
+        panic!("the root of a built file is a partition");
+    };
+    assert_eq!(partition.file_name, "assembly.jt");
+    assert_eq!(
+        partition.name, "assembly.jt",
+        "the property row of the root names it too"
+    );
+    // Bit 0 of the flags is set by every sample. The counts describe the graph
+    // the file holds — five nodes and twelve triangles — and as vertex range
+    // the distinct (position, normal) pairs of the shape, which is what the
+    // samples of every revision declare. The cube comes out as 26 rather than
+    // the 24 of a clean box because `MeshData::new` gives every triangle the
+    // normal of its own plane, and the two triangles of one face normalise to
+    // slightly different vectors.
+    assert_eq!(partition.flags, 1);
+    assert_eq!(partition.counts, [26, 26, 5, 5, 12, 12]);
+    assert_eq!(partition.bounds, [-HALF, -HALF, -HALF, HALF, HALF, HALF]);
+    // Six faces of a 10 mm cube.
+    assert!(
+        (partition.area - 600.0).abs() < 1e-3,
+        "area {}",
+        partition.area
+    );
+
+    // What the root declares through the property table: every sample says
+    // what kind of root it is, and the reader only learns the name of the
+    // partition from the row its object id owns.
+    let declared: Vec<&str> = lsg
+        .properties
+        .iter()
+        .filter_map(|stored| stored.property.string_value())
+        .collect();
+    assert!(
+        declared.contains(&"PartitionType") && declared.contains(&"Assembly"),
+        "the root declares its type: {declared:?}"
+    );
+
+    // A builder that never names a file still names its root: an empty name is
+    // refused rather than written.
+    let build = builder();
+    let file = parse(&build.write_to_bytes().expect("the graph can be written"));
+    let Node::Partition(partition) = graph(&file).root().expect("a root node") else {
+        panic!("the root of a built file is a partition");
+    };
+    assert_eq!(partition.file_name, "model.jt");
+    assert_eq!(partition.name, "model.jt");
+}
+
+#[test]
+fn a_file_on_disk_names_its_root_after_itself() {
+    // Writing to a path knows the name of the file, so a builder that never
+    // named one still produces a root a consumer can find.
+    let path = temp_path("named");
+    builder()
+        .write_to_file(&path)
+        .expect("the file can be written");
+    let file = JtFile::open(&path).expect("the file on disk parses");
+    let Node::Partition(partition) = graph(&file).root().expect("a root node") else {
+        panic!("the root of a built file is a partition");
+    };
+    let want = path
+        .file_stem()
+        .expect("the temporary path has a stem")
+        .to_string_lossy()
+        .into_owned()
+        + ".jt";
+    assert_eq!(
+        partition.file_name, want,
+        "the root names the file it is in"
+    );
+    assert_eq!(partition.name, want);
+
+    // A name set explicitly wins over the name of the path.
+    let mut build = builder();
+    build.set_file_name("chosen.jt");
+    build.write_to_file(&path).expect("the file can be written");
+    let file = JtFile::open(&path).expect("the file on disk parses");
+    let Node::Partition(partition) = graph(&file).root().expect("a root node") else {
+        panic!("the root of a built file is a partition");
+    };
+    assert_eq!(partition.file_name, "chosen.jt");
+    assert_eq!(partition.name, "chosen.jt");
+
+    std::fs::remove_file(&path).expect("the temporary file can be removed");
 }
 
 #[test]

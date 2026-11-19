@@ -323,6 +323,17 @@ pub struct Partition {
     pub file_name: String,
     /// Axis indicator, as stored.
     pub up_axis: i32,
+    /// Flag word: bit 0 says an untransformed box follows the counts.
+    pub flags: i32,
+    /// Axis aligned box of everything below the root.
+    pub bounds: [f32; 6],
+    /// Surface area of everything below the root.
+    pub area: f32,
+    /// The three `I32[2]` count arrays: vertex, node and triangle range.
+    pub counts: [i32; 6],
+    /// The untransformed box, stored by JT 8.x and 9.x only, and only when
+    /// flag bit 0 is set.
+    pub untransformed_bounds: Option<[f32; 6]>,
     /// Name from the property table.
     pub name: String,
     /// Child references.
@@ -335,20 +346,28 @@ impl Partition {
         if cursor.major() >= 10 {
             let _ = cursor.read_version()?;
         }
-        let _flags = cursor.read_i32()?;
+        let flags = cursor.read_i32()?;
         let file_name = cursor.read_mb_string()?;
-        let has_untransformed = (_flags & 1) != 0;
-        read_bounds(cursor)?;
-        let _area = cursor.read_f32()?;
-        read_int_pairs(cursor)?;
-        if has_untransformed && cursor.major() < 10 {
-            read_bounds(cursor)?;
-        }
+        let has_untransformed = (flags & 1) != 0;
+        let bounds = read_bounds(cursor)?;
+        let area = cursor.read_f32()?;
+        let counts = read_int_pairs(cursor)?;
+        // JT 10.x sets the flag but does not store the additional box.
+        let untransformed_bounds = if has_untransformed && cursor.major() < 10 {
+            Some(read_bounds(cursor)?)
+        } else {
+            None
+        };
         let children = base.children.clone();
         Ok(Partition {
             base,
             file_name,
             up_axis: 0,
+            flags,
+            bounds,
+            area,
+            counts,
+            untransformed_bounds,
             name: String::new(),
             children,
         })
@@ -520,36 +539,134 @@ pub struct Shape {
     pub bounds: [f32; 6],
     /// Surface area.
     pub area: f32,
+    /// The three `I32[2]` count arrays: vertex, LOD and triangle range.
+    pub counts: [i32; 6],
+    /// Stored size of the representation, in bytes.
+    ///
+    /// The reference reads this field and never uses it, so a writer may store
+    /// any value; it is kept so that a rewrite reproduces the file.
+    pub size: i32,
+    /// Level-of-detail fraction of this representation, `0.0` for the finest.
+    pub compression: f32,
+    /// The vertex bindings of the representation, as the revision stores them.
+    pub lod: ShapeLod,
     /// Name from the property table.
     pub name: String,
 }
 
+/// The tail of a shape node, describing the vertex data of its representation.
+///
+/// The revision picks the layout: JT 8.x stores three `I32` bindings, JT 9.x
+/// a version, a 64-bit binding, the quantization parameters and — when that
+/// version is not 1 — a second binding, and JT 10.x only a version and one
+/// binding. The reference reads all of it, so a writer has to store it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShapeLod {
+    /// JT 8.x: three `I32` bindings and the quantization parameters.
+    Vertex1 {
+        /// Binding of the normals.
+        normal_binding: i32,
+        /// Binding of the texture coordinates.
+        texture_binding: i32,
+        /// Binding of the colours.
+        color_binding: i32,
+        /// Quantization parameters, four bytes verbatim.
+        quantization: [u8; 4],
+    },
+    /// JT 9.x: a version, a binding, quantization parameters and, from version
+    /// 2 on, a second binding.
+    Vertex2 {
+        /// Class version as stored.
+        version: u16,
+        /// First 64-bit vertex binding, verbatim.
+        binding: [u8; 8],
+        /// Quantization parameters, four bytes verbatim.
+        quantization: [u8; 4],
+        /// Second binding, `None` when the version is 1 and none is stored.
+        second_binding: Option<[u8; 8]>,
+    },
+    /// JT 10.x: a version and one binding.
+    Binding {
+        /// Class version as stored.
+        version: u8,
+        /// 64-bit vertex binding, verbatim.
+        binding: [u8; 8],
+    },
+    /// A shape node of a class this reader does not model.
+    #[default]
+    None,
+}
+
 impl Shape {
     fn read(cursor: &mut Cursor<'_>) -> Result<Self> {
+        let major = cursor.major();
         let base = NodeBase::read(cursor, true)?;
-        if cursor.major() > 8 {
+        if major > 8 {
             let _version = cursor.read_version()?;
         }
         // JT 10.x stores a single (untransformed) box, earlier versions store
         // the reserved box first and the untransformed one second; the
         // reference hands out the untransformed box.
-        let bounds = if cursor.major() >= 10 {
+        let bounds = if major >= 10 {
             read_bounds(cursor)?
         } else {
             let _reserved = read_bounds(cursor)?;
             read_bounds(cursor)?
         };
         let area = cursor.read_f32()?;
-        read_int_pairs(cursor)?;
-        let _size = cursor.read_i32()?;
-        let _compression = cursor.read_f32()?;
+        let counts = read_int_pairs(cursor)?;
+        let size = cursor.read_i32()?;
+        let compression = cursor.read_f32()?;
+        let lod = read_shape_lod(cursor)?;
         Ok(Shape {
             base,
             bounds,
             area,
+            counts,
+            size,
+            compression,
+            lod,
             name: String::new(),
         })
     }
+}
+
+/// Read the shape-LOD tail of a shape node: the vertex bindings of its
+/// representation, whose layout the revision picks.
+fn read_shape_lod(cursor: &mut Cursor<'_>) -> Result<ShapeLod> {
+    if cursor.major() >= 10 {
+        // Version and 64-bit vertex binding only, no quantization parameters.
+        let version = cursor.read_u8()?;
+        let binding: [u8; 8] = cursor.read_bytes(8)?.try_into().expect("8 bytes");
+        return Ok(ShapeLod::Binding { version, binding });
+    }
+    if cursor.major() < 9 {
+        let normal_binding = cursor.read_i32()?;
+        let texture_binding = cursor.read_i32()?;
+        let color_binding = cursor.read_i32()?;
+        let quantization = read_quantization_params(cursor)?;
+        return Ok(ShapeLod::Vertex1 {
+            normal_binding,
+            texture_binding,
+            color_binding,
+            quantization,
+        });
+    }
+    let version = cursor.read_i16()? as u16;
+    let binding: [u8; 8] = cursor.read_bytes(8)?.try_into().expect("8 bytes");
+    let quantization = read_quantization_params(cursor)?;
+    // A version other than 1 adds a second vertex binding.
+    let second_binding = if version != 1 {
+        Some(cursor.read_bytes(8)?.try_into().expect("8 bytes"))
+    } else {
+        None
+    };
+    Ok(ShapeLod::Vertex2 {
+        version,
+        binding,
+        quantization,
+        second_binding,
+    })
 }
 
 /// A shape node referencing a vertex based representation.
@@ -599,13 +716,14 @@ fn read_bounds(cursor: &mut Cursor<'_>) -> Result<[f32; 6]> {
     Ok(box_)
 }
 
-/// Read the three `I32[2]` arrays that follow the bounds of a shape or
-/// partition: the instance, LOD and triangle counts.
-fn read_int_pairs(cursor: &mut Cursor<'_>) -> Result<()> {
-    for _ in 0..6 {
-        let _ = cursor.read_i32()?;
+/// Read the six `I32` that follow the bounds of a shape or partition: the
+/// vertex, LOD and triangle ranges.
+fn read_int_pairs(cursor: &mut Cursor<'_>) -> Result<[i32; 6]> {
+    let mut counts = [0i32; 6];
+    for value in &mut counts {
+        *value = cursor.read_i32()?;
     }
-    Ok(())
+    Ok(counts)
 }
 
 /// An attribute attached to a node.

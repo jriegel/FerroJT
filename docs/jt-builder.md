@@ -62,12 +62,43 @@ each other:
 | `set_transform` / `set_translation` / `set_placement` / `set_node_transform` | The transform of a node. |
 | `set_material(node, material)` | A JT material attribute on a node. |
 | `set_version(version)` / `version()` | The revision to write, `JtVersion`; default `10.3`. |
+| `set_file_name(name)` / `file_name()` | The name of the root partition — see [naming the root](#naming-the-root-partition). An empty string clears it. |
 | `write_to_file(path)` / `write_to_bytes()` | The complete file, DEFLATEd unless `compress` is off. |
-| `ferrojt::jt::JtBuilder` in Python | `JtBuilder`, `NodeHandle`, `MeshHandle`, `MeshData`, `MaterialData`, and `builder.version` as a readable and assignable string. |
+| `ferrojt::jt::JtBuilder` in Python | `JtBuilder`, `NodeHandle`, `MeshHandle`, `MeshData`, `MaterialData`, `builder.version` as a readable and assignable string, and `builder.file_name` / `builder.set_file_name()`. |
 
 Handles are opaque: `JtNode(usize)` and `JtMesh(usize)` have private fields, so
 outside the crate they are tokens, and every operation checks that a token
 belongs to the builder it is used with.
+
+## Naming the root partition
+
+A root `Partition` carries a file name, and it is not decoration. The reference
+assistant builds its own scene graph and creates the root node **only when that
+name is non-empty** — `JTData_SceneGraph.cxx:152-176` guards `PushNode` with
+`if (!aPartitionRecord->FileName().isEmpty())` and then asserts that a root node
+exists at all. A consumer of that shape refuses an unnamed file with something
+like *"Bad file detected … Unable in find root node"*, which is what a built
+file used to look like to a strict importer.
+
+So the builder writes the name twice, exactly as the samples do:
+
+* as the `file_name` string of the `Partition` struct itself, and
+* as a row in the scene graph property table for object id `0`, holding
+  `PartitionType = "Assembly"` and `JT_PROP_NAME = <name>`.
+
+Where the name comes from depends on how the file is produced:
+
+| Call | Root name |
+| --- | --- |
+| `write_to_file(path)` | the stem of `path` with a `.jt` extension, unless `set_file_name` said otherwise |
+| `write_to_bytes()` | whatever `set_file_name` set, else the fallback `model.jt` |
+
+The fallback is a real name rather than an empty string so that even a
+from-nothing `to_bytes()` produces a loadable file. The samples put a CAD
+assembly name (`example_block_nx1872.asm;0;16777215:`, `san666.asm;0;0:`) in the
+property and the `.jt` name in the struct field; we write the **same** `<stem>.jt`
+in both, which the reader tolerates because `Node::bind_name` keeps only the first
+`;`-separated token of a name.
 
 ## The mesh layout, and why a mesh is exploded
 
@@ -133,8 +164,22 @@ binding byte at all — `LodGeometry::normal_binding` comes back `None`, where a
   and an `Instance` target as one bare `i32`.
 * **Late loads**: a `Shape` gets a `JT_LLPROP_SHAPEIMPL` property pointing at its
   segment GUID with the segment type above.
+* **Property table**: the root partition's row goes first, so the name of the
+  file is the first thing a consumer that looks up object id `0` finds. A
+  property atom carries a class version from JT 9.x on — `2` at 10.x, `1` at
+  9.x — between its object id and its state word, and again after it.
+* **Shape node tail**: after the trailing size and compression, the vertex
+  bindings of the representation follow in a revision-specific layout — three
+  `I32` bindings plus quantization parameters at 8.x, a version, a 64-bit
+  binding and quantization parameters (plus a second binding from version 2) at
+  9.x, and a version plus one binding at 10.x. The reference reads all of it, so
+  a writer has to store it; `ShapeLod` in `jt/object.rs` is the parsed form.
+* **Segment trailer**: a non-LSG segment ends with the end-of-elements marker
+  **and** a property table of its own — `i16 version 1`, `i32 0` rows — six
+  bytes from JT 9.x on.
 * **Compression**: flag 2 / algorithm 2 (zlib), like the writer. XZ is read but
-  never emitted.
+  never emitted. The `dataLength` of a compressed segment counts the algorithm
+  byte, so it is the compressed length **plus one**.
 
 ## Rejected graphs
 
@@ -158,9 +203,11 @@ triple per slot.
 
 | Field | Written | A translator writes |
 | --- | --- | --- |
-| `Partition` flags | `0` | often `1`, asking for a second box |
-| `Partition` area and count arrays | `0` | varies |
+| `Partition` name | `<stem>.jt` in both the struct field and `JT_PROP_NAME` | a CAD assembly name in the property, the `.jt` name in the field |
+| `Partition` flags | `1`, asking for a second box — which JT 10.x then does not store | the same at 10.x, a real second box at 8.x and 9.x |
+| `Partition` area and count arrays | summed area of the shapes below, and the node range of the written graph | varies; the count range is instance-expanded in a CAD file |
 | `Partition` box | the box of every mesh below it | the same, usually |
+| `Shape` vertex bindings | the binding of the representation being written | the same |
 | `Shape` reserved box | zeros | the transformed box |
 | `Shape` trailing size and compression | `0` | e.g. `9272` |
 | `Material` colour flags | `0` — four components each | a file may store one grey value |
@@ -179,6 +226,11 @@ reads it back:
   segments; each supported revision reaches its own banner, its own header
   length and its own shape segment type;
 * the classes, names, child lists and instance targets survive;
+* the root partition **names the file**: an explicit `set_file_name` reaches both
+  the struct field and the `PartitionType`/`JT_PROP_NAME` property row, a
+  `write_to_file` takes the name of the path it writes to, and a bare
+  `write_to_bytes()` falls back to `model.jt` — never an empty name;
+* the partition's flag, box, area and counts read back as written;
 * at JT 8.x the representation comes back with the strip permutation applied to
   its indices, the same triangles, the same per-slot normals, 36 slots and a
   normal binding of `1`; at 9.x/10.x it comes back through the coder with
@@ -203,6 +255,17 @@ glTF and USD like any sample.
 * Key/value properties on a node, so a built file can carry `CAD_MASS::` and the
   like instead of only a name.
 * Layer filters: a built file declares none, so nothing gates on them.
+* Structure: a built file is `Partition` over `Shape` nodes. A CAD file puts a
+  `MetaData` node under the partition and wraps each part in
+  `Part` → `RangeLod` → `Group`, and it carries a type-4 Meta Data segment, a
+  PMI segment and an info segment in the table of contents. Nothing in this
+  workspace needs those, but a consumer that expects a `Part` under the root will
+  not find one.
+* Segment GUIDs are counters, not UUIDs, so a file cannot be merged with another
+  by GUID.
+* The `size` at the end of a `Shape` node stays `0`. Every reader in the
+  workspace ignores it and so does the reference; a CAD file stores the length of
+  its representation there.
 
 Writing a neutral `Model` is **not** open work any more — that is
 [`jt::from_model`](jt-from-model.md), which builds its own graph here rather than

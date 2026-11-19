@@ -46,7 +46,9 @@ use crate::error::{Error, Result};
 use crate::export::read_component;
 use crate::model::{Attribute, Material, Mesh, Model, Node, Primitive, Topology};
 
-use super::build::{BuildNode, JtBuilder, JtMesh, JtNode, MaterialData, MeshData};
+use super::build::{
+    BuildNode, JtBuilder, JtMesh, JtNode, MaterialData, MeshData, file_name_for_path,
+};
 use super::encode::encode;
 use super::version::JtVersion;
 
@@ -89,9 +91,34 @@ const METERS_PER_UNIT: &[(&str, f64)] = &[
 /// explicitly requested revision. [`Error::Invalid`] if the model has no scene
 /// roots or the graph is malformed.
 pub fn model_to_bytes(model: &Model, version: Option<JtVersion>) -> Result<Vec<u8>> {
+    write(model, version, source_file_name(model).as_deref())
+}
+
+/// Write a model out as a JT file at `path`.
+///
+/// See [`model_to_bytes`] for the revision and unit handling. The root
+/// partition is named after `path`, which is what a consumer builds its own
+/// root node from.
+///
+/// # Errors
+///
+/// As [`model_to_bytes`], plus [`Error::Io`] when the file cannot be written.
+pub fn model_to_file(model: &Model, path: &Path, version: Option<JtVersion>) -> Result<()> {
+    fs::write(
+        path,
+        write(model, version, Some(&file_name_for_path(path)))?,
+    )?;
+    Ok(())
+}
+
+/// Build the file, naming its root partition `file_name` when one is known.
+fn write(model: &Model, version: Option<JtVersion>, file_name: Option<&str>) -> Result<Vec<u8>> {
     let mut build = JtBuilder::new();
     if let Some(version) = version {
         build.set_version(version)?;
+    }
+    if let Some(name) = file_name {
+        build.set_file_name(name);
     }
 
     let scale = unit_scale(model)?;
@@ -126,16 +153,17 @@ pub fn model_to_bytes(model: &Model, version: Option<JtVersion>) -> Result<Vec<u
     writer.build.write_to_bytes()
 }
 
-/// Write a model out as a JT file at `path`.
+/// The name of the file a [`Model`] was read from, as a JT file name.
 ///
-/// See [`model_to_bytes`] for the revision and unit handling.
-///
-/// # Errors
-///
-/// As [`model_to_bytes`], plus [`Error::Io`] when the file cannot be written.
-pub fn model_to_file(model: &Model, path: &Path, version: Option<JtVersion>) -> Result<()> {
-    fs::write(path, model_to_bytes(model, version)?)?;
-    Ok(())
+/// A model that was not read from a file — one built by hand — has no source,
+/// and the builder then falls back to its own default. The extension goes at
+/// the **last** dot: a sample name such as `example_block_jt9.5.jt` has a dot
+/// inside its stem.
+fn source_file_name(model: &Model) -> Option<String> {
+    let source = model.source.as_deref()?;
+    let tail = source.rsplit(['/', '\\']).next().unwrap_or(source);
+    let stem = tail.rsplit_once('.').map_or(tail, |(stem, _)| stem);
+    (!stem.is_empty()).then(|| format!("{stem}.jt"))
 }
 
 /// The factor that turns the unit of the model into millimetres.

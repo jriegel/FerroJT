@@ -556,6 +556,24 @@ impl Builder {
         self.set_version_name(value)
     }
 
+    /// The name the root partition of the file carries, or `None` while none was
+    /// set — the writer then falls back to `"model.jt"`.
+    ///
+    /// This is not decoration: a consumer that builds its own scene graph keys
+    /// the root node on that name and refuses a file whose partition is
+    /// unnamed.
+    #[getter]
+    fn file_name(&self) -> Option<&str> {
+        self.inner.file_name()
+    }
+
+    /// Name the root partition of the file `value`, e.g. `"assembly.jt"`.
+    ///
+    /// An empty string clears the name again and lets the writer fall back.
+    fn set_file_name(&mut self, value: &str) {
+        self.inner.set_file_name(value);
+    }
+
     /// Add a node of `class_name` under `parent` and return its handle.
     ///
     /// `class_name` is a JT class name: `Partition`, `Part`, `MetaData`,

@@ -1247,6 +1247,11 @@ mod tests {
             },
             file_name: "fixture.jt".to_owned(),
             up_axis: 0,
+            flags: 0,
+            bounds: [0.0; 6],
+            area: 0.0,
+            counts: [0; 6],
+            untransformed_bounds: None,
             name: "root".to_owned(),
             children: kids,
         };

@@ -147,7 +147,10 @@ Read out of the samples, since no reference writer exists:
   element carries the object id from JT 9.x on, which is what
   `jt::element_stores_object_id` reports; passing `false` there silently breaks
   the 9.x and 10.x output.
-* End of elements: `i32 16` followed by sixteen `0xff`.
+* End of elements: `i32 16` followed by sixteen `0xff`. A **non-LSG** segment
+  closes with that marker **and** a property table of its own — `i16 version 1`
+  then `i32 0` rows — six bytes from JT 9.x on. A shape segment written without
+  it reads back with six bytes left over.
 * Version fields are `i16` up to JT 9.x and `u8` from 10.x on. Whether a class
   carries one at all is per class: `RangeLod`, `Shape` and `Instance` gate it
   on `major > 8`, while `MetaData` and `Part` have it unconditionally. Getting
@@ -167,11 +170,19 @@ visible in a dump, because the reader discards each of them:
 
 | Field | Written | Source |
 | --- | --- | --- |
-| `Partition` flags | `0` | often `1`, which asks for a second (untransformed) box |
-| `Partition` area and count arrays | `0` | varies |
 | `Part` reserved `i32` | `0` | e.g. `6488065` |
-| `Shape` trailing size and compression | `0` | e.g. `9272` |
 | `Material` colour flags | `0` — four components each | a file may store one grey value |
+
+Everything else in a `Partition` or `Shape` node is round-tripped now, because a
+consumer outside the workspace reads it: the partition's flags, name, box, area
+and counts (with the second box only where the revision stores one, i.e. when
+flag bit 0 is set below JT 10), and the counts, size, compression and vertex
+binding tail of a shape node. The binding tail is revision-specific — three `I32`
+bindings plus quantization parameters at 8.x, a version, a binding and the
+quantization parameters at 9.x (plus a second binding from version 2 on), and a
+version plus one binding at 10.x — and it is copied verbatim, since a coarse
+level of detail of a sample quantizes with `11 06 0b 06` where zeros would be a
+lie. `jt::dump` prints none of it, so no reference dump had to change.
 
 ## How the round trip is judged
 

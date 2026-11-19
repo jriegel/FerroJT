@@ -16,11 +16,12 @@
 //!
 //! [`encode`]: crate::jt::encode
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::codec::{ByteOrder, WriterExt, deflate};
 use crate::error::{Error, Result};
-use crate::jt::encode::write_topological_body;
+use crate::jt::encode::{write_binding, write_quantization_params, write_topological_body};
 use crate::jt::guid::{Guid, types};
 use crate::jt::segment::TocEntry;
 use crate::jt::version::JtVersion;
@@ -39,6 +40,23 @@ const ORDER: ByteOrder = ByteOrder::Little;
 const NAME_KEY: &str = "JT_PROP_NAME";
 /// The property key that points a shape at its representation segment.
 const SHAPE_KEY: &str = "JT_LLPROP_SHAPEIMPL";
+/// The property key the root partition says what kind of root it is.
+const PARTITION_TYPE_KEY: &str = "PartitionType";
+/// The value every sample of every revision stores for that key.
+const PARTITION_TYPE: &str = "Assembly";
+/// The file name a root partition falls back to when none was set.
+///
+/// A name is not decoration: a consumer that builds its own scene graph keys
+/// the root node on it and refuses a file whose partition is unnamed.
+const DEFAULT_FILE_NAME: &str = "model.jt";
+
+/// The root name for a file written to `path`: its own name, as a `.jt` name.
+pub(crate) fn file_name_for_path(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map_or_else(|| DEFAULT_FILE_NAME.to_owned(), |stem| format!("{stem}.jt"))
+}
 /// The state every property atom stores.
 const PROPERTY_STATE: u32 = 0x4000_0000;
 /// Base type byte of a string property atom.
@@ -401,6 +419,7 @@ pub struct JtBuilder {
     nodes: Vec<Slot>,
     meshes: Vec<MeshData>,
     root: JtNode,
+    file_name: Option<String>,
     compress: bool,
     version: JtVersion,
 }
@@ -427,9 +446,31 @@ impl JtBuilder {
             }],
             meshes: Vec::new(),
             root: JtNode(0),
+            file_name: None,
             compress: true,
             version: JtVersion::default(),
         }
+    }
+
+    /// The file name the root partition declares, or `None` when the default
+    /// of [`JtBuilder::set_file_name`] is good enough.
+    #[must_use]
+    pub fn file_name(&self) -> Option<&str> {
+        self.file_name.as_deref()
+    }
+
+    /// Say what the root partition of the file is called.
+    ///
+    /// A root partition carries the name of the file it belongs to, and a
+    /// consumer building a scene graph of its own keys the root node on that
+    /// name: handed an empty one it creates no root at all and reports a file
+    /// it cannot open. The name is therefore not decoration. An empty string
+    /// clears it again, and [`JtBuilder::write_to_bytes`] then falls back to
+    /// `"model.jt"` so no file it produces is left unnamed.
+    pub fn set_file_name(&mut self, name: impl Into<String>) -> &mut Self {
+        let name = name.into();
+        self.file_name = (!name.is_empty()).then_some(name);
+        self
     }
 
     /// The root partition of the graph.
@@ -699,13 +740,22 @@ impl JtBuilder {
 
     /// Write the file to disk.
     ///
+    /// When no root name was set with [`JtBuilder::set_file_name`], the root
+    /// partition takes the name of `path`: a file on disk knows its own name,
+    /// and a consumer creates the root node of its scene graph from that name.
+    ///
     /// # Errors
     ///
     /// See [`JtBuilder::write_to_bytes`]; a failure of the target file is
     /// reported as [`Error::Io`].
     pub fn write_to_file(&self, path: impl AsRef<Path>) -> Result<()> {
-        let bytes = self.write_to_bytes()?;
-        std::fs::write(path.as_ref(), bytes)?;
+        let path = path.as_ref();
+        let mut build = self.clone();
+        if build.file_name.is_none() {
+            build.set_file_name(file_name_for_path(path));
+        }
+        let bytes = build.write_to_bytes()?;
+        std::fs::write(path, bytes)?;
         Ok(())
     }
 
@@ -725,8 +775,17 @@ impl JtBuilder {
     pub fn write_to_bytes(&self) -> Result<Vec<u8>> {
         let version = self.version;
         let plan = self.plan()?;
+        // The root partition names the file it belongs to, and a consumer that
+        // builds a scene graph of its own creates the root node from that name:
+        // handed an empty one it finds no root at all and refuses the file. So
+        // a written file always names its root, falling back to a default.
+        let partition_name = self
+            .file_name
+            .clone()
+            .or_else(|| self.nodes[self.root.0].name.clone())
+            .unwrap_or_else(|| DEFAULT_FILE_NAME.to_owned());
         let lsg_guid = self.segment_guid(0);
-        let body = self.lsg_body(&plan)?;
+        let body = self.lsg_body(&plan, &partition_name)?;
         // The scene graph segment carries a compression header, so its payload
         // has to be the DEFLATE stream itself when the flag says so.
         let payload = if self.compress { deflate(&body)? } else { body };
@@ -735,7 +794,7 @@ impl JtBuilder {
         let kind = shape_segment_kind(version);
         segments.push(segment_bytes(ORDER, &lsg_guid, 1, &payload, self.compress)?);
         for (shape, element) in plan.shapes.iter().zip(&plan.representations) {
-            segments.push(shape_segment(shape.guid, kind, element));
+            segments.push(shape_segment(shape.guid, kind, element, version));
         }
 
         let sizes: usize = segments.iter().map(|bytes| bytes.len()).sum();
@@ -872,6 +931,7 @@ impl JtBuilder {
                         node: *node,
                         mesh,
                         guid: self.segment_guid(1 + shapes.len()),
+                        stats: ShapeStats::of(&self.meshes[mesh]),
                     });
                 }
                 BuildNode::Instance if slot.target.is_none() => {
@@ -923,7 +983,10 @@ impl JtBuilder {
     }
 
     /// The body of the scene graph segment: atoms, properties and the table.
-    fn lsg_body(&self, plan: &Plan) -> Result<Vec<u8>> {
+    ///
+    /// `partition_name` is the name of the root partition, which the partition
+    /// struct also stores as the file name of the file.
+    fn lsg_body(&self, plan: &Plan, partition_name: &str) -> Result<Vec<u8>> {
         // A property id lives in the same table as a node or attribute id, and
         // the table ends a row with the key `0`. Properties therefore continue
         // the numbering of the nodes and attributes instead of starting at 0 —
@@ -933,9 +996,31 @@ impl JtBuilder {
         let mut properties: Vec<Property> = Vec::new();
         let name_key = add_string_property(&mut properties, &mut next, NAME_KEY, self.version)?;
         let shape_key = add_string_property(&mut properties, &mut next, SHAPE_KEY, self.version)?;
+        let type_key =
+            add_string_property(&mut properties, &mut next, PARTITION_TYPE_KEY, self.version)?;
+        let type_value =
+            add_string_property(&mut properties, &mut next, PARTITION_TYPE, self.version)?;
         let mut rows: Vec<Row> = Vec::new();
 
+        // The root partition gets a row of its own, first in the table and
+        // numbered 0 like the node it describes. Every sample declares what
+        // kind of root it is and names the file, and a consumer that reads the
+        // table to find its root node needs both.
+        rows.push(Row {
+            object_id: plan.ids[self.root.0],
+            pairs: vec![
+                (type_key, type_value),
+                (
+                    name_key,
+                    add_string_property(&mut properties, &mut next, partition_name, self.version)?,
+                ),
+            ],
+        });
+
         for node in &plan.order {
+            if *node == self.root.0 {
+                continue;
+            }
             let slot = &self.nodes[*node];
             let mut pairs = Vec::new();
             if let Some(name) = &slot.name {
@@ -989,12 +1074,27 @@ impl JtBuilder {
             let children: Vec<i32> = slot.children.iter().map(|c| plan.ids[*c]).collect();
             let target = slot.target.map(|t| plan.ids[t]).unwrap_or(-1);
             let bounds = self.node_bounds(*node, plan);
+            let shape = plan
+                .shapes
+                .iter()
+                .find(|shape| shape.node == *node)
+                .map(|shape| &shape.stats);
+            let counts = self.node_counts(*node, plan);
+            let facts = NodeFacts {
+                bounds,
+                counts,
+                shape,
+                root: (*node == self.root.0).then_some(RootFacts {
+                    file_name: partition_name,
+                    area: self.partition_area(plan),
+                }),
+            };
             let node_body = node_body(
                 slot.class,
                 &plan.attribute_of[*node],
                 &children,
                 target,
-                &bounds,
+                &facts,
                 self.version,
             )?;
             write_atom(&mut body, ORDER, &guid, base, plan.ids[*node], &node_body)?;
@@ -1041,6 +1141,33 @@ impl JtBuilder {
         Ok(body)
     }
 
+    /// The three `I32[2]` ranges a partition declares for the graph below it.
+    ///
+    /// A shape node declares its own counts, so only a partition needs these.
+    /// They are the sums over the representations and the number of nodes the
+    /// scene graph holds — the numbers a consumer sizes its tables from.
+    fn node_counts(&self, pos: usize, plan: &Plan) -> [i32; 6] {
+        let slot = &self.nodes[pos];
+        if slot.class != BuildNode::Partition {
+            return [0; 6];
+        }
+        let mut vertices = 0i32;
+        let mut triangles = 0i32;
+        for shape in &plan.shapes {
+            vertices = vertices.saturating_add(shape.stats.vertices);
+            triangles = triangles.saturating_add(shape.stats.triangles);
+        }
+        let nodes = i32::try_from(plan.order.len()).unwrap_or(i32::MAX);
+        [vertices, vertices, nodes, nodes, triangles, triangles]
+    }
+
+    /// The area a partition declares: the triangles of everything below it.
+    fn partition_area(&self, plan: &Plan) -> f32 {
+        plan.shapes
+            .iter()
+            .fold(0.0f32, |sum, shape| sum + shape.stats.area)
+    }
+
     /// The box a partition or shape node stores.
     fn node_bounds(&self, pos: usize, plan: &Plan) -> [f32; 6] {
         let slot = &self.nodes[pos];
@@ -1079,9 +1206,15 @@ impl JtBuilder {
 ///
 /// `kind` is the segment type of the TOC row: JT 9.x uses 6 ("Shape") for
 /// every level of detail, JT 8.x and 10.x use 7 to 16 for LOD0 to LOD9.
-pub(crate) fn shape_segment(guid: Guid, kind: i32, element: &[u8]) -> Vec<u8> {
+///
+/// From JT 9.x on a segment ends with a property table of its own, and every
+/// sample of those revisions leaves it empty — a two byte version and a four
+/// byte count of zero. A JT 8.x segment has no such table, so the end of
+/// elements really is the end of the segment there.
+pub(crate) fn shape_segment(guid: Guid, kind: i32, element: &[u8], version: JtVersion) -> Vec<u8> {
+    let trailer = if version.major >= 9 { 26 } else { 20 };
     let mut segment: Vec<u8> = Vec::new();
-    let total = PLAIN_SEGMENT_ENVELOPE + element.len() + 20;
+    let total = PLAIN_SEGMENT_ENVELOPE + element.len() + trailer;
     write_guid(&mut segment, ORDER, &guid).expect("writing to a vector cannot fail");
     segment
         .write_i32_value(kind, ORDER)
@@ -1091,6 +1224,14 @@ pub(crate) fn shape_segment(guid: Guid, kind: i32, element: &[u8]) -> Vec<u8> {
         .expect("writing to a vector cannot fail");
     segment.extend_from_slice(element);
     write_end_of_elements(&mut segment, ORDER).expect("writing to a vector cannot fail");
+    if version.major >= 9 {
+        segment
+            .write_i16_value(1, ORDER)
+            .expect("writing to a vector cannot fail");
+        segment
+            .write_i32_value(0, ORDER)
+            .expect("writing to a vector cannot fail");
+    }
     segment
 }
 
@@ -1105,11 +1246,14 @@ fn add_string_property(
     *next += 1;
     let mut body: Vec<u8> = Vec::new();
     if version.has_object_versions() {
-        write_version(&mut body, ORDER, version.major, 1)?;
+        // A string property is class version 2 from JT 10.x on and 1 below.
+        let class = u32::from(version.major >= 10);
+        write_version(&mut body, ORDER, version.major, class)?;
     }
     body.write_u32_value(PROPERTY_STATE, ORDER)?;
     if version.has_object_versions() {
-        write_version(&mut body, ORDER, version.major, 1)?;
+        let class = u32::from(version.major >= 10);
+        write_version(&mut body, ORDER, version.major, class)?;
     }
     write_mb_string(&mut body, ORDER, value)?;
     properties.push(Property {
@@ -1151,6 +1295,108 @@ struct ShapeSlot {
     node: usize,
     mesh: usize,
     guid: Guid,
+    stats: ShapeStats,
+}
+
+/// What a shape node declares about the representation below it.
+///
+/// A JT shape node summarises its triangles before the representation is ever
+/// read: the surface area, the vertex and triangle ranges, and the vertex
+/// binding of the representation. The samples carry real values there — the
+/// block declares an area of 37 600 mm² and 24 vertices for its 12 triangles —
+/// and a consumer that sizes its buffers from those numbers cannot work with
+/// zeros.
+#[derive(Clone, Copy, Debug, Default)]
+struct ShapeStats {
+    /// Distinct vertex/normal pairs of the representation.
+    ///
+    /// The topological coder welds a position *and* its normal, so a cube with
+    /// eight corners and three normals per corner declares 24 vertices, which
+    /// is what the samples of every revision store.
+    vertices: i32,
+    /// Number of triangles.
+    triangles: i32,
+    /// Surface area.
+    area: f32,
+    /// JT 8.x binding of the normals: 1 when the mesh carries them.
+    normal_binding: i32,
+}
+
+impl ShapeStats {
+    /// Summarise one mesh the way a shape node does.
+    fn of(mesh: &MeshData) -> Self {
+        let mut pairs: BTreeSet<[u32; 6]> = BTreeSet::new();
+        let with_normals = !mesh.normals().is_empty();
+        for (slot, point) in mesh.vertices().chunks(3).enumerate() {
+            let normal = if with_normals {
+                let at = slot * 3;
+                [
+                    mesh.normals()[at],
+                    mesh.normals()[at + 1],
+                    mesh.normals()[at + 2],
+                ]
+            } else {
+                [0.0f32; 3]
+            };
+            pairs.insert([
+                point[0].to_bits(),
+                point[1].to_bits(),
+                point[2].to_bits(),
+                normal[0].to_bits(),
+                normal[1].to_bits(),
+                normal[2].to_bits(),
+            ]);
+        }
+        let mut area = 0.0f32;
+        for triangle in mesh.indices().chunks(3) {
+            let Ok([a, b, c]) = <[i32; 3]>::try_from(triangle) else {
+                continue;
+            };
+            let point = |slot: i32| -> [f32; 3] {
+                let at = usize::try_from(slot).unwrap_or(0) * 3;
+                [
+                    mesh.vertices()[at],
+                    mesh.vertices()[at + 1],
+                    mesh.vertices()[at + 2],
+                ]
+            };
+            let (a, b, c) = (point(a), point(b), point(c));
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let cross = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            area += (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt() * 0.5;
+        }
+        ShapeStats {
+            vertices: i32::try_from(pairs.len()).unwrap_or(i32::MAX),
+            triangles: mesh.triangle_count() as i32,
+            area,
+            normal_binding: i32::from(with_normals),
+        }
+    }
+}
+
+/// The fields a node adds to its body beyond the node base and its references.
+///
+/// The partition and shape fields are bundled here rather than passed one by
+/// one, and `root` is set for the root partition alone: only that partition
+/// names the file and declares the area of the whole.
+#[derive(Clone, Copy, Debug)]
+struct NodeFacts<'a> {
+    bounds: [f32; 6],
+    counts: [i32; 6],
+    shape: Option<&'a ShapeStats>,
+    root: Option<RootFacts<'a>>,
+}
+
+/// What the root partition declares about the file it belongs to.
+#[derive(Clone, Copy, Debug)]
+struct RootFacts<'a> {
+    file_name: &'a str,
+    area: f32,
 }
 
 /// The graph of a builder, ordered and numbered.
@@ -1224,10 +1470,12 @@ fn node_body(
     attributes: &[i32],
     children: &[i32],
     target: i32,
-    bounds: &[f32; 6],
+    facts: &NodeFacts<'_>,
     version: JtVersion,
 ) -> Result<Vec<u8>> {
     let major = version.major;
+    let bounds = &facts.bounds;
+    let counts = &facts.counts;
     let mut out: Vec<u8> = Vec::new();
     // JT 8.x stores no class version in a node base, only its flags and the
     // attributes it refers to.
@@ -1247,13 +1495,25 @@ fn node_body(
             if version.major >= 10 {
                 write_version(&mut out, ORDER, major, 1)?;
             }
-            // No "untransformed box" flag, so the one box below is the last
-            // field the reader stops at.
-            out.write_i32_value(0, ORDER)?;
-            write_mb_string(&mut out, ORDER, "")?;
+            // Bit 0 of the flags says that an untransformed box follows the
+            // counts; every sample sets it, and JT 10.x dropped that box.
+            out.write_i32_value(1, ORDER)?;
+            // The name of the file this partition belongs to. A consumer that
+            // builds a scene graph of its own creates the root node from it and
+            // refuses a file whose partition is unnamed, so it is never empty.
+            write_mb_string(
+                &mut out,
+                ORDER,
+                facts.root.map(|root| root.file_name).unwrap_or(""),
+            )?;
             write_box(&mut out, ORDER, bounds)?;
-            out.write_f32_value(0.0, ORDER)?;
-            write_counts(&mut out, ORDER)?;
+            // The area of everything below the partition, which is what the
+            // samples of every revision declare.
+            out.write_f32_value(facts.root.map_or(0.0, |root| root.area), ORDER)?;
+            write_counts(&mut out, ORDER, counts)?;
+            if major < 10 {
+                write_box(&mut out, ORDER, bounds)?;
+            }
         }
         BuildNode::Group => {
             if version.has_object_versions() {
@@ -1296,13 +1556,50 @@ fn node_body(
             // JT 8.x and 9.x store a reserved box and then the untransformed
             // one, JT 10.x keeps only the latter.
             if major < 10 {
-                write_box(&mut out, ORDER, &[0.0; 6])?;
+                write_box(&mut out, ORDER, bounds)?;
             }
             write_box(&mut out, ORDER, bounds)?;
-            out.write_f32_value(0.0, ORDER)?;
-            write_counts(&mut out, ORDER)?;
+            let stats = facts.shape.copied().unwrap_or_default();
+            out.write_f32_value(stats.area, ORDER)?;
+            // The vertex, LOD and triangle ranges. A shape holds exactly one
+            // representation, so its LOD range is the single index 0..1; the
+            // vertex range counts the distinct vertex/normal pairs the coder
+            // stores, which is what the samples of every revision declare.
+            write_counts(
+                &mut out,
+                ORDER,
+                &[
+                    stats.vertices,
+                    stats.vertices,
+                    1,
+                    1,
+                    stats.triangles,
+                    stats.triangles,
+                ],
+            )?;
+            // The stored size of the representation: the reference reads the
+            // field and never uses it, and no reader sizes anything from it.
             out.write_i32_value(0, ORDER)?;
+            // The level-of-detail fraction: 0.0 for the finest tier, which is
+            // the only one the builder writes.
             out.write_f32_value(0.0, ORDER)?;
+            // The shape description: the vertex binding of the representation
+            // and its quantization, in the layout of the revision.
+            if major >= 10 {
+                out.write_u8_value(1)?;
+                write_binding(&mut out);
+            } else if major > 8 {
+                // Version 2 adds a second binding after the quantization.
+                out.write_i16_value(2, ORDER)?;
+                write_binding(&mut out);
+                write_quantization_params(&mut out);
+                write_binding(&mut out);
+            } else {
+                out.write_i32_value(stats.normal_binding, ORDER)?;
+                out.write_i32_value(0, ORDER)?;
+                out.write_i32_value(0, ORDER)?;
+                write_quantization_params(&mut out);
+            }
         }
         BuildNode::Instance => {
             if version.has_object_versions() {
@@ -1370,11 +1667,14 @@ fn material_body(material: &MaterialData, version: JtVersion) -> Result<Vec<u8>>
 fn late_load_body(segment: &Guid, kind: i32, version: JtVersion) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     if version.has_object_versions() {
-        write_version(&mut out, ORDER, version.major, 1)?;
+        // A late loaded property is class version 2 from JT 10.x on and 1 below.
+        let class = u32::from(version.major >= 10);
+        write_version(&mut out, ORDER, version.major, class)?;
     }
     out.write_u32_value(PROPERTY_STATE, ORDER)?;
     if version.has_object_versions() {
-        write_version(&mut out, ORDER, version.major, 1)?;
+        let class = u32::from(version.major >= 10);
+        write_version(&mut out, ORDER, version.major, class)?;
     }
     write_guid(&mut out, ORDER, segment)?;
     out.write_i32_value(kind, ORDER)?;

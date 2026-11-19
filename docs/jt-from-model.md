@@ -20,10 +20,12 @@ The third is a thin layer over the second: it walks the graph, translates each
 node into a builder node, and calls the builder. Nothing is copied from a source
 file, so there is no TOC to preserve and no segment to pass through.
 
-`export::to_format(Format::Jt, model)` routes here, and `Format::Jt` is marked
-in `Format::is_writable`. `Format::Jt` is *not* writable through the
-`Exporter` trait — the trait has no place for the revision to write at, so the
-dispatcher special-cases it.
+`export::to_format(Format::Jt, model)` routes here for bytes, and
+`export::write_to_file(Format::Jt, model, path)` routes to `model_to_file` so the
+written file can name its root partition after its own path. `Format::Jt` is
+marked in `Format::is_writable`. It is *not* writable through the `Exporter`
+trait — the trait has no place for the revision to write at, so the dispatcher
+special-cases it.
 
 ## Which revision gets written
 
@@ -140,12 +142,42 @@ colour sets across its 105 shapes.
 
 ## Entry points
 
-| Layer | Call |
-| --- | --- |
-| Rust | `ferrojt::jt::model_to_bytes(&model, version)` / `model_to_file(&model, path, version)` |
-| Rust, no revision | `export::to_format(Format::Jt, &model)` / `export::write_to_file` |
-| CLI | `ferrojt convert model.glb -o out.jt` — add `--jt-version 8.1` to force a revision |
-| Python | `model.save("out.jt")`, `model.to_bytes("jt", version="8.1")` |
+| Layer | Call | Root partition named after |
+| --- | --- | --- |
+| Rust | `ferrojt::jt::model_to_bytes(&model, version)` | `Model::source` |
+| Rust | `ferrojt::jt::model_to_file(&model, path, version)` | `path` |
+| Rust, no revision | `export::to_format(Format::Jt, &model)` | `Model::source` |
+| Rust, no revision | `export::write_to_file(Format::Jt, &model, path)` | `path` |
+| CLI | `ferrojt convert model.glb -o out.jt` — add `--jt-version 8.1` to force a revision | the output path |
+| Python | `model.save("out.jt")`, `model.to_bytes("jt", version="8.1")` | `save` the path, `to_bytes` `Model::source` |
+
+`export::write_to_file` and `Model::save` route JT to `model_to_file` rather than
+through `to_format`: the root partition of a JT file is named after the file it
+lives in, so the writer has to see the path. `to_format` still produces JT bytes
+— it just cannot know a destination — and the revision a file lands on is chosen
+from the meshes of the model, not fixed by the container.
+
+## Naming the root partition
+
+A root `Partition` must carry a non-empty file name, and it must have a row in
+the scene graph property table: `JTData_SceneGraph.cxx:152-176` of the reference
+assistant creates the root node only when `FileName()` is non-empty and then
+asserts that a root node exists. A strict consumer refuses a file without one
+("Bad file detected … Unable in find root node"), so both are written — see
+[naming the root](jt-builder.md#naming-the-root-partition).
+
+The name is derived from the destination when there is one and from the model
+otherwise, which keeps a rewritten file indistinguishable from a fresh one:
+
+* `model_to_file` takes the stem of the output path and gives it a `.jt`
+  extension, so `target\Testglb.jt` produces a root named `Testglb.jt`.
+* `model_to_bytes` takes `Model::source` — set by the JT reader and by
+  `import::from_file`, `None` for `import::from_bytes` — so a JT→glTF→JT hop
+  keeps the original name. With no source at all the builder falls back to
+  `model.jt`.
+
+The extension is split at the **last** dot: `example_block_jt9.5.jt` has a dot
+inside its stem, and splitting at the first one named the root `example_block.jt`.
 
 `ferrojt convert` reads a glTF input through `import`, a JT input through the JT
 reader (so the layer filter and the LOD tier still apply), and writes either one
@@ -171,3 +203,7 @@ the refusal above.
   way to emit. The viewer's detail pane is their only exit.
 - Layer filters: they are a property of a JT *file*, applied on read. A model
   that came from glTF has none, and a written file declares none of its own.
+- Node classes beyond the ones above, and the `MetaData` / `Part` / `RangeLod` /
+  `Group` wrapper structure a CAD file uses. A consumer that insists on a `Part`
+  under the root will not find one — see the open work in
+  [`jt-builder.md`](jt-builder.md).

@@ -619,6 +619,51 @@ fn the_unit_conversion_lives_on_the_root_not_in_the_vertices() {
 }
 
 #[test]
+fn a_converted_file_names_its_root_partition() {
+    // A consumer that builds a scene graph of its own creates the root node
+    // from the file name of the root partition, so a converted file has to name
+    // one. Bytes have no destination and take the name of the file the model
+    // was read from; a written file knows its own name and takes that.
+    let source = sample("example_block_jt9.5");
+    let (_, from_jt, _, again) = through_glb(&source);
+
+    let bytes = jt::model_to_bytes(&from_jt, None).expect("writing must work");
+    let out = written(&source, &bytes);
+    let Node::Partition(partition) = out
+        .lsg
+        .as_ref()
+        .expect("a scene graph")
+        .root()
+        .expect("a root node")
+    else {
+        panic!("the root of a written file is a partition");
+    };
+    // The sample name has a dot inside its stem — `example_block_jt9.5` — so
+    // the extension has to be read off the last dot.
+    assert_eq!(partition.file_name, "example_block_jt9.5.jt");
+    assert_eq!(partition.name, "example_block_jt9.5.jt");
+
+    let path = temp_path("rooted", "jt");
+    jt::model_to_file(&again, &path, None).expect("writing must work");
+    let file = JtFile::open(&path).expect("the file on disk parses");
+    let _ = std::fs::remove_file(&path);
+    let Node::Partition(partition) = file
+        .lsg
+        .as_ref()
+        .expect("a scene graph")
+        .root()
+        .expect("a root node")
+    else {
+        panic!("the root of a written file is a partition");
+    };
+    assert_eq!(
+        partition.file_name,
+        path.file_stem().expect("a stem").to_string_lossy() + ".jt",
+        "a file on disk names its root after itself"
+    );
+}
+
+#[test]
 fn a_requested_revision_is_obeyed() {
     let source = sample("example_block_jt9.5");
     let (_, _, _, again) = through_glb(&source);

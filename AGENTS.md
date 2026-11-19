@@ -81,7 +81,7 @@ without it):
 ```
 
 Interactive viewer (also needs `open3d`; it is a tool, not a test — nothing in it
-is named `test_*`, so pytest still collects 98 tests):
+is named `test_*`, so pytest still collects 100 tests):
 
 ```powershell
 .\.venv\Scripts\python.exe tests\test_viewer.py data\ExampleFiles\example_block_jt9.5.jt
@@ -657,7 +657,56 @@ Upload with `python -m twine upload dist\*`.
   `jt::dump`'s `recurse_down_the_tree` (no cycle guard) stack-overflow.
 - **Compression must be written as flag 2 / algorithm 2** (zlib, i.e.
   `codec::deflate`). XZ (flag 3) is read but never emitted, even though
-  block-10.3 and the server sample store their LSG that way.
+  block-10.3 and the server sample store their LSG that way. `dataLength` counts
+  the algorithm byte, so it is the **compressed length + 1**.
+- **A non-LSG segment ends with a property table of its own**: end-of-elements
+  (`i32 16` + 16×`0xff`) then `i16 version 1` + `i32 0` rows = **6 bytes from JT
+  9.x on**. Writing a shape segment without it makes `ferrojt-cli info` report
+  leftover bytes; `target\eoe.py` checks `after_eoe=6` per segment.
+- **A `Shape` node has a vertex-binding tail after `size`/`compression`, and its
+  layout is per revision**: 8.x = three `i32` bindings + 4 quantization bytes;
+  9.x = `i16` version + 8-byte binding + quantization + a **second** binding only
+  when `version != 1`; 10.x = `u8` version + one 8-byte binding. The reference
+  *reads* all of it, so omitting it corrupts every following node. Parsed as
+  `object::ShapeLod` (`Vertex1`/`Vertex2`/`Binding`/`None`) and re-emitted
+  verbatim by `write.rs::write_shape_lod`; a coarse tier of a sample quantizes
+  with `11 06 0b 06`, so zeros are not a stand-in.
+- **A `Partition` node is not just a Group**: `i32 flags | mb string file_name |
+  box | f32 area | 6×i32 counts`, and the **second (untransformed) box is stored
+  only when `flags & 1` and `major < 10`** — JT 10.x sets the flag and stores
+  nothing. All of it round-trips now (`object::Partition` gained `flags`,
+  `bounds`, `area`, `counts`, `untransformed_bounds`); `read_int_pairs` returns
+  `[i32;6]` and `write_counts` takes it.
+- **A property atom carries a class version from JT 9.x on**: `length | guid | base
+  | [oid if major>8] | [class version if major>8] | state u32 | [class version if
+  major>8] | mb string`. The version is `2` at 10.x and `1` at 9.x. Sample 10.3:
+  `2d 00 00 00 | guid | 05 | 0e 00 00 00 | 02 | 00 00 00 40 | 02 | 07 00 00 00 |
+  "SUBNODE"`.
+- **A root `Partition` MUST carry a non-empty file name and a property-table row,
+  or a strict consumer refuses the file.** `JTData_SceneGraph.cxx:152-176` creates
+  the root node **only when `FileName()` is non-empty** and then asserts one
+  exists — that is the `Bad file detected / Unable in find root node` report on a
+  glTF→JT conversion. So the builder writes the name **twice**: the `Partition`
+  struct field *and* a property row for object id `0` with
+  `PartitionType = "Assembly"` + `JT_PROP_NAME`, pushed **first** in `lsg_body`.
+  Samples put a CAD name in the property (`example_block_nx1872.asm;0;16777215:`
+  at 10.3, `san666.asm;0;0:` for the server) and the `.jt` name in the field; we
+  write the **same** `<stem>.jt` in both — legal, because `Node::bind_name`
+  keeps only the first `;` token. `DEFAULT_FILE_NAME = "model.jt"` is the
+  fallback for a bare `write_to_bytes()`; never write an empty name.
+- **Which name, from where**: `model_to_file` / `export::write_to_file` /
+  `JtBuilder::write_to_file` / Python `save` name the root after the **output
+  path** (`build::file_name_for_path`), `model_to_bytes` / `to_bytes` /
+  `export::to_format` after `Model::source`. That is why `export::write_to_file`
+  and `Model::save` special-case `Format::Jt` and call `model_to_file` — the
+  writer has to see the path. Split the extension at the **last** dot
+  (`rsplit_once`): `example_block_jt9.5.jt` has a dot inside its stem, and
+  `split_once` produced `example_block.jt`. Python: `JtBuilder.set_file_name()` /
+  `.file_name`.
+- **`save()` and `to_bytes()` no longer agree byte for byte** unless a name was
+  set — `save` derives one from the path. `test_a_built_file_reads_back_as_jt_10_3`
+  and `test_every_supported_revision_reaches_its_own_banner` therefore call
+  `set_file_name` matching the path stem before comparing.
 - **A property atom is emitted exactly when a surviving table row refers to it.**
   Numbering and emission must use one rule (`collect_rows()` decides the
   surviving rows *before* `number_properties()`), or a second write of an
@@ -815,6 +864,23 @@ Upload with `python -m twine upload dist\*`.
   `Node::kind` is the free-form class carrier that round-trips through
   `class_of`, and anything unknown becomes `Group`. Written LSG node count ==
   `model.nodes.len() + 1 + instances`.
+- **A built file is structurally thinner than a CAD file — that is the next
+  loading risk after the root name.** Samples: `Partition → MetaData → Instance →
+  Part → RangeLod → Group×3 → Shape×3` (11 nodes, 14 atoms, 67 property atoms, 9
+  TOC rows incl. PMI(3), Material(8/9), B-rep(17), InfoSegment(31)). Ours:
+  `Partition(+GeometricTransform) → Shape(+Material)` (2 nodes, 4 atoms, 6
+  properties, 2 TOC rows). There is **no `MetaData` node and no type-4 Meta Data
+  segment**, no `Part`, no `RangeLod`/`Group` wrapper, and the segment GUIDs are
+  synthetic counters (`00000000-0000-0000-fe00-00000000000N`), not UUIDs. Every
+  reader in this workspace is fine with that; a consumer that insists on a `Part`
+  under the root is not. Also: the `Partition` node-count range is the written
+  graph, not the instance-expanded one (2 vs the samples' 7/18/4489), and the
+  trailing `size` of a `Shape` stays `0` (samples 2084/1712/1112) because no
+  reader uses it.
+- **`ShapeStats::of` counts distinct (position, normal) pairs**, which is what the
+  partition count range reports — 26 for the exploded flat-normal cube — while the
+  written 8.x representation declares 36 slots. For a glTF cube both are 24, so no
+  sample shows the difference; do not treat the two numbers as interchangeable.
 - **`from_model` emits one material attribute per shape *node***, so the distinct
   count is smaller than `Model::materials.len()` — the server sample writes 20
   attributes for 23 materials.
@@ -825,8 +891,8 @@ Upload with `python -m twine upload dist\*`.
   **is** a property (a different type), so the two do not mirror each other here.
 - **The pytest summary line never surfaces under redirection** (Open3D/Vulkan
   native output interleaves), so `Select-String 'passed|failed'` finds nothing.
-  Trust `$LASTEXITCODE` plus `pytest --co -q` per file: 21 build + 66 ferrojt +
-  11 visual = **98**.
+  Trust `$LASTEXITCODE` plus `pytest --co -q` per file: 22 build + 67 ferrojt +
+  11 visual = **100**.
 - **Parallel tests need pid *and* an atomic counter in the temp file name** — the
   pid alone collides across the worker processes of one run.
 - **Picture parity for a written file must be measured one process per picture**
@@ -866,7 +932,8 @@ USD: `.usdc` (binary) and `.usdz` (packaged) output, and JT textures into the
 JT: keeping the source TOC position instead of always appending the table —
 `docs/jt-writer.md` holds the details. The builder (`jt/build.rs`) creates a file
 from nothing at JT 10.3 by default (8.x/9.x on request) — `docs/jt-builder.md`
-lists what is still open there (XZ, key/value properties, layer filters). Writing
-a neutral `Model` (`jt/from_model.rs`, `docs/jt-from-model.md`) carries no LOD
-tiers, no key/value properties and no layer filters yet.
+lists what is still open there (XZ, key/value properties, layer filters, and the
+`MetaData`/`Part`/`RangeLod` structure plus real segment UUIDs). Writing a neutral
+`Model` (`jt/from_model.rs`, `docs/jt-from-model.md`) carries no LOD tiers, no
+key/value properties and no layer filters yet.
 macOS and ARM wheels need CI (`maturin generate-ci github`).

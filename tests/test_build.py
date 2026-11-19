@@ -235,6 +235,10 @@ def test_a_placement_with_rotation_and_scale_survives(tmp_path) -> None:
 def test_a_built_file_reads_back_as_jt_10_3(tmp_path) -> None:
     builder, _ = build()
     assert builder.version == "10.3", "the newest revision is the default"
+    # :meth:`JtBuilder.save` names the root partition after the path it writes
+    # to, so a name has to be set for the two entry points to agree byte for
+    # byte — see :func:`test_the_root_partition_names_the_file_it_belongs_to`.
+    builder.set_file_name("built.jt")
     data = builder.to_bytes()
     assert isinstance(data, bytes)
     assert data.startswith(b"Version 10.3 JT"), "the JT banner"
@@ -265,6 +269,7 @@ def test_every_supported_revision_reaches_its_own_banner(tmp_path) -> None:
         builder, _ = build()
         builder.version = revision
         assert builder.version == revision, "the builder keeps it"
+        builder.set_file_name(f"built-{revision}.jt")
         data = builder.to_bytes()
         assert data.startswith(f"Version {revision} JT".encode()), "the JT banner"
 
@@ -440,6 +445,39 @@ def test_an_uncompressed_graph_reads_back_the_same(tmp_path) -> None:
     model = ferrojt.open(str(path))
     assert model.node_count == 5
     assert model.triangle_count == 12
+
+
+def test_the_root_partition_names_the_file_it_belongs_to(tmp_path) -> None:
+    """A written file always names its root partition.
+
+    A consumer that builds a scene graph of its own creates the root node from
+    that name and refuses a file whose partition is unnamed.
+    """
+    builder, _ = build()
+    assert builder.file_name is None
+
+    path = tmp_path / "written.jt"
+    builder.save(str(path))
+    file = ferrojt.JtFile(str(path))
+    file.open()
+    root = file.lsg.root()
+    assert root is not None
+    assert root.name == "written.jt", "the name of the path becomes the root name"
+
+    # An explicit name wins over the name of the path, and bytes with no
+    # destination fall back to the default.
+    builder.set_file_name("chosen.jt")
+    assert builder.file_name == "chosen.jt"
+    builder.save(str(path))
+    file = ferrojt.JtFile(str(path))
+    file.open()
+    assert file.lsg.root().name == "chosen.jt"
+
+    unnamed = ferrojt.JtBuilder()
+    (tmp_path / "bytes.jt").write_bytes(unnamed.to_bytes())
+    file = ferrojt.JtFile(str(tmp_path / "bytes.jt"))
+    file.open()
+    assert file.lsg.root().name == "model.jt"
 
 
 def test_a_written_file_can_be_read_by_every_reader(tmp_path) -> None:

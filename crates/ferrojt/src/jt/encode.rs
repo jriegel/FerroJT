@@ -895,7 +895,7 @@ fn write_mesh_input(streams: &Streams, version: JtVersion, out: &mut Vec<u8>) {
 
 /// Writes the 64-bit vertex binding of JT 9.x/10.x: three position components
 /// and one normal component.
-fn write_binding(out: &mut Vec<u8>) {
+pub(crate) fn write_binding(out: &mut Vec<u8>) {
     write_u8(out, BINDING_LSB);
     write_u32(out, 0);
     write_u8(out, 0);
@@ -904,7 +904,7 @@ fn write_binding(out: &mut Vec<u8>) {
 }
 
 /// Writes the four quantization parameters of a lossless shape.
-fn write_quantization_params(out: &mut Vec<u8>) {
+pub(crate) fn write_quantization_params(out: &mut Vec<u8>) {
     for value in [0u8, 0, 0, 0] {
         write_u8(out, value);
     }

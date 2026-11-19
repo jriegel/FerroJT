@@ -37,7 +37,7 @@ use crate::jt::build::{MeshData, representation, shape_segment};
 use crate::jt::guid::{Guid, types};
 use crate::jt::model::{JtFile, LayerFilter, LodWalk, ObjectRef, SceneGraph};
 use crate::jt::object::{
-    Attribute, Class, LateLoad, LateLoaded, Node, NodeBase, Property, RawElement, Shape,
+    Attribute, Class, LateLoad, LateLoaded, Node, NodeBase, Property, RawElement, Shape, ShapeLod,
     StringProperty, class_of, read_element_envelope,
 };
 use crate::jt::segment::{FileHeader, TocEntry, has_compression_header, read_segment};
@@ -722,7 +722,7 @@ impl Writer<'_> {
             ),
             err => err,
         })?;
-        Ok(shape_segment(*guid, kind, &element))
+        Ok(shape_segment(*guid, kind, &element, self.version))
     }
 
     /// Segments the source file references but no surviving node does.
@@ -1300,13 +1300,18 @@ fn node_body(node: &Node, out_node: &OutNode, order: ByteOrder, major: u32) -> R
             if major >= 10 {
                 write_version(&mut out, order, major, 1)?;
             }
-            // The flags, area and counts of a partition are not read back by
-            // this reader, so an empty box and no counts is enough.
-            out.write_i32_value(0, order)?;
+            out.write_i32_value(partition.flags, order)?;
             write_mb_string(&mut out, order, &partition.file_name)?;
-            write_box(&mut out, order, &[0.0; 6])?;
-            out.write_f32_value(0.0, order)?;
-            write_counts(&mut out, order)?;
+            write_box(&mut out, order, &partition.bounds)?;
+            out.write_f32_value(partition.area, order)?;
+            write_counts(&mut out, order, &partition.counts)?;
+            // Bit 0 of the flags announces a second box, which JT 8.x and 9.x
+            // store here and JT 10.x drops.
+            if let Some(untransformed) = partition.untransformed_bounds {
+                if major < 10 {
+                    write_box(&mut out, order, &untransformed)?;
+                }
+            }
         }
         Node::MetaData(meta) => {
             write_group(&mut out, &meta.base.base, out_node, order, major)?;
@@ -1369,9 +1374,10 @@ fn node_body(node: &Node, out_node: &OutNode, order: ByteOrder, major: u32) -> R
                 write_box(&mut out, order, &shape.bounds)?;
             }
             out.write_f32_value(shape.area, order)?;
-            write_counts(&mut out, order)?;
-            out.write_i32_value(0, order)?;
-            out.write_f32_value(0.0, order)?;
+            write_counts(&mut out, order, &shape.counts)?;
+            out.write_i32_value(shape.size, order)?;
+            out.write_f32_value(shape.compression, order)?;
+            write_shape_lod(&mut out, order, &shape.lod, major)?;
         }
         Node::Unsupported { class_name } => {
             return Err(Error::invalid(
@@ -1416,9 +1422,71 @@ fn write_group(
 }
 
 /// Write the three `I32[2]` count arrays of a shape or partition.
-pub(crate) fn write_counts(out: &mut Vec<u8>, order: ByteOrder) -> Result<()> {
-    for _ in 0..6 {
-        out.write_i32_value(0, order)?;
+pub(crate) fn write_counts(out: &mut Vec<u8>, order: ByteOrder, counts: &[i32; 6]) -> Result<()> {
+    for count in counts {
+        out.write_i32_value(*count, order)?;
+    }
+    Ok(())
+}
+
+/// Write the shape description tail of a shape node, which follows the
+/// compression ratio and holds the quantization of the vertex data.
+///
+/// The layout is per revision: a JT 10.x node has a one byte version and one
+/// binding, a JT 9.x node a two byte version, one binding, the quantization
+/// parameters and — from version 2 on — a second binding, and a JT 8.x node
+/// three four byte bindings followed by the quantization parameters. The
+/// bindings and the quantization parameters are written back exactly as they
+/// were read: a coarse level of detail of a sample quantizes with `11 06 0b
+/// 06`, so zeros are not a stand-in for what the file says.
+fn write_shape_lod(out: &mut Vec<u8>, order: ByteOrder, lod: &ShapeLod, major: u32) -> Result<()> {
+    match lod {
+        ShapeLod::Binding { version, binding } => {
+            out.write_u8_value(*version)?;
+            out.write_bytes(binding)?;
+        }
+        ShapeLod::Vertex2 {
+            version,
+            binding,
+            quantization,
+            second_binding,
+        } => {
+            out.write_i16_value(*version as i16, order)?;
+            out.write_bytes(binding)?;
+            out.write_bytes(quantization)?;
+            if let Some(second) = second_binding {
+                out.write_bytes(second)?;
+            }
+        }
+        ShapeLod::Vertex1 {
+            normal_binding,
+            texture_binding,
+            color_binding,
+            quantization,
+        } => {
+            out.write_i32_value(*normal_binding, order)?;
+            out.write_i32_value(*texture_binding, order)?;
+            out.write_i32_value(*color_binding, order)?;
+            out.write_bytes(quantization)?;
+        }
+        ShapeLod::None => {
+            // Nothing was read, so fall back to what a writer of that revision
+            // emits for an unquantized shape.
+            if major >= 10 {
+                out.write_u8_value(1)?;
+                crate::jt::encode::write_binding(&mut *out);
+            } else if major > 8 {
+                out.write_i16_value(2, order)?;
+                crate::jt::encode::write_binding(&mut *out);
+                crate::jt::encode::write_quantization_params(&mut *out);
+                crate::jt::encode::write_binding(&mut *out);
+            } else {
+                out.write_i32_value(1, order)?;
+                out.write_i32_value(0, order)?;
+                out.write_i32_value(0, order)?;
+                crate::jt::encode::write_quantization_params(&mut *out);
+            }
+        }
     }
     Ok(())
 }

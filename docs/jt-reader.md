@@ -73,6 +73,31 @@ Submodules:
     stream is empty. Neither exporter emits them, so they are there for a
     consumer that wants them — the viewer's detail pane shows them.
 
+## Fields the reader keeps for a writer
+
+`jt::object` used to discard the summary fields of a root `Partition` and the
+vertex description tail of a `Shape`, which meant a rewrite could not reproduce
+them and a strict consumer got zeros where the source had values. Both are parsed
+now:
+
+* `Partition { flags, file_name, bounds, area, counts, untransformed_bounds }`.
+  Bit 0 of `flags` announces the untransformed box, which JT 8.x and 9.x store
+  after the counts and JT 10.x does not — so `untransformed_bounds` is `Some`
+  only when the flag is set *and* the revision is below 10, and a writer must
+  apply the same second condition or every later byte shifts.
+* `Shape { counts, size, compression, lod }`, where `lod: ShapeLod` is the
+  revision-specific tail after the compression ratio: `Vertex1` (three `I32`
+  bindings plus quantization parameters) at 8.x, `Vertex2` (a version, a 64-bit
+  binding, the quantization parameters and a second binding from version 2 on) at
+  9.x, and `Binding` (a version and one binding) at 10.x. The bindings and the
+  quantization parameters are kept verbatim — a coarse tier of a sample quantizes
+  with `11 06 0b 06`, so zeros are not a stand-in.
+* `size` is stored because the source stores it. The reference reads it and never
+  uses it, and nothing in this workspace does either.
+
+None of it reaches `jt::dump` or the neutral `Model`, so the reference JSON dumps
+and the pinned export counts are unchanged by it.
+
 ## Materials and colours
 
 A JT file stores a fixed-function colour set — ambient, diffuse, specular,

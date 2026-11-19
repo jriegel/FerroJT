@@ -195,13 +195,27 @@ impl Model {
     ///
     /// When `format` is omitted it is taken from the extension of `path`.
     /// `version` is the JT revision to write at, see [`Model::to_bytes`].
+    ///
+    /// A JT file names its root partition after `path`; a consumer that builds
+    /// its own scene graph keys the root node on that name, so it is not
+    /// decoration. [`Model::to_bytes`] cannot know a destination and names the
+    /// root after the file the model was read from instead.
     #[pyo3(signature = (path, format = None, *, version = None))]
     fn save(&self, path: &str, format: Option<&str>, version: Option<&str>) -> PyResult<()> {
         let format = match format {
             Some(f) => f.parse::<ferrojt::Format>().map_err(py_err)?,
             None => ferrojt::Format::detect(path),
         };
-        let bytes = jt_bytes(format, &self.inner, version)?;
+        if version.is_some() && format != ferrojt::Format::Jt {
+            return Err(PyValueError::new_err(
+                "version only applies to the JT format",
+            ));
+        }
+        if format == ferrojt::Format::Jt {
+            return ferrojt::jt::model_to_file(&self.inner, Path::new(path), jt_version(version)?)
+                .map_err(py_err);
+        }
+        let bytes = ferrojt::export::to_format(format, &self.inner).map_err(py_err)?;
         std::fs::write(path, bytes)
             .map_err(ferrojt::Error::from)
             .map_err(py_err)
