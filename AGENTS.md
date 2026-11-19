@@ -662,7 +662,12 @@ Upload with `python -m twine upload dist\*`.
 - **Compression must be written as flag 2 / algorithm 2** (zlib, i.e.
   `codec::deflate`). XZ (flag 3) is read but never emitted, even though
   block-10.3 and the server sample store their LSG that way. `dataLength` counts
-  the algorithm byte, so it is the **compressed length + 1**.
+  the algorithm byte, so it is the **compressed length + 1**. **Never emit flag
+  0** for a kind that carries a compression envelope: the file parses here and a
+  strict consumer refuses it, which is why `compress` defaults to `true` in
+  `WriteOptions::default()`, in the CLI (`--compress` / `--no-compress`,
+  `default_value_t = true`) and in Python (`write_jt(compress=True)`). Only the
+  two test variants that deliberately check the uncompressed path pass `false`.
 - **A non-LSG segment ends with a property table of its own**: end-of-elements
   (`i32 16` + 16×`0xff`) then `i16 version 1` + `i32 0` rows = **6 bytes from JT
   9.x on**. Writing a shape segment without it makes `ferrojt-cli info` report
@@ -686,6 +691,28 @@ Upload with `python -m twine upload dist\*`.
   major>8] | mb string`. The version is `2` at 10.x and `1` at 9.x. Sample 10.3:
   `2d 00 00 00 | guid | 05 | 0e 00 00 00 | 02 | 00 00 00 40 | 02 | 07 00 00 00 |
   "SUBNODE"`.
+- **That class version must name the revision the file is written at — for every
+  property atom, including a class the reader does not know. Zero is fatal.** A
+  strict consumer reads the **first** one to look the class up and refuses the
+  whole file when the value names nothing it knows: that is the
+  `Corrupt file detected / Aborting import / Unable in find root node` report on
+  a rewritten file, and it is what `jtinfo.exe` said about a 9.5 → 10.3 rewrite
+  until it was fixed. `build::property_class(version)` (made `pub(crate)`) is the
+  single rule — 1 at 9.x, 2 at 10.x — used by the builder in both slots and by
+  `write.rs::string_property_body` / `late_loaded_property_body`. An **unknown**
+  class cannot be re-serialised, so `write_property_atom` clones the atom and
+  patches the object id and the first version in place (`set_property_class`).
+  **Keep the framing of the source** — a consumer takes the value, not the width
+  of the field, and re-framing alone still gave exit 5. Detect the width from the
+  state word `PROPERTY_STATE = 0x4000_0000` (`has_state` at `at+1` = byte, `at+2`
+  = word), **never from the revision**; `PROPERTY_VERSION_OFFSET = 25` is the
+  first version inside the atom. `element.base_type` is `0` for an unknown class,
+  so never use it for framing. Pinned by four unit tests in `write.rs` and, at
+  file level, by `a_rewritten_file_names_the_class_version_of_its_own_revision`
+  in `tests/write.rs` — which frames the LSG payload itself (two end-of-elements
+  sections; the property atoms are in the second) because
+  `model.rs::read_property_atoms` **skips** an unknown-class atom entirely, so
+  the parsed graph cannot show it.
 - **A root `Partition` MUST carry a non-empty file name and a property-table row,
   or a strict consumer refuses the file.** `JTData_SceneGraph.cxx:152-176` creates
   the root node **only when `FileName()` is non-empty** and then asserts one
@@ -916,6 +943,26 @@ Upload with `python -m twine upload dist\*`.
   the `Partition` node-count range is the written graph, not the instance-expanded
   one (2 vs the samples' 7/18/4489), and the trailing `size` of a `Shape` stays
   `0` (samples 2084/1712/1112) because no reader uses it.
+- **A strict consumer also refuses a bare builder graph** — `jtinfo.exe` says
+  `Unable in find root node` for `target\build_{8.0,8.1,9.5,10.3}.jt`, which are
+  `Partition → Shape`. That is by design (the chain is `from_model`'s job), and
+  `target\build_chain.py` proves the hand-built `Partition → MetaData → Instance
+  → Part → RangeLOD → Group → Shape` passes at all four revisions. Two gotchas
+  there: the `Instance` must come from `instance_of(meta, part)` where `part` is
+  an `add_detached_node("Part")` — `add_node(root, "Instance")` followed by
+  `instance_of(inst, part)` is wrong — and `maturin develop` first, or a stale
+  wheel hides the Rust fix.
+- **The external oracle is `C:\Tools\JtUtilities\JtUtilities\bin64\jtinfo.exe`**
+  (12.7.1.0). A run is a real pass only when `# JtkAssemblies:` is ≥ 1: `0`
+  means the file parsed but its root was lost, exit `5` with
+  `ERROR: JtkCADImporter::import()` is a rejection, exit `-1073741819`/`4` is a
+  crash. Capture the raw output plus `$LASTEXITCODE` (`$o = & jtinfo.exe $f 2>&1
+  | Out-String; $code = $LASTEXITCODE`) — piping through `Select-String` loses
+  the exit code. `target\jtsweep.py` runs every rewrite at every legal revision,
+  every glTF→JT at every revision and the four hand-built chains through it and
+  prints `N of M accepted`; it is **46 of 46**, and the only non-passing lines
+  are `SKIP` where the writer deliberately refuses an impossible request (a
+  family change, or a non-two-manifold mesh at 9.x/10.x).
 - **`ShapeStats::of` counts distinct (position, normal) pairs**, which is what the
   partition count range reports — 26 for the exploded flat-normal cube — while the
   written 8.x representation declares 36 slots. For a glTF cube both are 24, so no

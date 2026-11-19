@@ -155,8 +155,10 @@ pub struct WriteArgs {
     #[arg(long)]
     pub no_layer_filter: bool,
 
-    /// Compress the rebuilt scene graph instead of storing it uncompressed.
-    #[arg(long)]
+    /// DEFLATE the rebuilt scene graph. On by default — a consumer that is
+    /// strict about the specification refuses a scene graph stored raw — and
+    /// `--no-compress` keeps the bytes of the source segment as they are.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     pub compress: bool,
 
     /// Rewrite the file at another JT revision: 8.0, 8.1, 9.5 or 10.3. Without

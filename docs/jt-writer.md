@@ -140,7 +140,25 @@ Read out of the samples, since no reference writer exists:
   compression header, also flag `u32`, data length `i32` and algorithm `u8` —
   33 bytes. `dataLength = size − 33 + 1` when compressed.
 * Compression is written as **flag 2 / algorithm 2** (zlib). XZ (flag 3) is
-  read but never written.
+  read but never written. A segment whose kind carries a compression header is
+  compressed **by default** — `WriteOptions::compress` is `true`, and so are
+  `--compress` in the CLI and `compress=` in Python. A strict consumer refuses
+  such a segment when the flag says 0, so an uncompressed rewrite of a file that
+  stores its scene graph compressed parses here and is rejected there.
+* Property atom: `i32 length | GUID | u8 base type | i32 object id | class
+  version | u32 state | class version | body`. The class version is `u8` from
+  JT 10.x on and `i16` below, and it has to name a version the consumer knows
+  for **its own** revision — `1` at 9.x, `2` at 10.x. Zero is fatal: a strict
+  consumer reads that value to look the class up and refuses the whole file when
+  it names nothing it knows, which is the `Corrupt file detected / Unable in
+  find root node` report on a rewritten file. A rewrite at another revision
+  therefore never keeps the value of the source — but it also never re-frames
+  the atom: a JT 9.x atom carried into a JT 10.x file keeps its `i16`, because
+  the consumer takes the value and not the width of the field. Which width was
+  used is read from the state word `0x4000_0000` that follows it, never inferred
+  from the revision. This applies to a property of a class the reader does not
+  know as well — it cannot be re-serialised, so only its object id and its first
+  class version are patched in place.
 * Element: `i32 length | GUID | u8 base type | i32 object id | body`, where the
   length excludes its own field — the stride of an atom is `4 + length`. The
   envelope of a known class is 25 bytes, of an unknown class 20. A **non-LSG**
@@ -205,12 +223,24 @@ source:
 * **a revision change**: the banner, the TOC segment types and the representation
   family are checked, the refusal of an impossible change is checked, and the
   triangles of a re-encoded file are compared as a set of welded corner triples —
-  the only comparison that survives the coder re-ordering the vertex table.
+  the only comparison that survives the coder re-ordering the vertex table. The
+  class version of every property atom is checked too, in the bytes of the scene
+  graph rather than through the parsed graph, because a property of an unknown
+  class never reaches the parsed graph at all.
 * **a shape without geometry**: a write that keeps only the finest tier leaves a
   coarse `Shape` node with no late load at all, and its dump must still be valid
   JSON. None of the five reference dumps has such a node, so the byte-for-byte
   parity check cannot catch it and `jt::dump` closes an attribute list on a flag
   instead of a constant comma.
+* **an external consumer**: everything above is judged by a reader that tolerates
+  a lot. `target/jtsweep.py` writes every sample at every legal revision, every
+  glTF conversion at every revision and a hand-built chain at each of the four,
+  and hands each result to `jtinfo.exe` from the JT tooling. A file counts as
+  accepted only when it reports at least one assembly — `0` means the file parsed
+  but its root was lost, which is a failure. Three rejections found that way are
+  pinned above: an uncompressed capable segment, a property atom naming class
+  version zero, and a property atom of a restructured write naming the class
+  version of the source. All 46 outputs pass now.
 
 ## Open work
 

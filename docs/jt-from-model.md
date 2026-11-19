@@ -148,6 +148,14 @@ Partition -> MetaData -> Instance -> Part -> RangeLOD -> Group -> the graph of t
 pin the chain from both sides, including that the instance has no children and
 that the triangles under the tier are those of the source file.
 
+The chain is one of four things a strict consumer checks; the other three are the
+root file name above, a compression flag that matches what the segment actually
+holds, and a property atom whose class version names the revision being written.
+All four are spelled out in
+[framing facts the writer depends on](jt-writer.md#framing-facts-the-writer-depends-on),
+and `target/jtsweep.py` runs every conversion at every legal revision through the
+Siemens `jtinfo.exe` to prove it.
+
 ## Instancing
 
 `Writer::built` records the builder slot of each model node **before** its

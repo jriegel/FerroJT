@@ -96,6 +96,15 @@ second version field only from JT 9.x on, then the centre, the signal and the
 triangle-count limits. The tier of a span is a plain `Group`; JT never encodes
 which tier a group is, the position under the span is the tier.
 
+The builder does **not** insert that chain on its own: `add_shape(root, …)`
+produces `Partition -> Shape`, which every reader in the workspace accepts and a
+strict consumer refuses with the same *"Unable in find root node"* an unnamed
+partition gets. Assembling the chain is the caller's job —
+[`jt::from_model`](jt-from-model.md) does it for a neutral `Model`, and a
+hand-built graph has to do it itself. `target/build_chain.py` is the proof that
+the hand-built form loads: the same cube passes at 8.0, 8.1, 9.5 and 10.3 once
+the chain is there and fails at nothing before it is.
+
 ## Naming the root partition
 
 A root `Partition` carries a file name, and it is not decoration. The reference
@@ -193,7 +202,10 @@ binding byte at all — `LodGeometry::normal_binding` comes back `None`, where a
 * **Property table**: the root partition's row goes first, so the name of the
   file is the first thing a consumer that looks up object id `0` finds. A
   property atom carries a class version from JT 9.x on — `2` at 10.x, `1` at
-  9.x — between its object id and its state word, and again after it.
+  9.x — between its object id and its state word, and again after it. Neither
+  may be zero: a strict consumer reads the first one to look the class up and
+  refuses the whole file when the value names nothing it knows, which is why
+  `property_class` derives it from the revision instead of leaving it out.
 * **Shape node tail**: after the trailing size and compression, the vertex
   bindings of the representation follow in a revision-specific layout — three
   `I32` bindings plus quantization parameters at 8.x, a version, a 64-bit

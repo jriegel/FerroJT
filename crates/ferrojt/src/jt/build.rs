@@ -59,6 +59,15 @@ pub(crate) fn file_name_for_path(path: &Path) -> String {
 }
 /// The state every property atom stores.
 const PROPERTY_STATE: u32 = 0x4000_0000;
+/// The class version a property atom stores in its two version fields.
+///
+/// A property has one from JT 9.x on, and every file a consumer accepts stores
+/// a non-zero one: `1` at JT 9.x and `2` at JT 10.x. Zero is read as an unknown
+/// class and the whole file is refused as corrupt, which is invisible to this
+/// crate's own reader — it ignores the value.
+pub(crate) fn property_class(version: JtVersion) -> u32 {
+    u32::from(version.versions_are_bytes()) + 1
+}
 /// Base type byte of a string property atom.
 const BASE_PROPERTY_STRING: u8 = 5;
 /// Base type byte of a late loaded property atom.
@@ -1287,13 +1296,11 @@ fn add_string_property(
     let mut body: Vec<u8> = Vec::new();
     if version.has_object_versions() {
         // A string property is class version 2 from JT 10.x on and 1 below.
-        let class = u32::from(version.major >= 10);
-        write_version(&mut body, ORDER, version.major, class)?;
+        write_version(&mut body, ORDER, version.major, property_class(version))?;
     }
     body.write_u32_value(PROPERTY_STATE, ORDER)?;
     if version.has_object_versions() {
-        let class = u32::from(version.major >= 10);
-        write_version(&mut body, ORDER, version.major, class)?;
+        write_version(&mut body, ORDER, version.major, property_class(version))?;
     }
     write_mb_string(&mut body, ORDER, value)?;
     properties.push(Property {
@@ -1744,13 +1751,11 @@ fn late_load_body(segment: &Guid, kind: i32, version: JtVersion) -> Result<Vec<u
     let mut out: Vec<u8> = Vec::new();
     if version.has_object_versions() {
         // A late loaded property is class version 2 from JT 10.x on and 1 below.
-        let class = u32::from(version.major >= 10);
-        write_version(&mut out, ORDER, version.major, class)?;
+        write_version(&mut out, ORDER, version.major, property_class(version))?;
     }
     out.write_u32_value(PROPERTY_STATE, ORDER)?;
     if version.has_object_versions() {
-        let class = u32::from(version.major >= 10);
-        write_version(&mut out, ORDER, version.major, class)?;
+        write_version(&mut out, ORDER, version.major, property_class(version))?;
     }
     write_guid(&mut out, ORDER, segment)?;
     out.write_i32_value(kind, ORDER)?;

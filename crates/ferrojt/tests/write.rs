@@ -7,7 +7,11 @@
 
 use std::path::{Path, PathBuf};
 
-use ferrojt::jt::{self, JtFile, JtVersion, LodGeometry, Property, WriteOptions};
+use ferrojt::codec::ByteOrder;
+use ferrojt::jt::{
+    self, Class, Cursor, JtFile, JtVersion, LodGeometry, Property, WriteOptions, class_of,
+    read_element_envelope, skip_element,
+};
 
 /// What a sample looks like after a round trip.
 struct Expectation {
@@ -150,6 +154,7 @@ fn lossless_variants() -> Vec<(&'static str, WriteOptions)> {
             WriteOptions {
                 all_lods: true,
                 no_layer_filter: true,
+                compress: false,
                 ..WriteOptions::default()
             },
         ),
@@ -179,6 +184,7 @@ fn filtered_variants() -> Vec<(&'static str, WriteOptions)> {
             "finest tier",
             WriteOptions {
                 no_layer_filter: true,
+                compress: false,
                 ..WriteOptions::default()
             },
         ),
@@ -1089,4 +1095,143 @@ fn a_shape_without_geometry_still_dumps_as_valid_json() {
         .filter(|shape| shape.get("NumIndices").is_some())
         .count();
     assert_eq!(with_geometry, 1, "only the finest tier kept geometry");
+}
+
+/// The class version of a property atom names the class the reader looks up.
+///
+/// A strict consumer reads that value before anything else in the atom and
+/// refuses the whole file when it names nothing it knows, so a rewrite at
+/// another revision has to store the version *of its own* revision — 1 at 9.x,
+/// 2 at 10.x — and never the zero the reference reader discards. The framing of
+/// the source is kept: a consumer takes the value, not the width of the field.
+#[test]
+fn a_rewritten_file_names_the_class_version_of_its_own_revision() {
+    for stem in [
+        "example_block_jt9.5.jt",
+        "opening_protection_plate1_jt9.5.jt",
+    ] {
+        let path = sample(stem);
+        for (revision, class) in [("9.5", 1), ("10.3", 2)] {
+            let (_, again, bytes) = rewrite(&path, revision);
+            let graph = again.lsg.as_ref().expect("a scene graph");
+            assert!(
+                !graph.properties.is_empty(),
+                "{stem} written as {revision} carries no properties at all"
+            );
+            for stored in &graph.properties {
+                let found = match &stored.property {
+                    Property::String(property) => property.version,
+                    Property::LateLoaded(load) => load.version,
+                    other => {
+                        panic!("{stem} written as {revision}: {other:?} cannot be checked")
+                    }
+                };
+                assert_eq!(
+                    found, class,
+                    "{stem} written as {revision}: a property names class version \
+                     {found}, expected {class}"
+                );
+            }
+            atoms_name_the_class_version(&again, &bytes, class);
+        }
+    }
+}
+
+/// The class version of every property atom of a written file, including the
+/// ones of a class this reader does not know and therefore cannot parse.
+///
+/// The reader skips such an atom entirely, so the parsed graph cannot show
+/// them; only the bytes of the LSG segment can.
+fn atoms_name_the_class_version(file: &JtFile, bytes: &[u8], class: u32) {
+    let major = file.header.major;
+    let row = file
+        .toc
+        .iter()
+        .find(|row| row.guid == file.header.lsg_guid)
+        .expect("a logical scene graph");
+    let at = usize::try_from(row.offset).expect("a segment offset");
+    let mut envelope = Cursor::new(&bytes[at..], file.header.order, major);
+    envelope.read_guid().expect("the segment guid");
+    envelope.read_i32().expect("the segment type");
+    let length = envelope.read_i32().expect("the segment length");
+    let flag = envelope.read_u32().unwrap_or(0);
+    let stored = envelope.read_i32().unwrap_or(0);
+    let algorithm = envelope.read_u8().unwrap_or(0);
+    let payload = if matches!((flag, algorithm), (2, 2) | (3, 3)) {
+        let want = usize::try_from(stored - 1).expect("a compressed length");
+        let here = envelope.position();
+        let packed = &bytes[at + here..at + here + want];
+        if flag == 2 {
+            ferrojt::codec::inflate(packed).expect("an inflated LSG")
+        } else {
+            ferrojt::codec::decompress_xz(packed).expect("an un-XZed LSG")
+        }
+    } else {
+        let declared =
+            usize::try_from(length).expect("a positive segment length") - envelope.position();
+        bytes[at + envelope.position()..at + envelope.position() + declared].to_vec()
+    };
+    let payload = payload.as_slice();
+
+    let mut cursor = Cursor::new(payload, file.header.order, major);
+    let mut checked = 0;
+    // The payload holds the nodes and attributes first, then the properties,
+    // each section closed by an end-of-element marker. Only the second one
+    // carries property atoms; what follows it is the property table.
+    let mut section = 0;
+    while cursor.remaining() > 0 {
+        let Some(atom) = read_element_envelope(&mut cursor, true).expect("an element envelope")
+        else {
+            section += 1;
+            if section > 1 {
+                break;
+            }
+            continue;
+        };
+        if section == 1 && class_of(&atom.guid) == Some(Class::Property) {
+            let body = payload
+                .get(atom.body_offset..atom.body_offset + atom.body_len)
+                .expect("the body of a property atom");
+            // A class the reader knows frames its base type and object id in the
+            // envelope, so its body starts at the class version. For an unknown
+            // class the envelope stops after the GUID and those two fields are
+            // still part of the body.
+            let inner = usize::from(atom.base_type == 0) * 5;
+            // The width of the field is not the revision: a JT 9.x atom copied
+            // into a JT 10.x file keeps the framing of its source. The state
+            // word that follows the version says which width was used.
+            const STATE: u32 = 0x4000_0000;
+            let order = file.header.order;
+            let word = match body.get(inner + 1..inner + 5) {
+                Some(slot) => {
+                    let [a, b, c, d] = slot.try_into().expect("a state word");
+                    let value = if order == ByteOrder::Big {
+                        u32::from_be_bytes([a, b, c, d])
+                    } else {
+                        u32::from_le_bytes([a, b, c, d])
+                    };
+                    value != STATE
+                }
+                _ => true,
+            };
+            let version = if word {
+                let [a, b] = body[inner..inner + 2].try_into().expect("a class version");
+                u32::from(if order == ByteOrder::Big {
+                    u16::from_be_bytes([a, b])
+                } else {
+                    u16::from_le_bytes([a, b])
+                })
+            } else {
+                u32::from(*body.get(inner).expect("a class version"))
+            };
+            assert_ne!(version, 0, "a property atom stores class version zero");
+            assert_eq!(
+                version, class,
+                "a property atom names class version {version}, expected {class}"
+            );
+            checked += 1;
+        }
+        skip_element(&mut cursor, &atom).expect("a property atom to skip");
+    }
+    assert!(checked > 0, "no property atom could be framed");
 }

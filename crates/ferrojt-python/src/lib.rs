@@ -433,8 +433,9 @@ impl JtFile {
     ///
     /// Only the finest tier of a range LOD is kept unless `all_lods` is set, and
     /// the layer filters of the file are applied unless `all_layers` is set —
-    /// the same selection [`JtFile::model`] makes. The scene graph is stored
-    /// uncompressed unless `compress` is set.
+    /// the same selection [`JtFile::model`] makes. The scene graph is DEFLATE
+    /// compressed unless `compress` is turned off; a strict consumer refuses a
+    /// scene graph stored raw, so leaving it on is what makes the file readable.
     ///
     /// `version` asks for another JT revision, `"8.0"`, `"8.1"`, `"9.5"` or
     /// `"10.3"`; leaving it out keeps the revision of the source file, which is
@@ -445,7 +446,7 @@ impl JtFile {
     /// two-manifold does not survive. Such a rewrite raises `ValueError` rather
     /// than writing a file whose shapes come back empty.
     #[pyo3(signature = (path, *, layer_filter = None, all_layers = false, all_lods = false,
-                        compress = false, version = None))]
+                        compress = true, version = None))]
     fn write_jt(
         &self,
         path: &str,

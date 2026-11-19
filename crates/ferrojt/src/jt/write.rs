@@ -33,7 +33,7 @@ use std::path::Path;
 use crate::codec::{ByteOrder, WriterExt, deflate};
 use crate::error::{Error, Result};
 use crate::jt::Cursor;
-use crate::jt::build::{MeshData, representation, shape_segment};
+use crate::jt::build::{MeshData, property_class, representation, shape_segment};
 use crate::jt::guid::{Guid, types};
 use crate::jt::model::{JtFile, LayerFilter, LodWalk, ObjectRef, SceneGraph};
 use crate::jt::object::{
@@ -60,6 +60,11 @@ const KNOWN_ENVELOPE: usize = 4 + 16 + 1 + 4;
 const UNKNOWN_ENVELOPE: usize = 4 + 16;
 /// Offset of the object id inside an atom of a known class.
 const OBJECT_ID_OFFSET: usize = 4 + 16 + 1;
+/// Offset of the class version inside a property atom.
+///
+/// A property atom stores that version, then the state, then a second version
+/// field, and the first one is what names the class. JT 8.x stores none.
+const PROPERTY_VERSION_OFFSET: usize = OBJECT_ID_OFFSET + 4;
 /// The state every property atom stores.
 ///
 /// The reader keeps it without interpreting it, and the reference writes this
@@ -73,7 +78,7 @@ const PROPERTY_STATE: u32 = 0x4000_0000;
 pub(crate) const COMPRESSION_ENVELOPE: usize = 4 + 16 + 4 + 4 + 4 + 1;
 
 /// What a rewritten file should keep.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct WriteOptions {
     /// Keep every tier of a range LOD.
     ///
@@ -86,7 +91,14 @@ pub struct WriteOptions {
     ///
     /// Combining this with [`WriteOptions::no_layer_filter`] is an error.
     pub layer_filter: Option<String>,
-    /// Compress the rebuilt scene graph instead of storing it uncompressed.
+    /// DEFLATE the rebuilt scene graph.
+    ///
+    /// On by default, and it should stay on: a segment of a type that carries a
+    /// compression header is only read as it is declared when the flag names a
+    /// known algorithm, so a strict consumer refuses a file whose scene graph is
+    /// stored raw. No sample of any revision does that. Turning this off keeps
+    /// the bytes of the source segment as they are, which is what a byte-level
+    /// comparison of a round trip wants.
     pub compress: bool,
     /// Write the file at this JT revision instead of the one it has.
     ///
@@ -104,6 +116,18 @@ pub struct WriteOptions {
     ///
     /// [`JtVersion::compatible`]: crate::jt::JtVersion::compatible
     pub version: Option<JtVersion>,
+}
+
+impl Default for WriteOptions {
+    fn default() -> Self {
+        Self {
+            all_lods: false,
+            no_layer_filter: false,
+            layer_filter: None,
+            compress: true,
+            version: None,
+        }
+    }
 }
 
 /// Rebuild a JT file.
@@ -860,15 +884,21 @@ impl Writer<'_> {
     /// version gates of the target revision, and the segment type of a late
     /// load is the one the target revision gives that segment. A property of a
     /// class the reader does not know cannot be parsed, so it keeps its bytes
-    /// and only its object id moves — such an atom is framed the same way in
-    /// every revision, which is what the reader relies on as well.
+    /// and only its object id and its class version move.
     ///
     /// The bytes are those of the source file, so they are parsed with the
     /// framing of that revision: reading a JT 9.x atom with the gates of JT
     /// 10.x would misalign the cursor before anything is rewritten.
+    ///
+    /// The class version cannot be kept. A strict consumer reads it to look the
+    /// class up and refuses the whole file when the value names nothing it
+    /// knows, so a JT 9.x atom rewritten into a JT 10.x file has to store the
+    /// version a JT 10.x file uses. The framing of the source is kept — a
+    /// consumer takes the value, not the width of the field.
     fn write_property_atom(&self, out: &mut Vec<u8>, atom: &Atom, new: i32) -> Result<()> {
         let order = self.file.header.order;
         let source_major = self.file.header.major;
+        let class = property_class(self.version);
         let mut cursor = Cursor::new(&atom.bytes, order, source_major);
         let Some(element) = read_element_envelope(&mut cursor, true)? else {
             return Err(Error::invalid(0, "a property atom has no envelope"));
@@ -885,21 +915,25 @@ impl Writer<'_> {
         };
         let new_body = match parsed.as_ref() {
             Some(Property::String(value)) => {
-                Some(string_property_body(value, order, self.version)?)
+                Some(string_property_body(value, order, self.version, class)?)
             }
             Some(Property::LateLoaded(load)) => Some(late_loaded_property_body(
                 load,
                 order,
                 self.version,
+                class,
                 &self.kinds,
             )?),
             _ => None,
         };
         let Some(new_body) = new_body else {
-            // Nothing to re-serialise: keep the atom as the source wrote it.
+            // Nothing to re-serialise: keep the atom as the source wrote it,
+            // except for the two fields a rewrite at another revision has to
+            // correct and that can be reached without parsing the body.
             let mut bytes = atom.bytes.clone();
             let start = OBJECT_ID_OFFSET;
             bytes[start..start + 4].copy_from_slice(&ordered_i32(new, order));
+            set_property_class(&mut bytes, order, source_major, class);
             out.extend_from_slice(&bytes);
             return Ok(());
         };
@@ -1070,19 +1104,22 @@ fn write_generated_banner(
 /// The body of a string property at `version`.
 ///
 /// A class version precedes the state and another one follows it from JT 9.x
-/// on; JT 8.x stores only the state and the string.
+/// on; JT 8.x stores only the state and the string. Both hold `class`, the
+/// version of the class the target revision names — not the one the source
+/// stored, which a consumer of another revision does not know.
 fn string_property_body(
     property: &StringProperty,
     order: ByteOrder,
     version: JtVersion,
+    class: u32,
 ) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     if version.has_object_versions() {
-        write_version(&mut out, order, version.major, property.version)?;
+        write_version(&mut out, order, version.major, class)?;
     }
     out.write_u32_value(PROPERTY_STATE, order)?;
     if version.has_object_versions() {
-        write_version(&mut out, order, version.major, property.version)?;
+        write_version(&mut out, order, version.major, class)?;
     }
     write_mb_string(&mut out, order, &property.value)?;
     Ok(out)
@@ -1092,20 +1129,22 @@ fn string_property_body(
 ///
 /// The segment type is the one the target revision gives that segment, and the
 /// object id of the element inside it moves with the element itself. JT 9.x
-/// appends a reserved word after the id, JT 10.x does not.
+/// appends a reserved word after the id, JT 10.x does not. Both class versions
+/// hold `class`, the version of the class the target revision names.
 fn late_loaded_property_body(
     load: &LateLoaded,
     order: ByteOrder,
     version: JtVersion,
+    class: u32,
     kinds: &BTreeMap<Guid, i32>,
 ) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     if version.has_object_versions() {
-        write_version(&mut out, order, version.major, load.version)?;
+        write_version(&mut out, order, version.major, class)?;
     }
     out.write_u32_value(PROPERTY_STATE, order)?;
     if version.has_object_versions() {
-        write_version(&mut out, order, version.major, load.version)?;
+        write_version(&mut out, order, version.major, class)?;
     }
     write_guid(&mut out, order, &load.guid)?;
     let kind = kinds.get(&load.guid).copied().unwrap_or(load.segment_type);
@@ -1117,6 +1156,52 @@ fn late_loaded_property_body(
         }
     }
     Ok(out)
+}
+
+/// Write the class version of a property atom that is kept as the source wrote it.
+///
+/// The field is a byte from JT 10.x on and a word below, and a file can hold an
+/// atom framed the other way, so the width is taken from the atom itself: it is
+/// the framing that puts the state word where it belongs. An atom whose state is
+/// nowhere to be found is left alone rather than guessed at.
+fn set_property_class(atom: &mut [u8], order: ByteOrder, major: u32, class: u32) {
+    if major <= 8 {
+        // JT 8.x stores no class version at all, so there is nothing to name.
+        return;
+    }
+    let at = PROPERTY_VERSION_OFFSET;
+    let word = if has_state(atom, at + 1, order) {
+        false
+    } else if has_state(atom, at + 2, order) {
+        true
+    } else {
+        return;
+    };
+    if word {
+        let bytes = if order == ByteOrder::Big {
+            (class as u16).to_be_bytes()
+        } else {
+            (class as u16).to_le_bytes()
+        };
+        if let Some(slot) = atom.get_mut(at..at + 2) {
+            slot.copy_from_slice(&bytes);
+        }
+    } else if let Some(slot) = atom.get_mut(at) {
+        *slot = class as u8;
+    }
+}
+
+/// Does the atom hold the property state word at `at`?
+fn has_state(atom: &[u8], at: usize, order: ByteOrder) -> bool {
+    let Ok(ok) = atom.get(at..at + 4).unwrap_or(&[]).try_into() else {
+        return false;
+    };
+    let value = if order == ByteOrder::Big {
+        u32::from_be_bytes(ok)
+    } else {
+        u32::from_le_bytes(ok)
+    };
+    value == PROPERTY_STATE
 }
 
 /// Write the TOC table at the end of the file.
@@ -1589,4 +1674,102 @@ pub(crate) fn write_attribute_base(
         out.write_u32_value(0, order)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An atom of `word` framing: the class version is a byte below JT 10.x and
+    /// a word from there on, and a file can hold one framed the other way.
+    fn atom(word: bool, version: u32) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        let head = if word {
+            let mut head = Vec::new();
+            head.write_u16_value(version as u16, ByteOrder::Little)
+                .unwrap();
+            head.write_u32_value(PROPERTY_STATE, ByteOrder::Little)
+                .unwrap();
+            head.write_u16_value(version as u16, ByteOrder::Little)
+                .unwrap();
+            head
+        } else {
+            let mut head = Vec::new();
+            head.write_u8_value(version as u8).unwrap();
+            head.write_u32_value(PROPERTY_STATE, ByteOrder::Little)
+                .unwrap();
+            head.write_u8_value(version as u8).unwrap();
+            head
+        };
+        let payload = b"value";
+        out.write_i32_value(
+            (16 + 1 + 4 + head.len() + payload.len()) as i32,
+            ByteOrder::Little,
+        )
+        .unwrap();
+        out.write_bytes(&[0x10, 0xdd, 0x10, 0x6e, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            .unwrap();
+        out.write_u8_value(5).unwrap();
+        out.write_i32_value(7, ByteOrder::Little).unwrap();
+        out.write_bytes(&head).unwrap();
+        out.write_bytes(payload).unwrap();
+        out
+    }
+
+    #[test]
+    fn a_byte_framed_atom_gets_a_byte_class_version() {
+        let mut bytes = atom(false, 1);
+        set_property_class(&mut bytes, ByteOrder::Little, 10, 2);
+        assert_eq!(2, bytes[PROPERTY_VERSION_OFFSET] as u32);
+        // The second field and the framing stay where they were.
+        assert_eq!(1, bytes[PROPERTY_VERSION_OFFSET + 5] as u32);
+        assert_eq!(
+            PROPERTY_STATE,
+            u32::from_le_bytes(
+                bytes[PROPERTY_VERSION_OFFSET + 1..PROPERTY_VERSION_OFFSET + 5]
+                    .try_into()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn a_word_framed_atom_keeps_its_word() {
+        // A JT 9.x atom copied into a JT 10.x file is still word framed, and
+        // the consumer reads the value, not the width of the field.
+        let mut bytes = atom(true, 1);
+        set_property_class(&mut bytes, ByteOrder::Little, 9, 2);
+        assert_eq!(
+            2,
+            u16::from_le_bytes(
+                bytes[PROPERTY_VERSION_OFFSET..PROPERTY_VERSION_OFFSET + 2]
+                    .try_into()
+                    .unwrap()
+            ) as u32
+        );
+        assert_eq!(
+            PROPERTY_STATE,
+            u32::from_le_bytes(
+                bytes[PROPERTY_VERSION_OFFSET + 2..PROPERTY_VERSION_OFFSET + 6]
+                    .try_into()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn a_jt_8x_atom_stores_no_class_version_at_all() {
+        let mut bytes = atom(false, 1);
+        set_property_class(&mut bytes, ByteOrder::Little, 8, 2);
+        assert_eq!(1, bytes[PROPERTY_VERSION_OFFSET] as u32);
+    }
+
+    #[test]
+    fn an_atom_without_a_state_word_is_left_alone() {
+        let mut bytes = atom(false, 1);
+        bytes[PROPERTY_VERSION_OFFSET + 1..PROPERTY_VERSION_OFFSET + 5]
+            .copy_from_slice(&0u32.to_le_bytes());
+        set_property_class(&mut bytes, ByteOrder::Little, 10, 2);
+        assert_eq!(1, bytes[PROPERTY_VERSION_OFFSET] as u32);
+    }
 }
