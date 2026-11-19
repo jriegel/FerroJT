@@ -434,7 +434,23 @@ class JtBuilder:
     def root(self) -> NodeHandle: ...
     def add_node(
         self, parent: NodeHandle, class_name: str, name: str | None = ...
-    ) -> NodeHandle: ...
+    ) -> NodeHandle:
+        """Add a node of `class_name` under `parent`.
+
+        `class_name` is a JT class name: ``Partition``, ``Part``, ``MetaData``,
+        ``Group``, ``Shape``, ``Instance`` or ``RangeLOD``. A ``Shape`` or
+        ``Instance`` node cannot have children.
+        """
+    def add_detached_node(
+        self, class_name: str, name: str | None = ...
+    ) -> NodeHandle:
+        """Add a node that no parent refers to.
+
+        Such a node only reaches the file through :meth:`instance_of`, which is
+        how a JT file shares a subtree: an instance names its target instead of
+        holding it as a child, so the target must not hang under the root as
+        well.
+        """
     def add_shape(
         self, parent: NodeHandle, mesh: MeshData, *, name: str | None = ...
     ) -> NodeHandle: ...

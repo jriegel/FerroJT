@@ -947,7 +947,14 @@ fn build_node(
         lod
     };
     for child in graph.children_of(node).into_iter().flatten() {
-        children.push(build_node(graph, model, child, built, walk, filter));
+        children.push(build_node(
+            graph,
+            model,
+            child,
+            built,
+            walk.for_child(),
+            filter,
+        ));
         let class_name = graph
             .nodes
             .get(child)
@@ -955,7 +962,14 @@ fn build_node(
         walk.next_tier(class_name);
     }
     if let Some(target) = graph.instance_target(node) {
-        children.push(build_node(graph, model, target, built, walk, filter));
+        children.push(build_node(
+            graph,
+            model,
+            target,
+            built,
+            walk.for_child(),
+            filter,
+        ));
     }
     model.nodes[index].children = children;
     index
@@ -993,6 +1007,8 @@ pub(crate) struct LodWalk {
     inside: bool,
     /// Tier of the branch currently being walked.
     level: u32,
+    /// Set while the children being walked are the tiers of a range span.
+    tiers: bool,
 }
 
 impl LodWalk {
@@ -1000,12 +1016,14 @@ impl LodWalk {
     pub(crate) const ROOT: Self = Self {
         inside: false,
         level: 0,
+        tiers: false,
     };
 
     /// The first child of a range LOD.
     pub(crate) const FIRST: Self = Self {
         inside: true,
         level: 0,
+        tiers: true,
     };
 
     /// `true` when the representations of this branch belong in the model.
@@ -1020,10 +1038,26 @@ impl LodWalk {
         self.inside.then_some(self.level)
     }
 
-    /// Move past a child of a range LOD. Only a group counts as a tier, and a
-    /// group nested in a group moves on too, as it does in the reference.
+    /// The walk to hand to a child of the node being walked.
+    ///
+    /// Only the direct children of a range span are its tiers, so a walk stops
+    /// counting tiers as soon as it descends into one of them. The reference
+    /// counts a group at any depth below the span, which is invisible in every
+    /// sample — each of their spans holds a group per tier and a shape under
+    /// that group — but it would read a file whose span wraps a whole assembly,
+    /// as this library writes one, as an assembly of nothing but coarse tiers.
+    #[must_use]
+    pub(crate) fn for_child(self) -> Self {
+        Self {
+            tiers: false,
+            ..self
+        }
+    }
+
+    /// Move past a child of a range span. Only a group counts as a tier, and
+    /// only a direct child of the span is one.
     pub(crate) fn next_tier(&mut self, class_name: &str) {
-        if self.inside && class_name == "Group" {
+        if self.tiers && class_name == "Group" {
             self.level += 1;
         }
     }

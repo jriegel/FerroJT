@@ -175,6 +175,61 @@ def test_the_graph_a_builder_accumulates() -> None:
     assert part.instance_target() is None
 
 
+def test_a_level_of_detail_span_can_be_built_by_hand(tmp_path) -> None:
+    """The chain of a CAD file, built node by node.
+
+    A consumer that builds a scene graph of its own walks from the root
+    partition down to a part and reads the geometry under the level-of-detail
+    span of that part. The part is created detached, because an instance
+    *refers* to its target instead of holding it as a child — and the span
+    hangs under the part, since an instance carries only a placement and a
+    reference.
+    """
+    builder = ferrojt.JtBuilder()
+    root = builder.root()
+    builder.add_node(root, "MetaData")
+    part = builder.add_detached_node("Part", "cube")
+    builder.instance_of(root, part)
+    span = builder.add_node(part, "RangeLOD")
+    tier = builder.add_node(span, "Group")
+    builder.add_shape(tier, cube(), name="cube shape")
+    assert builder.class_of(span) == "RangeLOD"
+    assert [child.class_name for child in builder.children(root)] == [
+        "MetaData",
+        "Instance",
+    ], "the detached part is reached only through the instance"
+
+    path = tmp_path / "chain.jt"
+    builder.save(str(path))
+
+    file = ferrojt.JtFile(str(path))
+    assert file.open()
+    graph = file.lsg
+    assert graph is not None
+    assert [node.class_name for node in graph.nodes()] == [
+        "Partition",
+        "MetaData",
+        "Instance",
+        "Part",
+        "RangeLOD",
+        "Group",
+        "Shape",
+    ]
+
+    instance = next(node for node in graph.nodes() if node.position == 2)
+    assert instance.instance_target().position == 3
+    assert instance.child_count() == 0, "an instance holds no child"
+
+    part_node = next(node for node in graph.nodes() if node.position == 3)
+    assert part_node.name == "cube"
+    span_node = next(node for node in graph.nodes() if node.position == 4)
+    assert [child.class_name for child in span_node.children()] == ["Group"]
+    tier_node = span_node.children()[0]
+    assert [child.class_name for child in tier_node.children()] == ["Shape"]
+    shape_node = next(node for node in graph.nodes() if node.position == 6)
+    assert shape_node.name == "cube shape"
+
+
 def test_a_mesh_can_be_added_on_its_own(tmp_path) -> None:
     builder = ferrojt.JtBuilder()
     mesh = builder.add_mesh(cube())

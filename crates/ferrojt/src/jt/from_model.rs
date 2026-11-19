@@ -31,11 +31,27 @@
 //!
 //! # What does not survive
 //!
-//! The builder has no level-of-detail node, so a node holding several
-//! representations keeps only the first one — the finest tier, which is the
-//! order the reader collected them in. Lines and points have no JT shape type
-//! here, so a primitive that is not a plain triangle list is refused rather
-//! than re-indexed.
+//! A neutral model carries one representation per node, so the level-of-detail
+//! span a CAD writer puts in a JT file holds exactly one tier: the group with
+//! the geometry of the model, which is LOD 0. Lines and points have no JT shape
+//! type here, so a primitive that is not a plain triangle list is refused
+//! rather than re-indexed.
+//!
+//! # Scene graph shape
+//!
+//! A model that did not come out of a JT file — every glTF file, and any graph
+//! built by hand — is wrapped in the chain a CAD writer produces, because a
+//! consumer that walks the graph looking for a part finds nothing in a
+//! partition that holds its shapes directly:
+//!
+//! ```text
+//! Partition -> MetaData -> Instance -> Part -> RangeLOD -> Group -> Shape
+//! ```
+//!
+//! The instance refers to the part instead of holding it as a child, which is
+//! how the samples store a part, and the range span holds the one tier. A model
+//! that *did* come out of a JT file already carries those classes and is
+//! written as it is, so the chain is never built twice.
 //!
 //! [`JtFile::to_model`]: crate::jt::JtFile::to_model
 
@@ -129,11 +145,20 @@ fn write(model: &Model, version: Option<JtVersion>, file_name: Option<&str>) -> 
 
     let mut writer = Writer {
         model,
+        parent: build.root(),
         build,
         shapes: Vec::new(),
         materials: Vec::new(),
         built: vec![None; model.nodes.len()],
     };
+    // A graph that did not come out of a JT file has none of the classes a CAD
+    // writer puts between its root partition and its shapes, so it gains them
+    // here. Writing the shapes straight under the partition produces a file
+    // this library reads back fine and a consumer walking the graph for a part
+    // refuses.
+    if !already_wrapped(model) {
+        writer.wrap(file_name)?;
+    }
     writer.write_scene()?;
 
     if let Some(mesh) = writer.shapes.iter().find(|mesh| encode(mesh).is_err()) {
@@ -151,6 +176,35 @@ fn write(model: &Model, version: Option<JtVersion>, file_name: Option<&str>) -> 
     }
 
     writer.build.write_to_bytes()
+}
+
+/// Whether the model already carries the classes of a JT scene graph.
+///
+/// [`JtFile::to_model`] keeps the JT class of every node, so a model read out of
+/// a JT file — or exported to glTF and read back, which keeps the class in the
+/// node kinds it declares — already has its partition, part, meta data and
+/// level-of-detail span and must not be wrapped a second time: a second chain
+/// would put a second partition under the root. A glTF reader declares every
+/// node a plain group, and a hand-built model declares nothing, so neither is
+/// mistaken for one.
+fn already_wrapped(model: &Model) -> bool {
+    model.nodes.iter().any(|node| {
+        matches!(
+            node.kind.as_deref(),
+            Some("Partition" | "Part" | "MetaData" | "LOD" | "RangeLOD")
+        )
+    })
+}
+
+/// The name of the instance that refers to the wrapper part.
+///
+/// The samples name their single part after the object it holds, with a `.part`
+/// tail; the name of the file is the closest thing to that here.
+fn part_name(file_name: Option<&str>) -> String {
+    let stem = file_name
+        .and_then(|name| name.rsplit_once('.'))
+        .map_or("model", |(stem, _)| stem);
+    format!("{stem}.part")
 }
 
 /// The name of the file a [`Model`] was read from, as a JT file name.
@@ -435,6 +489,9 @@ fn read_vector(model: &Model, handle: usize, width: usize) -> Result<Vec<f32>> {
 struct Writer<'a> {
     model: &'a Model,
     build: JtBuilder,
+    /// Where the scene roots go: the root partition itself, or the group of the
+    /// level-of-detail span wrapped around a graph that had none.
+    parent: JtNode,
     /// Every shape handed to the builder, kept so the encodability of the file
     /// can be probed afterwards: a `JtMesh` handle cannot be turned back into
     /// the data behind it.
@@ -449,8 +506,27 @@ struct Writer<'a> {
 }
 
 impl Writer<'_> {
-    /// Attach every scene root to the single root partition, as the JT samples
-    /// do: one Partition at the top, everything below it.
+    /// Put the chain a CAD writer hangs its shapes on under the root partition.
+    ///
+    /// `Partition -> MetaData -> Instance -> Part -> RangeLOD -> Group`, with one
+    /// tier in the span because a neutral model holds one representation per
+    /// node. The instance **refers** to the part instead of holding it as a
+    /// child, which is how every sample stores a part and where its placement
+    /// lives.
+    fn wrap(&mut self, file_name: Option<&str>) -> Result<()> {
+        let meta = self
+            .build
+            .add_node(self.build.root(), BuildNode::MetaData, None)?;
+        let part = self.build.add_detached_node(BuildNode::Part, None)?;
+        let instance = self.build.instance_of(meta, part)?;
+        self.build.set_name(instance, &part_name(file_name))?;
+        let span = self.build.add_node(part, BuildNode::RangeLod, None)?;
+        self.parent = self.build.add_node(span, BuildNode::Group, None)?;
+        Ok(())
+    }
+
+    /// Attach every scene root below the wrapper, as the JT samples do: one
+    /// Partition at the top, everything below it.
     fn write_scene(&mut self) -> Result<()> {
         let roots = &self
             .model
@@ -459,8 +535,9 @@ impl Writer<'_> {
             .filter(|scene| !scene.roots.is_empty())
             .ok_or_else(|| Error::invalid(0, "the model has no scene roots to write"))?
             .roots;
+        let parent = self.parent;
         for root in roots {
-            self.node(*root, self.build.root())?;
+            self.node(*root, parent)?;
         }
         Ok(())
     }

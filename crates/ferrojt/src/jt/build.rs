@@ -314,6 +314,8 @@ pub enum BuildNode {
     Part,
     /// A meta data node: a group that carries key/value properties.
     MetaData,
+    /// A level-of-detail span: a group whose children are the tiers, finest first.
+    RangeLod,
     /// A group: an interior node with children.
     Group,
     /// A shape node: the leaf that holds one mesh.
@@ -549,6 +551,33 @@ impl JtBuilder {
                 ),
             ));
         }
+        let node = self.new_node(class, name);
+        self.nodes[parent.0].children.push(node.0);
+        Ok(node)
+    }
+
+    /// Add a node that no child list refers to, for an instance to point at.
+    ///
+    /// That is how a JT file stores a part: the part is not a child of the node
+    /// above it, an `Instance` refers to it, and the instance carries the
+    /// placement. A node created here is only written when some instance does
+    /// refer to it — [`JtBuilder::write_to_bytes`] reports a node nothing
+    /// reaches.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] is never returned here; the class is only checked when
+    /// children or a mesh are added to the node.
+    pub fn add_detached_node<'a>(
+        &mut self,
+        class: BuildNode,
+        name: impl Into<Option<&'a str>>,
+    ) -> Result<JtNode> {
+        Ok(self.new_node(class, name))
+    }
+
+    /// Register a node of `class` named `name` without connecting it anywhere.
+    fn new_node<'a>(&mut self, class: BuildNode, name: impl Into<Option<&'a str>>) -> JtNode {
         let pos = self.nodes.len();
         self.nodes.push(Slot {
             class,
@@ -559,8 +588,7 @@ impl JtBuilder {
             matrix: None,
             material: None,
         });
-        self.nodes[parent.0].children.push(pos);
-        Ok(JtNode(pos))
+        JtNode(pos)
     }
 
     /// Add a shape node holding `mesh` under `parent`.
@@ -957,6 +985,10 @@ impl JtBuilder {
     }
 
     /// Depth first walk that writes a parent before its children.
+    ///
+    /// An instance target is visited too: a JT file reaches its part through the
+    /// instance that instantiates it, so a node with no child of its own is not
+    /// an orphan just because nothing in the child lists points at it.
     fn walk(
         &self,
         pos: usize,
@@ -973,7 +1005,14 @@ impl JtBuilder {
         on_path[pos] = true;
         order.push(pos);
         visited[pos] = true;
-        for child in &self.nodes[pos].children {
+        let slot = &self.nodes[pos];
+        let target = slot.target;
+        if let Some(target) = target {
+            if !visited[target] {
+                self.walk(target, order, visited, on_path)?;
+            }
+        }
+        for child in &slot.children {
             if !visited[*child] {
                 self.walk(*child, order, visited, on_path)?;
             }
@@ -1062,6 +1101,7 @@ impl JtBuilder {
                 BuildNode::Partition => types::NODE_PARTITION,
                 BuildNode::Part => types::NODE_PART,
                 BuildNode::MetaData => types::NODE_META_DATA,
+                BuildNode::RangeLod => types::NODE_RANGE_LOD,
                 BuildNode::Group => types::NODE_GROUP,
                 BuildNode::Shape => types::NODE_SHAPE_TRI_STRIP_SET,
                 BuildNode::Instance => types::NODE_INSTANCE,
@@ -1545,6 +1585,33 @@ fn node_body(
             write_version(&mut out, ORDER, major, 1)?;
             out.write_i32_value(0, ORDER)?;
         }
+        BuildNode::RangeLod => {
+            // A range span is an LOD selector, which is a group: the group
+            // version and child list, then the LOD fields, then its own.
+            if version.has_object_versions() {
+                write_version(&mut out, ORDER, major, 1)?;
+            }
+            write_deferred(&mut out, ORDER, children)?;
+            if version.has_object_versions() {
+                write_version(&mut out, ORDER, major, 1)?;
+            }
+            // The percentage limits of the LOD base, which JT 10.x dropped.
+            if major < 10 {
+                write_float_vector(&mut out, &[])?;
+                out.write_f32_value(0.0, ORDER)?;
+            }
+            if version.has_object_versions() {
+                write_version(&mut out, ORDER, major, 1)?;
+            }
+            // The range limits and the centre they are measured from. Every
+            // sample leaves both empty — the tier of a child is its position
+            // under the span, never a number stored in it — and a consumer
+            // that picks a tier by screen area does the same.
+            write_float_vector(&mut out, &[])?;
+            out.write_f32_value(0.0, ORDER)?;
+            out.write_f32_value(0.0, ORDER)?;
+            out.write_f32_value(0.0, ORDER)?;
+        }
     }
     match class {
         BuildNode::Shape => {
@@ -1611,6 +1678,15 @@ fn node_body(
         _ => {}
     }
     Ok(out)
+}
+
+/// Write a vector of floats: a count and then the values.
+fn write_float_vector(out: &mut Vec<u8>, values: &[f32]) -> Result<()> {
+    out.write_i32_value(values.len() as i32, ORDER)?;
+    for value in values {
+        out.write_f32_value(*value, ORDER)?;
+    }
+    Ok(())
 }
 
 /// Serialise the body of a geometric transform attribute.

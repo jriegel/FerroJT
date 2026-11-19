@@ -181,11 +181,15 @@ fn write_text(out: &mut impl Write, text: &str) -> Result<()> {
 }
 
 /// Write the `"name"` member of a node.
-fn write_name(out: &mut impl Write, indent: i32, name: &str) -> Result<()> {
+///
+/// `comma` says whether anything is written after it. A node with no
+/// attributes and no children ends with its name, and a separator there leaves
+/// the object unparseable.
+fn write_name(out: &mut impl Write, indent: i32, name: &str, comma: bool) -> Result<()> {
     tabs(out, indent)?;
     out.write_all(b"\"name\":\"")?;
     write_text(out, name)?;
-    out.write_all(b"\",\n")?;
+    out.write_all(if comma { b"\",\n" } else { b"\"\n" })?;
     Ok(())
 }
 
@@ -473,6 +477,13 @@ pub fn recurse_down_the_tree(
     graph: &SceneGraph,
     node: &Node,
 ) -> Result<()> {
+    // What the writer of one member has to know: whether anything of this node
+    // follows it. A container node that lost every child — a level-of-detail
+    // span of a filtered write, a part whose representation was dropped —
+    // otherwise ends with a separator in front of its closing brace.
+    let has_children = !graph.children_of(node).is_empty();
+    let has_attributes = !graph.attributes_of(node).is_empty();
+
     if let Node::Partition(partition) = node {
         tabs(out, *indent)?;
         out.write_all(b"\"LSG\":\n")?;
@@ -481,8 +492,13 @@ pub fn recurse_down_the_tree(
         *indent += 1;
         tabs(out, *indent)?;
         out.write_all(b"\"jt_type\":\"Partition\",\n")?;
-        write_name(out, *indent, &partition.name)?;
-        handle_attributes_json(config, indent, out, graph, node)?;
+        write_name(
+            out,
+            *indent,
+            &partition.name,
+            has_children || has_attributes,
+        )?;
+        handle_attributes(config, indent, out, graph, node, has_children)?;
         handle_all_children_json(config, indent, out, graph, node)?;
         *indent -= 1;
         tabs(out, *indent)?;
@@ -509,7 +525,7 @@ pub fn recurse_down_the_tree(
     if let Node::Part(part) = node {
         tabs(out, *indent)?;
         out.write_all(b"\"jt_type\":\"Part\",\n")?;
-        write_name(out, *indent, &part.name)?;
+        write_name(out, *indent, &part.name, has_attributes || has_children)?;
         let meta = handle_late_loads_meta(graph, node.late_loads());
         if !meta.is_empty() {
             tabs(out, *indent)?;
@@ -518,12 +534,21 @@ pub fn recurse_down_the_tree(
             tabs(out, *indent)?;
             out.write_all(b",\"layer\":[")?;
             write_layers(out, &scan_for_layer(&meta))?;
-            out.write_all(b"],\n")?;
+            out.write_all(if has_attributes || has_children {
+                b"],\n"
+            } else {
+                b"]\n"
+            })?;
         }
     } else if let Node::MetaData(meta_data) = node {
         tabs(out, *indent)?;
         out.write_all(b"\"jt_type\":\"MetaData\",\n")?;
-        write_name(out, *indent, &meta_data.name)?;
+        write_name(
+            out,
+            *indent,
+            &meta_data.name,
+            has_attributes || has_children,
+        )?;
         let meta = handle_late_loads_meta(graph, node.late_loads());
         if !meta.is_empty() {
             tabs(out, *indent)?;
@@ -548,12 +573,17 @@ pub fn recurse_down_the_tree(
             tabs(out, *indent)?;
             out.write_all(b"\"active-layer-filter\":\"")?;
             write_text(out, &info.active)?;
-            out.write_all(b"\",\n")?;
+            out.write_all(if has_attributes || has_children {
+                b"\",\n"
+            } else {
+                b"\"\n"
+            })?;
         }
     } else if let Node::RangeLod(lod) = node {
         tabs(out, *indent)?;
         out.write_all(b"\"jt_type\":\"RangeLOD\",\n")?;
-        write_name(out, *indent, &lod.name)?;
+        // The centre and the limits always follow the name.
+        write_name(out, *indent, &lod.name, true)?;
         tabs(out, *indent)?;
         out.write_all(b"\"center\":[")?;
         write_numbers(out, &lod.center)?;
@@ -563,20 +593,25 @@ pub fn recurse_down_the_tree(
         // The reference walks its limit vector from index one, which drops the
         // leading entry; an empty vector stays empty.
         write_numbers(out, lod.limits.get(1..).unwrap_or(&[]))?;
-        out.write_all(b"],\n")?;
+        out.write_all(if has_attributes || has_children {
+            b"],\n"
+        } else {
+            b"]\n"
+        })?;
     } else if let Node::Lod(lod) = node {
         tabs(out, *indent)?;
         out.write_all(b"\"jt_type\":\"LOD\",\n")?;
-        write_name(out, *indent, &lod.name)?;
+        write_name(out, *indent, &lod.name, has_attributes || has_children)?;
     } else if let Node::Group(group) = node {
         tabs(out, *indent)?;
         out.write_all(b"\"jt_type\":\"Group\",\n")?;
-        write_name(out, *indent, &group.name)?;
+        write_name(out, *indent, &group.name, has_attributes || has_children)?;
     } else if let Node::Instance(instance) = node {
         tabs(out, *indent)?;
         out.write_all(b"\"jt_type\":\"Instance\",\n")?;
-        write_name(out, *indent, &instance.name)?;
-        handle_attributes_json(config, indent, out, graph, node)?;
+        // The instanced object always follows the attributes.
+        write_name(out, *indent, &instance.name, true)?;
+        handle_attributes(config, indent, out, graph, node, true)?;
         tabs(out, *indent)?;
         out.write_all(b"\"InstancedObject\":\n")?;
         if let Some(target) = graph
@@ -588,7 +623,7 @@ pub fn recurse_down_the_tree(
     } else if let Node::ShapeTriStripSet(shape) = node {
         tabs(out, *indent)?;
         out.write_all(b"\"jt_type\":\"TriStripSet\",\n")?;
-        write_name(out, *indent, &shape.name)?;
+        write_name(out, *indent, &shape.name, true)?;
         // The geometry follows the attributes, so the last attribute ends with
         // a separator. A shape whose representation is not in the file — a
         // coarse level of detail left out of a filtered write, or a
@@ -606,7 +641,7 @@ pub fn recurse_down_the_tree(
     }
 
     if !matches!(node, Node::Instance(_) | Node::ShapeTriStripSet(_)) {
-        handle_attributes_json(config, indent, out, graph, node)?;
+        handle_attributes(config, indent, out, graph, node, has_children)?;
         handle_all_children_json(config, indent, out, graph, node)?;
     }
     *indent -= 1;

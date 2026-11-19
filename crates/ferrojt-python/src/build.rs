@@ -31,9 +31,10 @@ fn class_of(name: &str) -> PyResult<RustClass> {
         "group" => Ok(RustClass::Group),
         "shape" => Ok(RustClass::Shape),
         "instance" => Ok(RustClass::Instance),
+        "rangelod" | "rangelode" => Ok(RustClass::RangeLod),
         other => Err(PyValueError::new_err(format!(
-            "unknown node class {other:?}; use Partition, Part, MetaData, Group, Shape or \
-             Instance"
+            "unknown node class {other:?}; use Partition, Part, MetaData, Group, Shape, \
+             Instance or RangeLOD"
         ))),
     }
 }
@@ -47,6 +48,7 @@ fn class_name(class: RustClass) -> &'static str {
         RustClass::Group => "Group",
         RustClass::Shape => "Shape",
         RustClass::Instance => "Instance",
+        RustClass::RangeLod => "RangeLOD",
     }
 }
 
@@ -577,8 +579,9 @@ impl Builder {
     /// Add a node of `class_name` under `parent` and return its handle.
     ///
     /// `class_name` is a JT class name: `Partition`, `Part`, `MetaData`,
-    /// `Group`, `Shape` or `Instance`. A `Shape` or `Instance` node cannot have
-    /// children.
+    /// `Group`, `Shape`, `Instance` or `RangeLOD`. A `Shape` or `Instance` node
+    /// cannot have children.
+    #[pyo3(signature = (parent, class_name, name = None))]
     fn add_node(
         slf: Py<Self>,
         py: Python<'_>,
@@ -593,6 +596,31 @@ impl Builder {
             let node = builder
                 .inner
                 .add_node(parent.node, class, name)
+                .map_err(py_err)?;
+            (node, builder.id)
+        };
+        NodeHandle::new(py, &slf, id, node)
+    }
+
+    /// Add a node that no parent refers to and return its handle.
+    ///
+    /// Such a node only reaches the file through [`Builder::instance_of`],
+    /// which is how a JT file shares a subtree: the instance names its target
+    /// instead of holding it as a child, so the target must not hang under the
+    /// root as well.
+    #[pyo3(signature = (class_name, name = None))]
+    fn add_detached_node(
+        slf: Py<Self>,
+        py: Python<'_>,
+        class_name: &str,
+        name: Option<&str>,
+    ) -> PyResult<Py<NodeHandle>> {
+        let class = class_of(class_name)?;
+        let (node, id) = {
+            let mut builder = slf.bind(py).borrow_mut();
+            let node = builder
+                .inner
+                .add_detached_node(class, name)
                 .map_err(py_err)?;
             (node, builder.id)
         };

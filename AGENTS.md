@@ -134,9 +134,13 @@ Upload with `python -m twine upload dist\*`.
   position under `RangeLod` (first group = 0, next = 1, …). Segment type cannot
   identify it — JT 8.x/10.x use types 7..10 for LOD0..LOD3, but JT 9.x uses type 6
   ("Shape") for every tier. `to_model()` exports only the finest tier, mirroring
-  `example/ToolsLib/src/JtGltfMesh.cpp`; the state is `LodWalk { inside, level }`
-  threaded through `build_node`. Nodes are never dropped, only geometry, and each
-  mesh records `Mesh::lod_level`. `jt::dump` is *not* filtered.
+  `example/ToolsLib/src/JtGltfMesh.cpp`; the state is
+  `LodWalk { inside, level, tiers }` threaded through `build_node`. Only the
+  **direct** children of a range span are tiers — `for_child()` clears `tiers` one
+  level down — because a span may wrap an assembly whose nested groups are not
+  tiers; the reference counts any nested group, which is invisible in the samples
+  and fatal for a written wrapper. Nodes are never dropped, only geometry, and
+  each mesh records `Mesh::lod_level`. `jt::dump` is *not* filtered.
 - Pinned LOD0 counts (`crates/ferrojt/tests/model.rs`): block 8.1/9.5/10.3 →
   1 mesh / 12 triangles; plate1-8.0 → 2 / 617; plate1-9.5 → 2 / 486.
   `tests/test_ferrojt.py` asserts `mesh_count == 1`, `triangle_count == 12`.
@@ -827,6 +831,13 @@ Upload with `python -m twine upload dist\*`.
   accessor is `class_of` (`#[pyo3(name = "class_of")]`) and `add_node`'s
   parameter is `class_name`; `add_shape(parent, mesh, *, name=None)`.
   `MeshData.bounds` returns a **list** of six, not a tuple.
+  `add_node`/`add_detached_node` need a `#[pyo3(signature = (…, name = None))]`
+  or the optional name is a required positional argument; the stub in
+  `_ferrojt.pyi` says `name: str | None = ...` and would lie without it.
+  `class_name` accepts `"RangeLOD"` (also `rangelod`/`rangelode`).
+  **A new `BuildNode` variant must be covered in `src/build.rs::class_name` or
+  the cdylib fails to build** (`error[E0004]: pattern … not covered`) — `maturin
+  develop` breaks before any test runs.
 - **Python writing entry points**: `JtFile.write_jt(path, *, layer_filter=None,
   all_layers=False, all_lods=False, compress=False, version=None)` and
   `JtBuilder.version` / `set_version()`. `version` is a **string** (`"10.3"`,
@@ -860,23 +871,51 @@ Upload with `python -m twine upload dist\*`.
   `x y z w`) and leaves the geometry alone — bounds of a 100×80×60 mm block are
   unchanged. Unknown unit/up axis → `Error::Unsupported`.
 - **A glTF hop erases every JT node class.** A file written from a `Model` is
-  exactly `Partition 1 · Shape = meshes · Group = nodes − meshes · Instance = extra`;
+  exactly `Partition 1 · MetaData 1 · Part 1 · RangeLOD 1 ·
+  Shape = meshes · Group = nodes − meshes + 1 · Instance = extra + 1`;
   `Node::kind` is the free-form class carrier that round-trips through
   `class_of`, and anything unknown becomes `Group`. Written LSG node count ==
-  `model.nodes.len() + 1 + instances`.
-- **A built file is structurally thinner than a CAD file — that is the next
-  loading risk after the root name.** Samples: `Partition → MetaData → Instance →
-  Part → RangeLod → Group×3 → Shape×3` (11 nodes, 14 atoms, 67 property atoms, 9
-  TOC rows incl. PMI(3), Material(8/9), B-rep(17), InfoSegment(31)). Ours:
+  `model.nodes.len() + 6 + instances` for a glTF-sourced model, `+ 1` for a
+  JT-sourced one — `already_wrapped()` sees a `Partition`/`Part`/`MetaData`/`LOD`/
+  `RangeLOD` class in the model and skips the wrapper.
+- **A converted file must carry the chain a consumer walks.** Shapes straight
+  under the root partition leave a strict importer with nothing, which is the
+  "the external program cannot load the converted JT" report. `Writer::wrap` in
+  `jt/from_model.rs` puts `Partition → MetaData → Instance → Part → RangeLOD →
+  Group` under the root and hangs the graph of the model on that group, mirroring
+  every sample. Two details bite: the `Part` is created with
+  `JtBuilder::add_detached_node` and **referred to** by the `Instance` (an
+  instance holds no children, so `add_node(instance, …)` is refused and a detached
+  node nothing refers to is reported as unreachable), and the `RangeLOD` hangs
+  under the **part**. The instance is named `<stem>.part` (`part_name`, after the
+  `_model1_117.part` of the samples); the part node stays unnamed, as in the
+  samples. The span holds exactly **one** tier — LOD 0, the only one a neutral
+  model has. Pinned by `a_converted_file_wraps_its_graph_in_the_classes_a_consumer_walks`
+  (Rust, `tests/gltf.rs`) and the same-named Python test, and by
+  `a_level_of_detail_span_can_be_built_by_hand` (`tests/build.rs`) /
+  `test_a_level_of_detail_span_can_be_built_by_hand` (`tests/test_build.py`) for
+  the hand-built side.
+- **`jt::dump` closes every member with a `comma` flag.** A container node that
+  lost all of its children — a filtered `RangeLOD`, a `Part` whose representation
+  was dropped — otherwise ends `"name":"",` right before `}` and the JSON will
+  not parse. `write_name(.., comma)` and the terminator of each following member
+  take it; `recurse_down_the_tree` computes `has_children`/`has_attributes` once.
+  Writing `b"\n"` instead of `b"\"\n"` for the no-comma case drops the closing
+  quote and reads as `Invalid control character`. None of the six reference dumps
+  has a dangling comma (`target\dangling.py` counts them), so byte parity is
+  untouched.
+- **A bare built file is structurally thinner than a CAD file.** Samples:
+  `Partition → MetaData → Instance → Part → RangeLod → Group×3 → Shape×3`
+  (11 nodes, 14 atoms, 67 property atoms, 9 TOC rows incl. PMI(3), Material(8/9),
+  B-rep(17), InfoSegment(31)). `JtBuilder` on its own still writes
   `Partition(+GeometricTransform) → Shape(+Material)` (2 nodes, 4 atoms, 6
-  properties, 2 TOC rows). There is **no `MetaData` node and no type-4 Meta Data
-  segment**, no `Part`, no `RangeLod`/`Group` wrapper, and the segment GUIDs are
-  synthetic counters (`00000000-0000-0000-fe00-00000000000N`), not UUIDs. Every
-  reader in this workspace is fine with that; a consumer that insists on a `Part`
-  under the root is not. Also: the `Partition` node-count range is the written
-  graph, not the instance-expanded one (2 vs the samples' 7/18/4489), and the
-  trailing `size` of a `Shape` stays `0` (samples 2084/1712/1112) because no
-  reader uses it.
+  properties, 2 TOC rows) — the wrapper chain is `from_model`'s job, not the
+  builder's, and a hand-built graph has to add it itself. What stays thin in
+  both: there is **no type-4 Meta Data segment**, and the segment GUIDs are
+  synthetic counters (`00000000-0000-0000-fe00-00000000000N`), not UUIDs. Also:
+  the `Partition` node-count range is the written graph, not the instance-expanded
+  one (2 vs the samples' 7/18/4489), and the trailing `size` of a `Shape` stays
+  `0` (samples 2084/1712/1112) because no reader uses it.
 - **`ShapeStats::of` counts distinct (position, normal) pairs**, which is what the
   partition count range reports — 26 for the exploded flat-normal cube — while the
   written 8.x representation declares 36 slots. For a glTF cube both are 24, so no
@@ -891,8 +930,8 @@ Upload with `python -m twine upload dist\*`.
   **is** a property (a different type), so the two do not mirror each other here.
 - **The pytest summary line never surfaces under redirection** (Open3D/Vulkan
   native output interleaves), so `Select-String 'passed|failed'` finds nothing.
-  Trust `$LASTEXITCODE` plus `pytest --co -q` per file: 22 build + 67 ferrojt +
-  11 visual = **100**.
+  Trust `$LASTEXITCODE` plus `pytest --co -q` per file: 23 build + 68 ferrojt +
+  11 visual = **102**.
 - **Parallel tests need pid *and* an atomic counter in the temp file name** — the
   pid alone collides across the worker processes of one run.
 - **Picture parity for a written file must be measured one process per picture**

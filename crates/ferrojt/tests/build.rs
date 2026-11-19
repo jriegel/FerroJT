@@ -295,6 +295,101 @@ fn the_scene_graph_of_a_built_file_survives_the_round_trip() {
 }
 
 #[test]
+fn a_level_of_detail_span_can_be_built_by_hand() {
+    // The chain a consumer walks down to the geometry: partition, meta data, an
+    // instance naming a part, that part, and a level-of-detail span holding one
+    // tier. The part is detached because an instance *refers* to its target
+    // instead of holding it as a child, so the target must not hang under the
+    // root as well — and a node nothing refers to is refused, so the instance
+    // has to name it. The span hangs under the part, because an instance itself
+    // has no children: it carries only the placement and the reference.
+    let mut build = JtBuilder::new();
+    let root = build.root();
+    let meta = build
+        .add_node(root, BuildNode::MetaData, None)
+        .expect("the root takes a meta data node");
+    let part = build
+        .add_detached_node(BuildNode::Part, Some("cube"))
+        .expect("a detached part can be created");
+    build
+        .instance_of(root, part)
+        .expect("a detached part can be instanced");
+    let span = build
+        .add_node(part, BuildNode::RangeLod, None)
+        .expect("a part takes a level-of-detail span");
+    let tier = build
+        .add_node(span, BuildNode::Group, None)
+        .expect("a span takes a tier");
+    build
+        .add_shape(tier, "cube shape", cube())
+        .expect("a tier takes a shape");
+    assert_eq!(meta.index(), 1, "a detached node takes no slot of its own");
+
+    let bytes = build
+        .write_to_bytes()
+        .expect("the chain can be written as it was built");
+    let file = parse(&bytes);
+    let lsg = graph(&file);
+    assert_eq!(
+        classes(&file),
+        [
+            "Partition",
+            "MetaData",
+            "Instance",
+            "Part",
+            "RangeLOD",
+            "Group",
+            "Shape"
+        ],
+        "the walk reaches the shape through the classes of a CAD file"
+    );
+
+    let root = lsg.root().expect("a root node");
+    assert_eq!(
+        lsg.children_of(root),
+        vec![Some(1), Some(2)],
+        "only the meta data node and the instance hang off the partition"
+    );
+
+    let instance = lsg.node_at(2).expect("the instance");
+    assert_eq!(
+        lsg.instance_target(instance),
+        Some(3),
+        "the instance refers to the part instead of containing it"
+    );
+    assert!(
+        lsg.children_of(instance).is_empty(),
+        "an instance carries the placement and the reference, no children"
+    );
+
+    let part = lsg.node_at(3).expect("the part");
+    assert_eq!(part.class_name(), "Part");
+    assert_eq!(part.name(), "cube", "the name travelled through the table");
+    assert_eq!(
+        lsg.children_of(part),
+        vec![Some(4)],
+        "the part holds its level-of-detail span"
+    );
+
+    let span = lsg.node_at(4).expect("the level-of-detail span");
+    assert_eq!(span.class_name(), "RangeLOD");
+    assert_eq!(
+        lsg.children_of(span),
+        vec![Some(5)],
+        "the span holds the one tier a neutral model has"
+    );
+    assert_eq!(
+        lsg.children_of(lsg.node_at(5).expect("the tier")),
+        vec![Some(6)]
+    );
+
+    let shape = lsg.node_at(6).expect("the shape");
+    assert_eq!(shape.name(), "cube shape");
+    assert_eq!(shape.late_loads().len(), 1, "the shape keeps its shape");
+    assert!(file.segment_offset(&shape.late_loads()[0].guid).is_some());
+}
+
+#[test]
 fn the_root_partition_names_the_file_it_belongs_to() {
     // A consumer that builds a scene graph of its own creates the root node
     // from the file name of the root partition and refuses a file whose

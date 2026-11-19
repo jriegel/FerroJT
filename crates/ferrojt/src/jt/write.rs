@@ -314,12 +314,28 @@ fn collect_kinds(
             continue;
         };
         let child_pos = plan.kept[*child].pos;
-        collect_kinds(graph, plan, child_pos, tier, version, kinds, path)?;
+        collect_kinds(
+            graph,
+            plan,
+            child_pos,
+            tier.for_child(),
+            version,
+            kinds,
+            path,
+        )?;
         tier.next_tier(graph.nodes[child_pos].node.class_name());
     }
     if let Some(target) = kept.target {
         let target_pos = plan.kept[target].pos;
-        collect_kinds(graph, plan, target_pos, tier, version, kinds, path)?;
+        collect_kinds(
+            graph,
+            plan,
+            target_pos,
+            tier.for_child(),
+            version,
+            kinds,
+            path,
+        )?;
     }
     path.remove(&pos);
     Ok(())
@@ -447,12 +463,12 @@ impl Plan {
                 self.kept[index].children.push(None);
                 continue;
             };
-            let kept = self.walk(graph, options, filter, child, tier);
+            let kept = self.walk(graph, options, filter, child, tier.for_child());
             self.kept[index].children.push(Some(kept));
             tier.next_tier(graph.nodes[child].node.class_name());
         }
         if let Some(target) = graph.instance_target(node) {
-            let kept = self.walk(graph, options, filter, target, tier);
+            let kept = self.walk(graph, options, filter, target, tier.for_child());
             self.kept[index].target = Some(kept);
         }
         index

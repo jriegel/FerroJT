@@ -55,7 +55,8 @@ each other:
 | Item | Behaviour |
 | --- | --- |
 | `JtBuilder::new()` / `JtBuilder::default()` | An empty file: one root `Partition`, no meshes, JT 10.3. |
-| `add_node(parent, class, name)` | Add a `Partition`/`Part`/`MetaData`/`Group`/`Shape`/`Instance` node. |
+| `add_node(parent, class, name)` | Add a `Partition`/`Part`/`MetaData`/`Group`/`Shape`/`Instance`/`RangeLOD` node. |
+| `add_detached_node(class, name)` | Add a node no child list refers to, for an `Instance` to point at. |
 | `add_shape(parent, name, mesh)` | Add a `Shape` node holding a mesh. |
 | `instance_of(parent, target)` | Share the subtree of `target` instead of copying it. |
 | `add_mesh(mesh)` / `set_mesh(node, mesh)` | Keep a mesh without a node, then attach it. |
@@ -69,6 +70,31 @@ each other:
 Handles are opaque: `JtNode(usize)` and `JtMesh(usize)` have private fields, so
 outside the crate they are tokens, and every operation checks that a token
 belongs to the builder it is used with.
+
+## The chain a consumer walks
+
+A consumer that builds a scene graph of its own does not look for shapes under
+the root partition — it walks down to a **part** and reads the geometry under the
+level-of-detail span of that part. Every sample stores it the same way:
+
+```text
+Partition -> MetaData -> Instance -> Part -> RangeLOD -> Group -> Shape
+```
+
+Two details of that chain are easy to get wrong, and both are what
+`a_level_of_detail_span_can_be_built_by_hand` pins:
+
+* The `Part` is **not a child** of the node above it. An `Instance` refers to it
+  through the target of its element and carries the placement, so the part is
+  created with `add_detached_node` and must be named by some `instance_of` — a
+  node nothing refers to is reported as unreachable.
+* The `RangeLOD` hangs under the **part**, not under the instance: an instance
+  node has no children at all, which `add_node` refuses.
+
+A `RangeLOD` element is written byte for byte as the samples store it — the
+second version field only from JT 9.x on, then the centre, the signal and the
+triangle-count limits. The tier of a span is a plain `Group`; JT never encodes
+which tier a group is, the position under the span is the tier.
 
 ## Naming the root partition
 

@@ -103,8 +103,13 @@ That gives the invariant `the_neutral_graph_of_a_sample_survives_the_hop` pins:
 a file written from a model is exactly
 
 ```text
-Partition 1 · Shape = meshes · Group = nodes − meshes · Instance = extra placements
+Partition 1 · MetaData 1 · Part 1 · RangeLOD 1
+Shape = meshes · Group = nodes − meshes + 1 · Instance = extra placements + 1
 ```
+
+The five extra nodes are the wrapper of the next section; the `+1` on `Group` is
+the tier group of that wrapper, and the `+1` on `Instance` is the instance that
+names the wrapper part.
 
 Two demotions are deliberate. A `Shape` node whose mesh has no geometry becomes
 a `Group` (glTF mandates a `POSITION` attribute, and an empty JT shape is not
@@ -112,6 +117,36 @@ worth writing) — the same policy the reader applies to the 36 empty
 representations of the server sample. And a node holding several representations
 keeps only the first, because the builder has no level-of-detail node; the
 reader collects tiers finest-first, so that is the finest one.
+
+## The wrapper chain
+
+Shapes straight under the root partition are not what a consumer walks. It
+descends from the partition to a **part** and reads the geometry under the
+level-of-detail span of that part, so a file whose graph skips that chain reads
+as one that will not load — which is exactly what a converted glTF file used to
+be. `Writer::wrap` therefore puts the chain of the samples under the root:
+
+```text
+Partition -> MetaData -> Instance -> Part -> RangeLOD -> Group -> the graph of the model
+```
+
+* The `Part` is created with `add_detached_node` and named by the `Instance`,
+  because an instance *refers* to its target instead of holding it as a child —
+  that is where a JT file stores a part and its placement.
+* The instance is named `<stem>.part` after the file (`part_name`), mirroring the
+  `_model1_117.part` of the block samples. The part node itself stays unnamed,
+  as in the samples.
+* The span holds exactly **one** tier, a `Group`, because a neutral model has one
+  representation per node — LOD 0, the finest. `a_converted_file_wraps_its_graph_in_the_classes_a_consumer_walks`
+  walks the six classes and pins that single tier.
+* `already_wrapped` stops a second chain: a model that came out of a JT file
+  already carries `Partition`/`Part`/`MetaData`/`LOD`/`RangeLOD` classes, so its
+  graph is written as it is and gains only the root partition.
+
+`a_converted_file_wraps_its_graph_in_the_classes_a_consumer_walks` (Rust) and
+`test_a_converted_file_wraps_its_graph_in_the_classes_a_consumer_walks` (Python)
+pin the chain from both sides, including that the instance has no children and
+that the triangles under the tier are those of the source file.
 
 ## Instancing
 
@@ -196,7 +231,8 @@ the refusal above.
 ## What does not survive
 
 - Level of detail: the model has no tier, so a hop leaves one representation per
-  part. `jt::dump` and `JtFile.lsg` keep every tier; the model does not.
+  part — the wrapper span holds a single tier. `jt::dump` and `JtFile.lsg` keep
+  every tier; the model does not.
 - Non-triangle primitives: `POINTS`, `LINES` and the strip topologies are refused
   rather than re-indexed.
 - JT key/value properties: they live in `Node::extras`, which the builder has no

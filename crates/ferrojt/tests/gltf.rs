@@ -464,7 +464,7 @@ fn expectation(path: &Path) -> Expected {
     let block = || Expected {
         major: 10,
         minor: 3,
-        nodes: 11,
+        nodes: 16,
         meshes: 1,
         triangles: 12,
         materials: 1,
@@ -477,7 +477,7 @@ fn expectation(path: &Path) -> Expected {
         _ if stem.contains("Server") => Expected {
             major: 8,
             minor: 1,
-            nodes: 2_688,
+            nodes: 2_693,
             meshes: 105,
             triangles: 124_154,
             materials: 20,
@@ -485,7 +485,7 @@ fn expectation(path: &Path) -> Expected {
         _ if stem.contains("example_block_jt8.1") => block(),
         _ if stem.contains("example_block_jt9.5") => block(),
         _ if stem.contains("example_block_jt10.3") => Expected {
-            nodes: 12,
+            nodes: 17,
             ..block()
         },
         // One screw of the older plate is not a closed two-manifold, so that
@@ -493,13 +493,13 @@ fn expectation(path: &Path) -> Expected {
         _ if stem.contains("plate1_jt8.0") => Expected {
             major: 8,
             minor: 1,
-            nodes: 27,
+            nodes: 32,
             meshes: 2,
             triangles: 617,
             materials: 2,
         },
         _ if stem.contains("plate1_jt9.5") => Expected {
-            nodes: 23,
+            nodes: 28,
             meshes: 2,
             triangles: 486,
             materials: 2,
@@ -531,8 +531,10 @@ fn every_sample_goes_from_glb_to_jt() {
         let _ = std::fs::remove_file(&path);
         let model = out.to_model();
 
-        // One node more than the neutral graph that went in: the root partition
-        // the builder always adds, which is where the unit conversion lives.
+        // Five nodes more than the neutral graph that went in: the root
+        // partition the builder always adds, which is where the unit conversion
+        // lives, and the meta data, instance, part, level-of-detail span and
+        // tier group a consumer walking the graph for a part expects to find.
         assert_eq!(
             model.nodes.len(),
             want.nodes,
@@ -661,6 +663,140 @@ fn a_converted_file_names_its_root_partition() {
         path.file_stem().expect("a stem").to_string_lossy() + ".jt",
         "a file on disk names its root after itself"
     );
+}
+
+#[test]
+fn a_converted_file_wraps_its_graph_in_the_classes_a_consumer_walks() {
+    // A consumer that builds a scene graph of its own walks from the root
+    // partition down to a part and reads the geometry under the level-of-detail
+    // span of that part. Shapes straight under the partition — which is what an
+    // unwrapped conversion used to write — leave that walk with nothing. So the
+    // writer mirrors the chain of the samples:
+    //
+    //   Partition -> MetaData -> Instance -> Part -> RangeLOD -> Group -> Shape
+    //
+    // with the instance *referring* to the part rather than containing it, and
+    // exactly one tier in the span, because a neutral model has one level of
+    // detail.
+    let source = sample("example_block_jt9.5");
+    let (file, _, _, again) = through_glb(&source);
+    let bytes = jt::model_to_bytes(&again, None).expect("writing must work");
+    let out = written(&source, &bytes);
+    let graph = out.lsg.as_ref().expect("a scene graph");
+
+    // The chain, walked from the root down to the tier group. An instance does
+    // not hold its target as a child, so the walk follows the reference
+    // instead. Below the tier group the graph of the model continues, and that
+    // part is not part of the wrapper.
+    let mut path: Vec<String> = Vec::new();
+    let mut pos = graph.root.expect("a root node");
+    let mut span = None;
+    let mut part = None;
+    for _ in 0..6 {
+        let node = graph.node_at(pos).expect("a node");
+        let class = node.class_name();
+        path.push(class.to_string());
+        if class == "RangeLOD" {
+            span = Some(pos);
+        }
+        if class == "Part" {
+            part = Some(pos);
+        }
+        let next = if class == "Instance" {
+            graph.instance_target(node).expect("an instance target")
+        } else {
+            let mut children = graph.children_of(node).into_iter().flatten();
+            let Some(next) = children.next() else { break };
+            assert!(
+                children.next().is_none(),
+                "the wrapper chain must not branch: {class} has more than one child"
+            );
+            next
+        };
+        pos = next;
+    }
+    assert_eq!(
+        path,
+        [
+            "Partition",
+            "MetaData",
+            "Instance",
+            "Part",
+            "RangeLOD",
+            "Group"
+        ],
+        "the classes from the root down to the tier group"
+    );
+
+    // The instance refers to the part instead of holding it as a child.
+    let instance = graph
+        .node_at(2)
+        .and_then(|node| graph.instance_target(node))
+        .expect("the instance must name its target");
+    assert_eq!(
+        Some(instance),
+        part,
+        "the instance of the wrapper refers to the part"
+    );
+
+    // The span holds exactly one tier group — the finest, and the only one a
+    // neutral model has — and geometry hangs under it.
+    let span = graph
+        .node_at(span.expect("a level-of-detail span"))
+        .expect("the span");
+    let tiers = graph.children_of(span);
+    assert_eq!(tiers.len(), 1, "the span holds one tier");
+    assert_eq!(
+        graph
+            .node_at(tiers[0].expect("the tier group"))
+            .expect("the tier")
+            .class_name(),
+        "Group",
+        "a tier of a range span is a group"
+    );
+    assert!(
+        !finest_triangles(&out).is_empty(),
+        "the geometry must hang under the tier group"
+    );
+    assert!(
+        classes(&out).iter().any(|class| class == "Shape"),
+        "a shape node must sit under the tier group"
+    );
+
+    // The same triangles the source's finest tier holds, so the chain did not
+    // move the geometry out of reach of the LOD walk.
+    assert_eq!(
+        finest_triangles(&out),
+        finest_triangles(&file),
+        "walking the span of the written file finds the geometry of the source"
+    );
+}
+
+#[test]
+fn a_converted_file_dumps_as_valid_json() {
+    // The wrapper chain ends in a tier group whose children are the shapes of
+    // the model, and a shape is not part of the dump. So the group is written
+    // with no children at all, and every member the dump writer emits before it
+    // must close without a separator — a dangling comma makes the whole dump
+    // unparseable. None of the samples hits that case, so it is pinned here.
+    let source = sample("example_block_jt9.5");
+    let (_, _, _, again) = through_glb(&source);
+    for version in [JtVersion::V8_1, JtVersion::V10_3] {
+        let bytes = jt::model_to_bytes(&again, Some(version))
+            .unwrap_or_else(|err| panic!("JT {version}: writing failed: {err}"));
+        let out = written(&source, &bytes);
+        for config in [
+            ferrojt::jt::DUMP_TOC,
+            ferrojt::jt::DUMP_TOC | ferrojt::jt::DUMP_MESH,
+            ferrojt::jt::DUMP_ALL,
+        ] {
+            let text = jt::dump(&out, config, 1)
+                .unwrap_or_else(|err| panic!("JT {version}, config {config}: {err}"));
+            serde_json::from_str::<serde_json::Value>(&text).unwrap_or_else(|err| {
+                panic!("JT {version}, config {config}: the dump of a written file: {err}")
+            });
+        }
+    }
 }
 
 #[test]
@@ -1001,8 +1137,8 @@ fn a_shared_subtree_is_instantiated_not_copied() {
     let out = written(&source, &bytes);
     assert_eq!(
         instance_count(&out),
-        1,
-        "the shared screw must be instanced"
+        2,
+        "the shared screw must be instanced, next to the instance of the wrapper part"
     );
     // One representation, not two: the share survived rather than a copy.
     assert_eq!(
@@ -1017,9 +1153,9 @@ fn the_neutral_graph_of_a_sample_survives_the_hop() {
     // A written file states the neutral graph, not the JT graph it came from:
     // the glTF hop erases every JT node class, so the writer re-derives the
     // classes from the shape of the graph. The invariant is exactly one root
-    // partition, one shape per mesh, and a group for every other node — the
-    // parts, meta data nodes and LOD containers of the source all collapse to
-    // groups — plus one instance per share.
+    // partition, the wrapper chain a consumer walks down to a part, one shape
+    // per mesh, and a group for every other node — the parts, meta data nodes
+    // and LOD containers of the source all collapse to groups.
     for source in samples() {
         let label = name(&source);
         let (file, _, _, again) = through_glb(&source);
@@ -1039,10 +1175,20 @@ fn the_neutral_graph_of_a_sample_survives_the_hop() {
         );
         assert_eq!(
             of("Group"),
-            again.nodes.len() - again.meshes.len(),
-            "{label}: every other node becomes a group\n{}",
+            again.nodes.len() - again.meshes.len() + 1,
+            "{label}: every other node becomes a group, plus the tier group of the wrapper\n{}",
             classes(&out).join(" ")
         );
+        // A neutral graph has none of the classes a CAD writer puts between its
+        // root partition and its shapes, so the hop adds exactly one of each.
+        for class in ["MetaData", "Part", "RangeLOD"] {
+            assert_eq!(
+                of(class),
+                1,
+                "{label}: the graph gains exactly one {class} node\n{}",
+                classes(&out).join(" ")
+            );
+        }
         // Nothing else is ever emitted, and no node of the neutral graph is
         // lost on the way.
         let total: usize = got.values().sum();
@@ -1051,9 +1197,15 @@ fn the_neutral_graph_of_a_sample_survives_the_hop() {
             out.lsg.as_ref().expect("a scene graph").nodes.len(),
             "{label}: the class multiset must cover the whole graph"
         );
+        assert_eq!(
+            total,
+            again.nodes.len() + 5 + of("Instance"),
+            "{label}: the root partition, the five wrapper nodes, the graph of the \
+             model and one instance node per share"
+        );
         assert!(
-            of("Instance") <= again.nodes.len(),
-            "{label}: an instance per shared visit at most"
+            of("Instance") <= again.nodes.len() + 1,
+            "{label}: an instance per shared visit at most, plus the wrapper one"
         );
         // The source graph is richer: it names the classes the hop erases.
         assert!(

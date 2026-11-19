@@ -1068,15 +1068,76 @@ def test_a_glb_file_writes_back_out_as_jt(tmp_path) -> None:
     assert banner(str(target)).startswith("Version 10.3")
 
     again = ferrojt.open(str(target))
-    # The builder adds its root partition, so the graph is one node deeper than
-    # the glTF document it was built from.
-    assert again.node_count == source.node_count + 1
+    # The builder adds its root partition, and a graph that came out of glTF
+    # gains the chain a consumer walks down to a part — meta data, instance,
+    # part, level-of-detail span and tier group — so the graph is six nodes
+    # deeper than the glTF document it was built from.
+    assert again.node_count == source.node_count + 6
     assert again.mesh_count == source.mesh_count
     assert again.triangle_count == source.triangle_count
     # The export keeps only the finest tier, so that is the tier to compare.
     # The three tiers of the source are *not* identical — they are the same
     # cube at three quantisations — so the full set of the file cannot match.
     assert finest_triangle_set(str(target)) == finest_triangle_set(str(BLOCK_95))
+
+
+@needs_sample
+def test_a_converted_file_wraps_its_graph_in_the_classes_a_consumer_walks(
+    tmp_path,
+) -> None:
+    """A glTF conversion gains the chain of a CAD file.
+
+    A consumer that builds a scene graph of its own walks from the root
+    partition down to a part and reads the geometry under the level-of-detail
+    span of that part. Shapes straight under the partition leave that walk with
+    nothing, which reads as a file that will not load. So the writer mirrors the
+    chain of the samples, with the instance *referring* to the part rather than
+    containing it, and one tier in the span because a neutral model has one
+    level of detail.
+    """
+    source = ferrojt.open(str(BLOCK_95))
+    glb = tmp_path / "block.glb"
+    source.save(str(glb))
+
+    target = tmp_path / "chain.jt"
+    ferrojt.open(str(glb)).save(str(target))
+
+    file = ferrojt.JtFile(str(target))
+    assert file.open()
+    graph = file.lsg
+    assert graph is not None
+
+    chain: list[str] = []
+    node = graph.root()
+    assert node is not None
+    while True:
+        chain.append(node.class_name)
+        if node.class_name == "RangeLOD":
+            break
+        node = (
+            node.instance_target()
+            if node.is_instance
+            else node.children()[0]
+        )
+    assert chain == ["Partition", "MetaData", "Instance", "Part", "RangeLOD"], (
+        "the classes from the root down to the level-of-detail span"
+    )
+
+    # The instance refers to the part instead of holding it as a child.
+    instance = next(n for n in graph.nodes() if n.is_instance)
+    assert instance.instance_target().class_name == "Part"
+    assert instance.child_count() == 0, "an instance holds no child"
+    assert instance.name == "chain.part", "the instance is named after the file"
+
+    # The span holds exactly one tier — the finest, and the only one a neutral
+    # model has — and the geometry hangs under it.
+    spans = [n for n in graph.nodes() if n.class_name == "RangeLOD"]
+    assert len(spans) == 1, "the wrapper adds exactly one level-of-detail span"
+    tiers = spans[0].children()
+    assert len(tiers) == 1, "one level of detail, because the model has one"
+    assert tiers[0].class_name == "Group", "a tier of a range span is a group"
+    assert graph.representation_count == source.mesh_count
+    assert sum(mesh.triangle_count for mesh in graph.meshes()) == source.triangle_count
 
 
 @needs_sample
