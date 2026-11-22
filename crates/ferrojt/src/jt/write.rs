@@ -893,8 +893,8 @@ impl Writer<'_> {
     /// The class version cannot be kept. A strict consumer reads it to look the
     /// class up and refuses the whole file when the value names nothing it
     /// knows, so a JT 9.x atom rewritten into a JT 10.x file has to store the
-    /// version a JT 10.x file uses. The framing of the source is kept — a
-    /// consumer takes the value, not the width of the field.
+    /// version a JT 10.x file uses — and it has to store it at the width of the
+    /// target revision, which [`set_property_class`] explains.
     fn write_property_atom(&self, out: &mut Vec<u8>, atom: &Atom, new: i32) -> Result<()> {
         let order = self.file.header.order;
         let source_major = self.file.header.major;
@@ -928,12 +928,12 @@ impl Writer<'_> {
         };
         let Some(new_body) = new_body else {
             // Nothing to re-serialise: keep the atom as the source wrote it,
-            // except for the two fields a rewrite at another revision has to
+            // except for the fields a rewrite at another revision has to
             // correct and that can be reached without parsing the body.
             let mut bytes = atom.bytes.clone();
             let start = OBJECT_ID_OFFSET;
             bytes[start..start + 4].copy_from_slice(&ordered_i32(new, order));
-            set_property_class(&mut bytes, order, source_major, class);
+            set_property_class(&mut bytes, order, source_major, self.version, class)?;
             out.extend_from_slice(&bytes);
             return Ok(());
         };
@@ -1158,16 +1158,32 @@ fn late_loaded_property_body(
     Ok(out)
 }
 
-/// Write the class version of a property atom that is kept as the source wrote it.
+/// Re-frame the class versions of a property atom that is kept as the source wrote it.
 ///
-/// The field is a byte from JT 10.x on and a word below, and a file can hold an
-/// atom framed the other way, so the width is taken from the atom itself: it is
-/// the framing that puts the state word where it belongs. An atom whose state is
-/// nowhere to be found is left alone rather than guessed at.
-fn set_property_class(atom: &mut [u8], order: ByteOrder, major: u32, class: u32) {
-    if major <= 8 {
+/// A property atom body is a class version, the state word, a second class
+/// version and the value, and each version field is a byte from JT 10.x on and
+/// a word below. The width belongs to the revision the file is **written** at,
+/// not to the one it came from: a consumer reads the state word to find the
+/// value, so an atom kept at the width of the source makes it read the value
+/// two bytes early. That is not harmless — a strict consumer stops reading the
+/// property table at the first atom it cannot make sense of, which on a JT 9.x
+/// file rewritten at JT 10.x means the shape late loads further down the table
+/// are never found and the file loads with no geometry at all.
+///
+/// The width is found from the atom itself: it is the framing that puts the
+/// state word where it belongs. An atom whose state is nowhere to be found is
+/// left alone rather than guessed at. Re-framing changes the length of the
+/// body, so the length prefix of the atom is rewritten as well.
+fn set_property_class(
+    atom: &mut Vec<u8>,
+    order: ByteOrder,
+    source_major: u32,
+    version: JtVersion,
+    class: u32,
+) -> Result<()> {
+    if source_major <= 8 {
         // JT 8.x stores no class version at all, so there is nothing to name.
-        return;
+        return Ok(());
     }
     let at = PROPERTY_VERSION_OFFSET;
     let word = if has_state(atom, at + 1, order) {
@@ -1175,20 +1191,30 @@ fn set_property_class(atom: &mut [u8], order: ByteOrder, major: u32, class: u32)
     } else if has_state(atom, at + 2, order) {
         true
     } else {
-        return;
+        return Ok(());
     };
-    if word {
-        let bytes = if order == ByteOrder::Big {
-            (class as u16).to_be_bytes()
-        } else {
-            (class as u16).to_le_bytes()
-        };
-        if let Some(slot) = atom.get_mut(at..at + 2) {
-            slot.copy_from_slice(&bytes);
-        }
-    } else if let Some(slot) = atom.get_mut(at) {
-        *slot = class as u8;
-    }
+    // The second version sits right before the value, so the state word names
+    // its offset as well.
+    let second = if word { at + 6 } else { at + 5 };
+    let Some(value) = atom
+        .get(second + if word { 2 } else { 1 }..)
+        .map(<[u8]>::to_vec)
+    else {
+        return Ok(());
+    };
+    // A JT 8.x target stores no class version, but it can never reach here: a
+    // family change is refused before anything is written.
+    let mut body: Vec<u8> = Vec::new();
+    write_version(&mut body, order, version.major, class)?;
+    body.write_u32_value(PROPERTY_STATE, order)?;
+    write_version(&mut body, order, version.major, class)?;
+    atom.truncate(at);
+    atom.extend_from_slice(&body);
+    atom.extend_from_slice(&value);
+    let length = i32::try_from(atom.len() - 4)
+        .map_err(|_| Error::invalid(0, "a property atom is too large"))?;
+    atom[..4].copy_from_slice(&ordered_i32(length, order));
+    Ok(())
 }
 
 /// Does the atom hold the property state word at `at`?
@@ -1533,32 +1559,74 @@ pub(crate) fn write_counts(out: &mut Vec<u8>, order: ByteOrder, counts: &[i32; 6
 /// Write the shape description tail of a shape node, which follows the
 /// compression ratio and holds the quantization of the vertex data.
 ///
-/// The layout is per revision: a JT 10.x node has a one byte version and one
-/// binding, a JT 9.x node a two byte version, one binding, the quantization
-/// parameters and — from version 2 on — a second binding, and a JT 8.x node
-/// three four byte bindings followed by the quantization parameters. The
-/// bindings and the quantization parameters are written back exactly as they
-/// were read: a coarse level of detail of a sample quantizes with `11 06 0b
-/// 06`, so zeros are not a stand-in for what the file says.
+/// The layout is picked by the revision being **written**, not by the one the
+/// node was read at: a JT 10.x node has a one byte version and one binding, a
+/// JT 9.x node a two byte version, one binding, the quantization parameters
+/// and — from version 2 on — a second binding, and a JT 8.x node three four
+/// byte bindings followed by the quantization parameters. Re-emitting the
+/// layout of the source instead shifts every byte after the tail — the nodes
+/// that follow, the end of the element list and the property table — and a
+/// strict consumer then loses the meta data, the layer filters, the PMI and
+/// the B-rep of the file: a 9.x node read at 22 bytes and written into a JT
+/// 10.x file moves them by 13 bytes each.
+///
+/// Within one revision the bindings and the quantization parameters are
+/// written back exactly as they were read: a coarse level of detail of a
+/// sample quantizes with `11 06 0b 06`, so zeros are not a stand-in for what
+/// the file says. Only a revision change re-frames them, and a family change
+/// (JT 8.x against JT 9.x or 10.x) is refused before this is reached, so the
+/// branches that carry a binding across that boundary are a fallback rather
+/// than a supported path.
 fn write_shape_lod(out: &mut Vec<u8>, order: ByteOrder, lod: &ShapeLod, major: u32) -> Result<()> {
-    match lod {
-        ShapeLod::Binding { version, binding } => {
-            out.write_u8_value(*version)?;
-            out.write_bytes(binding)?;
-        }
-        ShapeLod::Vertex2 {
-            version,
-            binding,
-            quantization,
-            second_binding,
-        } => {
-            out.write_i16_value(*version as i16, order)?;
-            out.write_bytes(binding)?;
-            out.write_bytes(quantization)?;
-            if let Some(second) = second_binding {
-                out.write_bytes(second)?;
+    if major >= 10 {
+        // One byte version and one 64 bit binding, no quantization parameters.
+        match lod {
+            ShapeLod::Binding { version, binding } => {
+                out.write_u8_value(*version)?;
+                out.write_bytes(binding)?;
+            }
+            ShapeLod::Vertex2 { binding, .. } => {
+                out.write_u8_value(1)?;
+                out.write_bytes(binding)?;
+            }
+            ShapeLod::Vertex1 { .. } | ShapeLod::None => {
+                out.write_u8_value(1)?;
+                crate::jt::encode::write_binding(&mut *out);
             }
         }
+        return Ok(());
+    }
+    if major > 8 {
+        match lod {
+            ShapeLod::Vertex2 {
+                version,
+                binding,
+                quantization,
+                second_binding,
+            } => {
+                out.write_i16_value(*version as i16, order)?;
+                out.write_bytes(binding)?;
+                out.write_bytes(quantization)?;
+                if let Some(second) = second_binding {
+                    out.write_bytes(second)?;
+                }
+            }
+            ShapeLod::Binding { binding, .. } => {
+                out.write_i16_value(2, order)?;
+                out.write_bytes(binding)?;
+                crate::jt::encode::write_quantization_params(&mut *out);
+                out.write_bytes(binding)?;
+            }
+            ShapeLod::Vertex1 { .. } | ShapeLod::None => {
+                out.write_i16_value(2, order)?;
+                crate::jt::encode::write_binding(&mut *out);
+                crate::jt::encode::write_quantization_params(&mut *out);
+                crate::jt::encode::write_binding(&mut *out);
+            }
+        }
+        return Ok(());
+    }
+    match lod {
         ShapeLod::Vertex1 {
             normal_binding,
             texture_binding,
@@ -1570,23 +1638,13 @@ fn write_shape_lod(out: &mut Vec<u8>, order: ByteOrder, lod: &ShapeLod, major: u
             out.write_i32_value(*color_binding, order)?;
             out.write_bytes(quantization)?;
         }
-        ShapeLod::None => {
-            // Nothing was read, so fall back to what a writer of that revision
-            // emits for an unquantized shape.
-            if major >= 10 {
-                out.write_u8_value(1)?;
-                crate::jt::encode::write_binding(&mut *out);
-            } else if major > 8 {
-                out.write_i16_value(2, order)?;
-                crate::jt::encode::write_binding(&mut *out);
-                crate::jt::encode::write_quantization_params(&mut *out);
-                crate::jt::encode::write_binding(&mut *out);
-            } else {
-                out.write_i32_value(1, order)?;
-                out.write_i32_value(0, order)?;
-                out.write_i32_value(0, order)?;
-                crate::jt::encode::write_quantization_params(&mut *out);
-            }
+        // Nothing was read, or the node comes from a later revision: write what
+        // a JT 8.x writer emits for an unquantized shape.
+        _ => {
+            out.write_i32_value(1, order)?;
+            out.write_i32_value(0, order)?;
+            out.write_i32_value(0, order)?;
+            crate::jt::encode::write_quantization_params(&mut *out);
         }
     }
     Ok(())
@@ -1719,10 +1777,12 @@ mod tests {
     #[test]
     fn a_byte_framed_atom_gets_a_byte_class_version() {
         let mut bytes = atom(false, 1);
-        set_property_class(&mut bytes, ByteOrder::Little, 10, 2);
+        let before = bytes.len();
+        set_property_class(&mut bytes, ByteOrder::Little, 10, JtVersion::V10_3, 2).unwrap();
+        assert_eq!(before, bytes.len());
         assert_eq!(2, bytes[PROPERTY_VERSION_OFFSET] as u32);
-        // The second field and the framing stay where they were.
-        assert_eq!(1, bytes[PROPERTY_VERSION_OFFSET + 5] as u32);
+        // The second field is re-framed too, and it names the same revision.
+        assert_eq!(2, bytes[PROPERTY_VERSION_OFFSET + 5] as u32);
         assert_eq!(
             PROPERTY_STATE,
             u32::from_le_bytes(
@@ -1731,16 +1791,48 @@ mod tests {
                     .unwrap()
             )
         );
+        assert_eq!(b"value", &bytes[PROPERTY_VERSION_OFFSET + 6..]);
     }
 
     #[test]
-    fn a_word_framed_atom_keeps_its_word() {
-        // A JT 9.x atom copied into a JT 10.x file is still word framed, and
-        // the consumer reads the value, not the width of the field.
+    fn a_word_framed_atom_is_re_framed_to_the_revision_being_written() {
+        // A JT 9.x atom copied into a JT 10.x file must stop being word framed.
+        // A consumer finds the value at the state word, so a word-framed atom
+        // in a byte-framed file makes it read two bytes early; it then gives up
+        // on the property table, and with it on the shape late loads further
+        // down — a rewritten file that loads with no geometry at all. The real
+        // JT 10.3 sample stores its one atom of the unknown class `10dd1019`
+        // byte framed (length 15) where the JT 9.5 source stores it word
+        // framed (length 17), which is the framing this test pins.
         let mut bytes = atom(true, 1);
-        set_property_class(&mut bytes, ByteOrder::Little, 9, 2);
+        set_property_class(&mut bytes, ByteOrder::Little, 9, JtVersion::V10_3, 2).unwrap();
+        // The envelope is 25 bytes and the body is now 1 + 4 + 1 + 5.
+        assert_eq!(32, i32::from_le_bytes(bytes[..4].try_into().unwrap()));
+        assert_eq!(32, bytes.len() - 4);
+        assert_eq!(2, bytes[PROPERTY_VERSION_OFFSET] as u32);
         assert_eq!(
-            2,
+            PROPERTY_STATE,
+            u32::from_le_bytes(
+                bytes[PROPERTY_VERSION_OFFSET + 1..PROPERTY_VERSION_OFFSET + 5]
+                    .try_into()
+                    .unwrap()
+            )
+        );
+        assert_eq!(2, bytes[PROPERTY_VERSION_OFFSET + 5] as u32);
+        assert_eq!(b"value", &bytes[PROPERTY_VERSION_OFFSET + 6..]);
+    }
+
+    #[test]
+    fn a_byte_framed_atom_becomes_word_framed_at_jt_9x() {
+        // The same rule in the other direction: a JT 10.x atom written into a
+        // JT 9.x file gains the wider field, and its length prefix grows.
+        let mut bytes = atom(false, 1);
+        set_property_class(&mut bytes, ByteOrder::Little, 10, JtVersion::V9_5, 1).unwrap();
+        // The envelope is 25 bytes and the body is now 2 + 4 + 2 + 5.
+        assert_eq!(34, i32::from_le_bytes(bytes[..4].try_into().unwrap()));
+        assert_eq!(34, bytes.len() - 4);
+        assert_eq!(
+            1,
             u16::from_le_bytes(
                 bytes[PROPERTY_VERSION_OFFSET..PROPERTY_VERSION_OFFSET + 2]
                     .try_into()
@@ -1755,13 +1847,15 @@ mod tests {
                     .unwrap()
             )
         );
+        assert_eq!(b"value", &bytes[PROPERTY_VERSION_OFFSET + 8..]);
     }
 
     #[test]
     fn a_jt_8x_atom_stores_no_class_version_at_all() {
         let mut bytes = atom(false, 1);
-        set_property_class(&mut bytes, ByteOrder::Little, 8, 2);
-        assert_eq!(1, bytes[PROPERTY_VERSION_OFFSET] as u32);
+        let before = bytes.clone();
+        set_property_class(&mut bytes, ByteOrder::Little, 8, JtVersion::V9_5, 2).unwrap();
+        assert_eq!(before, bytes);
     }
 
     #[test]
@@ -1769,7 +1863,58 @@ mod tests {
         let mut bytes = atom(false, 1);
         bytes[PROPERTY_VERSION_OFFSET + 1..PROPERTY_VERSION_OFFSET + 5]
             .copy_from_slice(&0u32.to_le_bytes());
-        set_property_class(&mut bytes, ByteOrder::Little, 10, 2);
-        assert_eq!(1, bytes[PROPERTY_VERSION_OFFSET] as u32);
+        let before = bytes.clone();
+        set_property_class(&mut bytes, ByteOrder::Little, 10, JtVersion::V10_3, 2).unwrap();
+        assert_eq!(before, bytes);
+    }
+
+    #[test]
+    fn a_shape_tail_is_re_framed_for_the_revision_being_written() {
+        // The tail of a `Shape` node is framed by the revision the file is
+        // written at, not by the one the node was read at. A JT 9.x node reads
+        // as a two byte version, one binding and the quantization parameters —
+        // 22 bytes — while a JT 10.x node is a one byte version and one binding,
+        // 9 bytes. Keeping the source framing moves every byte behind it, so a
+        // consumer loses the meta data, the layer filters, the PMI and the B-rep
+        // of a rewritten file and renders nothing.
+        let order = ByteOrder::Little;
+        let source = ShapeLod::Vertex2 {
+            version: 2,
+            binding: [0x21, 0, 0, 0, 0, 0, 0, 0],
+            quantization: [0x11, 0x06, 0x0b, 0x06],
+            second_binding: Some([0x21, 0, 0, 0, 0, 0, 0, 0]),
+        };
+        let mut at_9_5 = Vec::new();
+        write_shape_lod(&mut at_9_5, order, &source, 9).expect("writing cannot fail");
+        assert_eq!(at_9_5.len(), 22, "a JT 9.x tail keeps its own framing");
+        assert_eq!(at_9_5[10..14], [0x11, 0x06, 0x0b, 0x06], "quantization");
+
+        let mut at_10_3 = Vec::new();
+        write_shape_lod(&mut at_10_3, order, &source, 10).expect("writing cannot fail");
+        assert_eq!(at_10_3.len(), 9, "a JT 9.x node written into JT 10.x");
+        assert_eq!(at_10_3[0] as u32, 1, "one byte version");
+        assert_eq!(
+            at_10_3[1..9],
+            source_binding(&source),
+            "the binding survives"
+        );
+
+        let mut at_8_1 = Vec::new();
+        write_shape_lod(&mut at_8_1, order, &source, 8).expect("writing cannot fail");
+        assert_eq!(
+            at_8_1.len(),
+            16,
+            "a JT 8.x tail is three bindings plus quantization"
+        );
+    }
+
+    /// The 64-bit vertex binding stored in a shape tail, for the comparison
+    /// above.
+    fn source_binding(lod: &ShapeLod) -> [u8; 8] {
+        match lod {
+            ShapeLod::Vertex2 { binding, .. } => *binding,
+            ShapeLod::Binding { binding, .. } => *binding,
+            ShapeLod::Vertex1 { .. } | ShapeLod::None => [0; 8],
+        }
     }
 }

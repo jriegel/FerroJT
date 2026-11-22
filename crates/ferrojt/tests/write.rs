@@ -1102,8 +1102,10 @@ fn a_shape_without_geometry_still_dumps_as_valid_json() {
 /// A strict consumer reads that value before anything else in the atom and
 /// refuses the whole file when it names nothing it knows, so a rewrite at
 /// another revision has to store the version *of its own* revision — 1 at 9.x,
-/// 2 at 10.x — and never the zero the reference reader discards. The framing of
-/// the source is kept: a consumer takes the value, not the width of the field.
+/// 2 at 10.x — and never the zero the reference reader discards. The width of
+/// the field belongs to that revision as well: a consumer locates the value at
+/// the state word, so an atom kept at the width of the source makes it read the
+/// value early and give up on the rest of the property table.
 #[test]
 fn a_rewritten_file_names_the_class_version_of_its_own_revision() {
     for stem in [
@@ -1132,8 +1134,38 @@ fn a_rewritten_file_names_the_class_version_of_its_own_revision() {
                      {found}, expected {class}"
                 );
             }
-            atoms_name_the_class_version(&again, &bytes, class);
+            atoms_name_the_class_version(&again, &bytes, Some(class));
         }
+    }
+}
+
+/// The atoms of a class this reader does not know must survive a rewrite, and
+/// they must be framed at the revision the file is written at.
+///
+/// `example_block_jt9.5.jt` carries one property of the class `10dd1019`, which
+/// is in no specification and in none of the reference sources. The real JT 10.3
+/// sample carries the same class, byte framed where its JT 9.5 sibling is word
+/// framed — so a CAD system re-frames it, and so must we. Keeping the source
+/// framing cost the shape late loads further down the table: the file parsed,
+/// `jtinfo` reported a root and only 9 of the 18 properties, and an external
+/// renderer drew nothing at all.
+#[test]
+fn an_unknown_property_class_is_re_framed_for_the_revision_being_written() {
+    let path = sample("example_block_jt9.5.jt");
+    let source_bytes = std::fs::read(&path).expect("the bytes of the source file");
+    let source = JtFile::read(&path, &source_bytes).expect("the source file");
+    let unknown = atoms_name_the_class_version(&source, &source_bytes, None);
+    assert_eq!(
+        unknown, 1,
+        "the JT 9.5 sample is expected to carry one property of an unknown class"
+    );
+    for (revision, class) in [("9.5", 1), ("10.3", 2)] {
+        let (_, again, bytes) = rewrite(&path, revision);
+        let kept = atoms_name_the_class_version(&again, &bytes, Some(class));
+        assert_eq!(
+            kept, unknown,
+            "{revision}: a property of an unknown class was lost"
+        );
     }
 }
 
@@ -1141,8 +1173,12 @@ fn a_rewritten_file_names_the_class_version_of_its_own_revision() {
 /// ones of a class this reader does not know and therefore cannot parse.
 ///
 /// The reader skips such an atom entirely, so the parsed graph cannot show
-/// them; only the bytes of the LSG segment can.
-fn atoms_name_the_class_version(file: &JtFile, bytes: &[u8], class: u32) {
+/// them; only the bytes of the LSG segment can. Every atom must name `class`
+/// and must frame its version field at the width of the revision of `file`;
+/// pass `None` to inspect a source file, whose values are not ours to choose.
+/// The return value is how many atoms belong to a class the reader does not
+/// know.
+fn atoms_name_the_class_version(file: &JtFile, bytes: &[u8], class: Option<u32>) -> u32 {
     let major = file.header.major;
     let row = file
         .toc
@@ -1175,6 +1211,7 @@ fn atoms_name_the_class_version(file: &JtFile, bytes: &[u8], class: u32) {
 
     let mut cursor = Cursor::new(payload, file.header.order, major);
     let mut checked = 0;
+    let mut unknown = 0;
     // The payload holds the nodes and attributes first, then the properties,
     // each section closed by an end-of-element marker. Only the second one
     // carries property atoms; what follows it is the property table.
@@ -1188,7 +1225,11 @@ fn atoms_name_the_class_version(file: &JtFile, bytes: &[u8], class: u32) {
             }
             continue;
         };
-        if section == 1 && class_of(&atom.guid) == Some(Class::Property) {
+        let known = class_of(&atom.guid);
+        // The property section holds the properties we know plus, in some files,
+        // a property of a class no reader knows — which is exactly the atom this
+        // test is about.
+        if section == 1 && !matches!(known, Some(class) if class != Class::Property) {
             let body = payload
                 .get(atom.body_offset..atom.body_offset + atom.body_len)
                 .expect("the body of a property atom");
@@ -1197,9 +1238,13 @@ fn atoms_name_the_class_version(file: &JtFile, bytes: &[u8], class: u32) {
             // class the envelope stops after the GUID and those two fields are
             // still part of the body.
             let inner = usize::from(atom.base_type == 0) * 5;
-            // The width of the field is not the revision: a JT 9.x atom copied
-            // into a JT 10.x file keeps the framing of its source. The state
-            // word that follows the version says which width was used.
+            if atom.base_type == 0 {
+                unknown += 1;
+            }
+            // The width of the field is the width of the revision the file is
+            // written at. The state word that follows the version says which
+            // width was used, so the check reads the field the way a consumer
+            // finds it rather than assuming an offset.
             const STATE: u32 = 0x4000_0000;
             let order = file.header.order;
             let word = match body.get(inner + 1..inner + 5) {
@@ -1213,6 +1258,17 @@ fn atoms_name_the_class_version(file: &JtFile, bytes: &[u8], class: u32) {
                     value != STATE
                 }
                 _ => true,
+            };
+            assert_eq!(
+                word,
+                major < 10,
+                "a property atom is {} framed in a JT {major}.x file",
+                if word { "word" } else { "byte" }
+            );
+            let Some(class) = class else {
+                checked += 1;
+                skip_element(&mut cursor, &atom).expect("a property atom to skip");
+                continue;
             };
             let version = if word {
                 let [a, b] = body[inner..inner + 2].try_into().expect("a class version");
@@ -1234,4 +1290,5 @@ fn atoms_name_the_class_version(file: &JtFile, bytes: &[u8], class: u32) {
         skip_element(&mut cursor, &atom).expect("a property atom to skip");
     }
     assert!(checked > 0, "no property atom could be framed");
+    unknown
 }
