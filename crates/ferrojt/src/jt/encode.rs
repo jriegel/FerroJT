@@ -67,6 +67,16 @@ struct Streams {
     groups: Vec<i32>,
     face_flags: Vec<i32>,
     attr_masks: [Vec<i32>; 8],
+    /// The auxiliary high-bit stream of context 7: one value per mask symbol
+    /// written into [`Streams::attr_masks`]`[7]`.
+    ///
+    /// The reader ORs both auxiliary arrays into a context-7 mask at bit 30, so
+    /// a mask that needs no bit above 29 still needs one value (zero) in each
+    /// array. A consumer that renders a shape from its topological
+    /// representation refuses a *context-7 face whose auxiliary streams are
+    /// empty*, which is why the count must track the mask count rather than the
+    /// mask value.
+    attr_masks_high: Vec<i32>,
     attr_masks_large: Vec<u32>,
     split_faces: Vec<i32>,
     split_positions: Vec<i32>,
@@ -503,6 +513,15 @@ impl<'a> Walk<'a> {
             ));
         }
         self.streams.attr_masks[context].push((1 << degree) - 1);
+        // A context-7 mask is widened with two auxiliary streams, and the reader
+        // indexes them with the *same* read position as the mask itself. Every
+        // mask symbol therefore needs a value in each, even when — as here, with
+        // a degree of at most 31 — no bit above 29 is ever set. A consumer that
+        // renders from the topological representation rejects a context-7 face
+        // whose auxiliary streams are empty.
+        if context == 7 {
+            self.streams.attr_masks_high.push(0);
+        }
         Ok(())
     }
 
@@ -821,32 +840,185 @@ enum FaceChoice {
     Split { face: i32, position: i32 },
 }
 
-/// Appends one mark-2 package holding `values` verbatim.
+/// Appends one mark-2 package holding `values`, coded with bitlength2.
 ///
-/// A null package stores its values as raw 32-bit words; an empty package is
-/// only its zero value count, because the codec byte is never reached.
-fn package2(values: &[i32], out: &mut Vec<u8>) {
+/// An empty package is only its zero value count, because the codec byte is
+/// never reached — `loadCDP2` returns a null package for a zero count without
+/// reading further.
+fn package2(values: &[i32], version: JtVersion, out: &mut Vec<u8>) {
     write_u32(out, values.len() as u32);
     if values.is_empty() {
         return;
     }
-    write_u8(out, 0);
-    write_u32(out, values.len() as u32 * 32);
-    for value in values {
-        write_u32(out, *value as u32);
+    // Codec 1, `JtDecode_Int32CDP_Bitlength2`. The null codec (0) is accepted by
+    // the OpenJT reference reader but produces no geometry in a consumer that
+    // renders a shape from its topological representation: no file written by
+    // real CAD tooling stores a non-empty package any other way than with
+    // bitlength2 or one of the two entropy codecs.
+    write_u8(out, 1);
+    let min = values.iter().copied().min().unwrap_or(0);
+    let max = values.iter().copied().max().unwrap_or(0);
+    let span = i64::from(max) - i64::from(min);
+    let width = u32::try_from(span).map_or(32, |span| u32::BITS - span.leading_zeros());
+    let mut bits = BitWriter::default();
+    if version.major >= 10 {
+        // `decodeV10`, fixed range: the minimum and maximum as nibbler values,
+        // then one unsigned field of the width of the span per value.
+        bits.bit(false);
+        bits.nibbler(min);
+        bits.nibbler(max);
+        for &value in values {
+            bits.u((i64::from(value) - i64::from(min)) as u32, width);
+        }
+    } else if span > 0 && span < (1 << 31) {
+        // `decodeFixedWidth`: a six-bit bit count for the minimum, a six-bit bit
+        // count for the maximum, both values in those widths, and then one
+        // unsigned field of the width of the span per value.
+        bits.bit(false);
+        bits.u(signed_bits(min), 6);
+        bits.u(signed_bits(max), 6);
+        bits.i(min, signed_bits(min));
+        bits.i(max, signed_bits(max));
+        for &value in values {
+            bits.u((i64::from(value) - i64::from(min)) as u32, width);
+        }
+    } else if span == 0 {
+        // The same fixed-range framing with no fields at all: the reader computes
+        // a range of zero and fills the package with the minimum it just read.
+        bits.bit(false);
+        bits.u(signed_bits(min), 6);
+        bits.u(signed_bits(max), 6);
+        bits.i(min, signed_bits(min));
+        bits.i(max, signed_bits(max));
+    } else {
+        // The range of a JT 9.x fixed-range package is read as a **signed** int,
+        // so a span of 2^31 or more reads as negative and the reader fills the
+        // whole package with the minimum. Such a package goes down the variable
+        // branch, which names its field width per run instead.
+        bits.bit(true);
+        write_variable_bits(values, min, width + 1, &mut bits);
+    }
+    bits.finish(out);
+}
+
+/// Appends the variable-range code text of the JT 9.x bitlength2 codec.
+///
+/// One mean, then per run a change to the field width and the number of values
+/// it covers. A change field of `change_bits` bits continues the run when it
+/// holds the extreme of its range, so the width is approached in steps of three
+/// and closed by a change of at most two. The mean is the minimum and the
+/// residuals are the offsets from it, so the width has to leave room for a sign
+/// bit — except at the full 32 bits, where the reader takes the raw difference
+/// and adds it with wraparound.
+fn write_variable_bits(values: &[i32], min: i32, width: u32, bits: &mut BitWriter) {
+    const CHANGE_BITS: u32 = 3;
+    const RUN_BITS: u32 = 3;
+    /// The largest change that ends a run rather than continuing it.
+    const LAST_STEP: u32 = 2;
+    /// The largest run length a `run_bits`-bit count can name.
+    const MAX_RUN: usize = (1 << RUN_BITS) - 1;
+
+    let width = width.min(32);
+    bits.i(min, 32);
+    bits.u(CHANGE_BITS, CHANGE_BITS);
+    bits.u(RUN_BITS, RUN_BITS);
+
+    let mut remaining = width;
+    while remaining > LAST_STEP {
+        bits.i(3, CHANGE_BITS);
+        remaining -= 3;
+    }
+    bits.i(remaining as i32, CHANGE_BITS);
+
+    let mut position = 0;
+    while position < values.len() {
+        let run = (values.len() - position).min(MAX_RUN);
+        bits.u(run as u32, RUN_BITS);
+        for &value in &values[position..position + run] {
+            bits.u((i64::from(value) - i64::from(min)) as u32, width);
+        }
+        position += run;
     }
 }
 
 /// Appends one mark-2 package holding raw `words`.
-fn package2_words(words: &[u32], out: &mut Vec<u8>) {
-    write_u32(out, words.len() as u32);
-    if words.is_empty() {
-        return;
+///
+/// The decoder hands the package's values to the codec as signed integers, so a
+/// coordinate's IEEE bit pattern goes in as its two's complement value.
+fn package2_words(words: &[u32], version: JtVersion, out: &mut Vec<u8>) {
+    let values: Vec<i32> = words.iter().map(|&word| word as i32).collect();
+    package2(&values, version, out);
+}
+
+/// The smallest nibble count a `nibblerGet` of that many nibbles returns `value`
+/// for. Each nibble carries four bits low-first and the reader sign-extends from
+/// the whole run, so the count has to be exact.
+fn nibbles_for(value: i32) -> u32 {
+    (1..=8)
+        .find(|&nibbles| {
+            let half = 1i64 << (4 * nibbles - 1);
+            i64::from(value) >= -half && i64::from(value) < half
+        })
+        .expect("every i32 fits eight nibbles")
+}
+
+/// The smallest bit count a `ReadI32Or0` of that many bits returns `value` for.
+/// Zero bits is legal and reads as zero.
+fn signed_bits(value: i32) -> u32 {
+    if value == 0 {
+        return 0;
     }
-    write_u8(out, 0);
-    write_u32(out, words.len() as u32 * 32);
-    for word in words {
-        write_u32(out, *word);
+    (1..=32)
+        .find(|&bits| {
+            let half = 1i64 << (bits - 1);
+            i64::from(value) >= -half && i64::from(value) < half
+        })
+        .expect("every i32 fits 32 bits")
+}
+
+/// A most-significant-bit-first sink for a CDP code text.
+///
+/// `JtDecode_BitReader` takes the bits of a package in order out of the most
+/// significant bit of the first word, so the first bit written here is the most
+/// significant bit of the first word, and the last word is padded at the bottom.
+#[derive(Default)]
+struct BitWriter {
+    bits: Vec<u8>,
+}
+
+impl BitWriter {
+    fn bit(&mut self, value: bool) {
+        self.bits.push(u8::from(value));
+    }
+
+    fn u(&mut self, value: u32, width: u32) {
+        for shift in (0..width).rev() {
+            self.bits.push(((value >> shift) & 1) as u8);
+        }
+    }
+
+    fn i(&mut self, value: i32, width: u32) {
+        self.u(value as u32, width);
+    }
+
+    fn nibbler(&mut self, value: i32) {
+        let nibbles = nibbles_for(value);
+        for index in 0..nibbles {
+            self.u(((value >> (4 * index)) as u32) & 0xF, 4);
+            self.bit(index + 1 < nibbles);
+        }
+    }
+
+    /// Writes the bit count of the code text and then the words holding it.
+    fn finish(self, out: &mut Vec<u8>) {
+        write_u32(out, self.bits.len() as u32);
+        for chunk in self.bits.chunks(32) {
+            let mut word = 0u32;
+            for &bit in chunk {
+                word = (word << 1) | u32::from(bit);
+            }
+            write_u32(out, word << (32 - chunk.len()));
+        }
     }
 }
 
@@ -873,23 +1045,24 @@ fn lag1_residuals(values: &[i32]) -> Vec<i32> {
 /// them, followed by the trailing hash it skips.
 fn write_mesh_input(streams: &Streams, version: JtVersion, out: &mut Vec<u8>) {
     for context in 0..8 {
-        package2(&streams.degrees[context], out);
+        package2(&streams.degrees[context], version, out);
     }
-    package2(&streams.valences, out);
-    package2(&streams.groups, out);
-    package2(&lag1_residuals(&streams.face_flags), out);
+    package2(&streams.valences, version, out);
+    package2(&streams.groups, version, out);
+    package2(&lag1_residuals(&streams.face_flags), version, out);
     for context in 0..8 {
-        package2(&streams.attr_masks[context], out);
+        package2(&streams.attr_masks[context], version, out);
     }
     // The two auxiliary mask arrays of context 7. JT 10.x folds them into one
-    // stream and never reads the second.
-    package2(&[], out);
+    // stream and never reads the second. Both hold one value per context-7 mask
+    // symbol; the mask here never reaches past bit 30, so both are zero.
+    package2(&streams.attr_masks_high, version, out);
     if version.major < 10 {
-        package2(&[], out);
+        package2(&streams.attr_masks_high, version, out);
     }
-    package2_words(&streams.attr_masks_large, out);
-    package2(&lag1_residuals(&streams.split_faces), out);
-    package2(&streams.split_positions, out);
+    package2_words(&streams.attr_masks_large, version, out);
+    package2(&lag1_residuals(&streams.split_faces), version, out);
+    package2(&streams.split_positions, version, out);
     write_u32(out, 0);
 }
 
@@ -934,7 +1107,7 @@ fn write_coords(encoded: &Encoded, version: JtVersion, out: &mut Vec<u8>) {
                 .iter()
                 .map(|p| p[axis].to_bits() as i32)
                 .collect();
-            package2(&lag1_residuals(&codes), out);
+            package2(&lag1_residuals(&codes), version, out);
         }
     } else {
         for axis in 0..3 {
@@ -948,8 +1121,8 @@ fn write_coords(encoded: &Encoded, version: JtVersion, out: &mut Vec<u8>) {
                 .iter()
                 .map(|p| (p[axis].to_bits() & 0x007f_ffff) as i32)
                 .collect();
-            package2(&lag1_residuals(&exponents), out);
-            package2(&lag1_residuals(&mantissas), out);
+            package2(&lag1_residuals(&exponents), version, out);
+            package2(&lag1_residuals(&mantissas), version, out);
         }
     }
     write_u32(out, 0);
@@ -964,7 +1137,7 @@ fn write_normals(encoded: &Encoded, version: JtVersion, out: &mut Vec<u8>) {
     if version.major >= 10 {
         for axis in 0..3 {
             let codes: Vec<u32> = encoded.normals.iter().map(|n| n[axis].to_bits()).collect();
-            package2_words(&codes, out);
+            package2_words(&codes, version, out);
         }
     } else {
         for axis in 0..3 {
@@ -978,8 +1151,8 @@ fn write_normals(encoded: &Encoded, version: JtVersion, out: &mut Vec<u8>) {
                 .iter()
                 .map(|n| (n[axis].to_bits() & 0x007f_ffff) as i32)
                 .collect();
-            package2(&exponents, out);
-            package2(&mantissas, out);
+            package2(&exponents, version, out);
+            package2(&mantissas, version, out);
         }
     }
     write_u32(out, 0);
@@ -1025,6 +1198,15 @@ pub(crate) fn write_topological_body(
     write_u32(out, encoded.normals.len() as u32);
     write_coords(&encoded, version, out);
     write_normals(&encoded, version, out);
+    // The flag field announced by the flag bit of the vertex binding: one value
+    // per vertex attribute, so one per normal. The OpenJT reader stops after the
+    // hash of the normals and never looks at it, which is why a missing flag
+    // stream goes unnoticed here; a consumer that renders a shape from its
+    // topological representation refuses the whole shape instead. The values
+    // themselves are not read by either, so they are all zero. The element
+    // version closing the body follows in the caller.
+    write_u32(out, encoded.normals.len() as u32);
+    package2(&vec![0; encoded.normals.len()], version, out);
     Ok(())
 }
 
@@ -1046,6 +1228,7 @@ fn write_f32(out: &mut Vec<u8>, value: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jt::decode::{Package, Unpack};
     use crate::jt::guid::types::SHAPE_LOD_TRI_STRIP_SET;
     use crate::jt::object::{Element, LodGeometry};
     use crate::jt::reader::Cursor;
@@ -1144,6 +1327,116 @@ mod tests {
         round_trip(&octahedron(), 24);
     }
 
+    #[test]
+    fn a_context_seven_face_carries_both_auxiliary_mask_streams() {
+        // A coder face of degree nine reads its attribute mask from context 7,
+        // and the reader widens that mask by ORing two auxiliary arrays into it
+        // **at the same read position as the mask itself**. So every context-7
+        // mask symbol needs a value in each auxiliary stream even when, as here,
+        // no bit above 29 is ever set — and a consumer that renders a shape from
+        // its topological representation refuses a context-7 face whose
+        // auxiliary streams are empty, which blanks the whole shape.
+        //
+        // The cube (degrees 4 and 6) and the octahedron (degree 4) never reach
+        // context 7, which is why a block always rendered and only a file with a
+        // high-valence vertex — the plate's screws — came out empty.
+        let mesh = enneagon_bipyramid();
+        let encoded = encode(&mesh).expect("a bipyramid is a closed two-manifold");
+        let masks = encoded.streams.attr_masks[7].len();
+        assert!(
+            masks > 0,
+            "the fixture must produce a coder face of degree nine"
+        );
+        assert_eq!(
+            masks,
+            encoded.streams.attr_masks_high.len(),
+            "every context-7 mask symbol needs one auxiliary value"
+        );
+
+        for version in [JtVersion::V9_5, JtVersion::V10_3] {
+            let mut body = Vec::new();
+            write_topological_body(&mesh, version, &mut body).expect("the mesh can be encoded");
+            let auxiliary = auxiliary_masks(&body, version);
+            // JT 10.x folds the pair into one stream and never reads the second.
+            assert_eq!(
+                auxiliary.len(),
+                if version.major >= 10 { 1 } else { 2 },
+                "{version} stores one auxiliary mask stream, not two"
+            );
+            for (at, package) in auxiliary.iter().enumerate() {
+                assert!(
+                    package.out_val_count() > 0,
+                    "{version} left auxiliary mask stream {at} empty"
+                );
+                assert_eq!(
+                    package.out_val_count(),
+                    masks,
+                    "auxiliary mask stream {at} of {version} does not track the \
+                     context-7 masks"
+                );
+            }
+        }
+    }
+
+    /// A closed bipyramid over a nine-gon: two apices of nine triangles each and
+    /// nine equator corners of four. The apices are coder faces of **degree
+    /// nine**, the first degree whose attribute mask is read from context 7.
+    fn enneagon_bipyramid() -> MeshData {
+        let mut vertices = vec![0.0, 0.0, 1.0, 0.0, 0.0, -1.0];
+        for step in 0..9i32 {
+            let angle = std::f32::consts::TAU * step as f32 / 9.0;
+            vertices.extend_from_slice(&[angle.cos(), angle.sin(), 0.0]);
+        }
+        let mut indices = Vec::new();
+        for step in 0..9i32 {
+            let next = (step + 1) % 9;
+            // Both cones wound outward, so the mesh is consistently oriented.
+            indices.extend_from_slice(&[0, 2 + step, 2 + next]);
+            indices.extend_from_slice(&[1, 2 + next, 2 + step]);
+        }
+        MeshData::new(vertices, indices).expect("a bipyramid is a valid mesh")
+    }
+
+    /// The two auxiliary attribute-mask streams of a body, read in the order
+    /// [`write_mesh_input`] writes them. Walking the framing that precedes them
+    /// is part of the check: a stream written out of order is a stream no
+    /// reader finds.
+    fn auxiliary_masks(body: &[u8], version: JtVersion) -> Vec<Package> {
+        let mut cursor = Cursor::new(body, ByteOrder::Little, version.major);
+        let next = |cursor: &mut Cursor<'_>| {
+            Package::load2(cursor).expect("a symbol package of the walk must read back")
+        };
+        // The shape LOD base: two class versions and the 64-bit vertex binding.
+        cursor
+            .skip(if version.major >= 10 { 2 } else { 4 })
+            .expect("the shape LOD base");
+        cursor.skip(8).expect("the vertex binding");
+        if version.major >= 10 {
+            // The tri-strip set of JT 10.x announces itself with two versions, a
+            // zero count, the topology marker and its embedded header.
+            cursor
+                .skip(2 + 4 + TOPOLOGY_MARKER.len() + EMBEDDED_HEADER.len())
+                .expect("the topology marker of a JT 10.x shape");
+        } else {
+            cursor.skip(2 + 4 + 2).expect("the representation version");
+        }
+        // The symbol streams up to the pair in question.
+        for _ in 0..8 {
+            next(&mut cursor);
+        }
+        next(&mut cursor); // valences
+        next(&mut cursor); // groups
+        next(&mut cursor); // face flags
+        for _ in 0..8 {
+            next(&mut cursor);
+        }
+        let mut out = vec![next(&mut cursor)];
+        if version.major < 10 {
+            out.push(next(&mut cursor));
+        }
+        out
+    }
+
     /// Encodes `mesh` for both revisions that carry a topological representation
     /// and checks that the reader hands back exactly the same shape. `corners`
     /// is the number of triangle corners of the input.
@@ -1208,5 +1501,45 @@ mod tests {
             "the error says {error}"
         );
         assert!(body.is_empty(), "nothing may be written for a refused mesh");
+    }
+
+    #[test]
+    fn every_package_we_write_decodes_back_with_its_own_codec() {
+        // A non-empty package is written with bitlength2 (codec 1), the codec
+        // every real file uses. The null codec (0) is accepted by the reference
+        // reader but produces no geometry in a consumer that renders a shape
+        // from its topological representation, so it must never be emitted for
+        // values that are there. Reading the package back with our own decoder
+        // proves the code text is well formed for the revision written.
+        for version in [JtVersion::V9_5, JtVersion::V10_3] {
+            for values in [
+                vec![0, 1, 2, 3],
+                vec![7],
+                vec![-5, -5, -5],
+                vec![i32::MIN, -1, 0, 1, i32::MAX],
+                (0..200).map(|i| (i * 37) % 1000 - 500).collect(),
+            ] {
+                let mut body = Vec::new();
+                package2(&values, version, &mut body);
+                assert_eq!(body[4] as u32, 1, "{version} wrote the null codec");
+                assert_eq!(
+                    decode_package(&body, version),
+                    values,
+                    "{version} did not decode the package back"
+                );
+            }
+            let mut empty = Vec::new();
+            package2(&[], version, &mut empty);
+            assert_eq!(empty, vec![0, 0, 0, 0], "an empty package is its count");
+        }
+    }
+
+    /// Read one mark 2 package from `body` and decode it the way a file does.
+    fn decode_package(body: &[u8], version: JtVersion) -> Vec<i32> {
+        let mut cursor = Cursor::new(body, ByteOrder::Little, version.major);
+        let mut package = Package::load2(&mut cursor).expect("the package we wrote must read back");
+        package
+            .decode(ByteOrder::Little, Unpack::Null)
+            .expect("the code text we wrote must decode")
     }
 }
