@@ -64,6 +64,7 @@ use crate::model::{Attribute, Material, Mesh, Model, Node, Primitive, Topology};
 
 use super::build::{
     BuildNode, JtBuilder, JtMesh, JtNode, MaterialData, MeshData, file_name_for_path,
+    placement_matrix,
 };
 use super::encode::encode;
 use super::version::JtVersion;
@@ -139,9 +140,6 @@ fn write(model: &Model, version: Option<JtVersion>, file_name: Option<&str>) -> 
 
     let scale = unit_scale(model)?;
     let orientation = orientation(model)?;
-    if scale != 1.0 || orientation != IDENTITY {
-        build.set_transform(build.root(), &root_transform(scale, &orientation))?;
-    }
 
     let mut writer = Writer {
         model,
@@ -150,14 +148,24 @@ fn write(model: &Model, version: Option<JtVersion>, file_name: Option<&str>) -> 
         shapes: Vec::new(),
         materials: Vec::new(),
         built: vec![None; model.nodes.len()],
+        adopted: None,
     };
-    // A graph that did not come out of a JT file has none of the classes a CAD
-    // writer puts between its root partition and its shapes, so it gains them
-    // here. Writing the shapes straight under the partition produces a file
-    // this library reads back fine and a consumer walking the graph for a part
-    // refuses.
-    if !already_wrapped(model) {
-        writer.wrap(file_name)?;
+    // The builder always owns a root partition, and a model read out of a JT
+    // file brings one of its own. The two are **merged** rather than stacked: a
+    // root partition holding a second partition leaves the part one level deeper
+    // than a consumer walk, which descends a fixed handful of classes from the
+    // root to reach a part, can reach the geometry of. Such a file parses,
+    // reports a root, and then never produces a frame.
+    //
+    // A graph with no partition of its own — every glTF file, and any graph
+    // built by hand — gains the chain a CAD writer puts between its root
+    // partition and its shapes. Writing the shapes straight under the partition
+    // produces a file this library reads back fine and a consumer walking the
+    // graph for a part refuses.
+    match partition_root(model) {
+        Some(index) => writer.adopt(index, scale, &orientation)?,
+        None if !already_wrapped(model) => writer.wrap(file_name, scale, &orientation)?,
+        None => writer.set_root_transform(scale, &orientation)?,
     }
     writer.write_scene()?;
 
@@ -178,15 +186,35 @@ fn write(model: &Model, version: Option<JtVersion>, file_name: Option<&str>) -> 
     writer.build.write_to_bytes()
 }
 
+/// The scene root that is the partition of the file, if there is one.
+///
+/// [`JtFile::to_model`] keeps the JT class of every node, so the root of a model
+/// read out of a JT file — or exported to glTF and read back, which keeps the
+/// class in the node kinds it declares — is a partition. A glTF reader declares
+/// every node a plain group, and a hand-built model declares nothing, so neither
+/// is mistaken for one.
+fn partition_root(model: &Model) -> Option<usize> {
+    model
+        .scenes
+        .first()
+        .into_iter()
+        .flat_map(|scene| scene.roots.iter())
+        .copied()
+        .find(|root| {
+            model
+                .nodes
+                .get(*root)
+                .is_some_and(|node| class_of(node.kind.as_deref()) == BuildNode::Partition)
+        })
+}
+
 /// Whether the model already carries the classes of a JT scene graph.
 ///
-/// [`JtFile::to_model`] keeps the JT class of every node, so a model read out of
-/// a JT file — or exported to glTF and read back, which keeps the class in the
-/// node kinds it declares — already has its partition, part, meta data and
-/// level-of-detail span and must not be wrapped a second time: a second chain
-/// would put a second partition under the root. A glTF reader declares every
-/// node a plain group, and a hand-built model declares nothing, so neither is
-/// mistaken for one.
+/// A model that carries a partition is merged with the root instead — see
+/// `partition_root`. This catches the rest of the chain: a model that has a
+/// part, a meta data node or a level-of-detail span but no partition of its own
+/// must not be wrapped around it, because that would duplicate the classes a
+/// consumer walks down to the geometry.
 fn already_wrapped(model: &Model) -> bool {
     model.nodes.iter().any(|node| {
         matches!(
@@ -289,13 +317,35 @@ fn root_transform(scale: f32, orientation: &Orientation) -> [f64; 16] {
     matrix
 }
 
+/// The product of two column major 4x4 matrices: `a` applied after `b`.
+fn multiply(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
+    let mut out = [0.0; 16];
+    for column in 0..4 {
+        for row in 0..4 {
+            let mut sum = 0.0;
+            for axis in 0..4 {
+                sum += a[4 * axis + row] * b[4 * column + axis];
+            }
+            out[4 * column + row] = sum;
+        }
+    }
+    out
+}
+
 /// The JT class a neutral node maps to.
 ///
 /// A model read out of a JT file carries the JT class name in [`Node::kind`],
-/// so it maps straight back. Everything else — the `"Group"` a glTF node gets,
-/// and the `"LOD"`, `"RangeLOD"` and unknown classes the builder has no node
-/// type for — becomes a group, the one JT container carrying no data of its
-/// own.
+/// so it maps straight back. Everything else — the `"Group"` a glTF node gets
+/// and the unknown classes the builder has no node type for — becomes a group,
+/// the one JT container carrying no data of its own.
+///
+/// The level-of-detail classes are **not** among those. A span is a container
+/// with data of its own, and turning it into a group is not merely a loss of
+/// fidelity: a consumer walking the graph reaches the geometry through the span
+/// or through an instance, and a file whose graph offers neither — a JT 9.x
+/// file, which has no instance at all — parses and then never produces a frame.
+/// `"LOD"` names the older selector, which the builder cannot emit, so it keeps
+/// the range span's shape and is written as one.
 fn class_of(kind: Option<&str>) -> BuildNode {
     match kind {
         Some("Partition") => BuildNode::Partition,
@@ -303,6 +353,7 @@ fn class_of(kind: Option<&str>) -> BuildNode {
         Some("MetaData") => BuildNode::MetaData,
         Some("Shape") => BuildNode::Shape,
         Some("Instance") => BuildNode::Instance,
+        Some("LOD" | "RangeLOD") => BuildNode::RangeLod,
         _ => BuildNode::Group,
     }
 }
@@ -503,17 +554,63 @@ struct Writer<'a> {
     /// reached from several parents into one node plus an instance, and what
     /// stops a cycle from recursing forever.
     built: Vec<Option<JtNode>>,
+    /// The model node merged with the root partition of the builder, which
+    /// [`Writer::write_scene`] therefore must not write a second time.
+    adopted: Option<usize>,
 }
 
 impl Writer<'_> {
+    /// Merge the partition of the model with the root partition of the builder.
+    ///
+    /// The root keeps its own identity — the builder numbers it 0, and a
+    /// consumer builds its root node from the file name stored there — and takes
+    /// the frame of the model, which is where the unit conversion lives. The
+    /// name of the model's partition is deliberately **not** copied over: the
+    /// root is named after the file being written, in both the field and the
+    /// property, which is what a consumer derives its root node from.
+    fn adopt(&mut self, index: usize, scale: f32, orientation: &Orientation) -> Result<()> {
+        let root = self.build.root();
+        let transform = self.model.nodes[index].transform;
+        self.built[index] = Some(root);
+        self.adopted = Some(index);
+        if transform.is_identity() {
+            return self.set_root_transform(scale, orientation);
+        }
+        // The frame of the file sits above the frame the partition carried, which
+        // is where it sat in the graph it came from.
+        let placement =
+            placement_matrix(transform.translation, transform.rotation, transform.scale);
+        self.build
+            .set_transform(
+                root,
+                &multiply(&root_transform(scale, orientation), &placement),
+            )
+            .map(|_| ())
+    }
+
+    /// Put the frame of the model on the root partition.
+    fn set_root_transform(&mut self, scale: f32, orientation: &Orientation) -> Result<()> {
+        if scale != 1.0 || *orientation != IDENTITY {
+            self.build
+                .set_transform(self.build.root(), &root_transform(scale, orientation))?;
+        }
+        Ok(())
+    }
+
     /// Put the chain a CAD writer hangs its shapes on under the root partition.
     ///
     /// `Partition -> MetaData -> Instance -> Part -> RangeLOD -> Group`, with one
     /// tier in the span because a neutral model holds one representation per
     /// node. The instance **refers** to the part instead of holding it as a
     /// child, which is how every sample stores a part and where its placement
-    /// lives.
-    fn wrap(&mut self, file_name: Option<&str>) -> Result<()> {
+    /// lives. The frame of the model goes on the root, above the whole chain.
+    fn wrap(
+        &mut self,
+        file_name: Option<&str>,
+        scale: f32,
+        orientation: &Orientation,
+    ) -> Result<()> {
+        self.set_root_transform(scale, orientation)?;
         let meta = self
             .build
             .add_node(self.build.root(), BuildNode::MetaData, None)?;
@@ -536,21 +633,51 @@ impl Writer<'_> {
             .ok_or_else(|| Error::invalid(0, "the model has no scene roots to write"))?
             .roots;
         let parent = self.parent;
+        let adopted = self.adopted;
         for root in roots {
-            self.node(*root, parent)?;
+            if Some(*root) == adopted {
+                // The partition itself became the root of the file, so only what
+                // hangs below it still has to be written.
+                let slot = self
+                    .built
+                    .get(*root)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| Error::invalid(0, "the root partition was not written"))?;
+                let children = self.model.nodes[*root].children.clone();
+                for child in children {
+                    self.node(child, slot)?;
+                }
+            } else {
+                self.node(*root, parent)?;
+            }
         }
         Ok(())
     }
 
     /// Write `index` under `parent` and return the node it landed in.
     fn node(&mut self, index: usize, parent: JtNode) -> Result<JtNode> {
+        self.place(index, Some(parent))
+    }
+
+    /// Write `index` as a node no child list refers to, for an instance to point
+    /// at, and return the slot it landed in.
+    fn detached(&mut self, index: usize) -> Result<JtNode> {
+        self.place(index, None)
+    }
+
+    /// Write `index` under `parent`, or detached when there is none.
+    fn place(&mut self, index: usize, parent: Option<JtNode>) -> Result<JtNode> {
         let node = self
             .model
             .nodes
             .get(index)
             .ok_or_else(|| Error::invalid(0, "a node of the model is out of range"))?;
         if let Some(slot) = self.built.get(index).copied().flatten() {
-            return self.share(parent, slot);
+            return match parent {
+                Some(parent) => self.share(parent, slot),
+                None => Ok(slot),
+            };
         }
 
         // A JT instance node carries no data of its own, and the neutral graph
@@ -566,9 +693,37 @@ impl Writer<'_> {
                 .ok_or_else(|| Error::invalid(0, "an instance node has no target"))?;
             let target = match self.built.get(target).copied().flatten() {
                 Some(slot) => slot,
-                None => self.node(target, self.build.root())?,
+                // The node an instance refers to is **not** a child of the node
+                // above it: that is how every sample stores a part, and the
+                // instance carries the placement. Hanging it under the root as
+                // well would draw the subtree a third time, at the identity.
+                None => self.detached(target)?,
             };
-            let instance = self.share(parent, target)?;
+            let instance = match parent {
+                Some(parent) => self.share(parent, target)?,
+                None => {
+                    // An instance node reached with no parent of its own has
+                    // nothing to hang on; its target is what matters and is
+                    // already written.
+                    target
+                }
+            };
+            // The placement of an instance lives on the **instance**, not on the
+            // node it refers to: that is how a file stores the same part twice at
+            // two positions, and the neutral graph keeps it the same way. Dropping
+            // it here collapses every instance of a part onto one place, which is
+            // what made the two screws of a plate render on top of each other.
+            // Only the instance may carry it — with no parent there is no
+            // instance, and putting it on the target would bake one instance's
+            // placement into a subtree shared by several.
+            if parent.is_some() {
+                if !node.transform.is_identity() {
+                    self.build.set_node_transform(instance, &node.transform)?;
+                }
+                if let Some(name) = node.name.as_deref() {
+                    self.build.set_name(instance, name)?;
+                }
+            }
             self.built[index] = Some(target);
             return Ok(instance);
         }
@@ -593,7 +748,10 @@ impl Writer<'_> {
             && node.children.is_empty()
             && matches!(class, BuildNode::Shape | BuildNode::Group);
         let class = if own_shape { BuildNode::Shape } else { class };
-        let slot = self.build.add_node(parent, class, node.name.as_deref())?;
+        let slot = match parent {
+            Some(parent) => self.build.add_node(parent, class, node.name.as_deref())?,
+            None => self.build.add_detached_node(class, node.name.as_deref())?,
+        };
         self.built[index] = Some(slot);
         if !node.transform.is_identity() {
             self.build.set_node_transform(slot, &node.transform)?;

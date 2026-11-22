@@ -347,6 +347,35 @@ fn class_counts(file: &JtFile) -> HashMap<String, usize> {
     out
 }
 
+/// How far below the root a class first appears, following the reference of an
+/// `Instance` to its target the way a consumer walk does. `None` when the class
+/// is unreachable from the root at all. A consumer descends a fixed handful of
+/// classes from the root to reach a part, so this depth is what decides whether
+/// a file renders or merely parses.
+fn depth_of_class(file: &JtFile, class: &str) -> Option<usize> {
+    let graph = file.lsg.as_ref().expect("a scene graph");
+    let mut stack = vec![(graph.root.expect("a root node"), 0usize)];
+    let mut best = None;
+    while let Some((pos, depth)) = stack.pop() {
+        let node = graph.node_at(pos).expect("a node");
+        if node.class_name() == class {
+            best = Some(best.map_or(depth, |seen: usize| seen.min(depth)));
+        }
+        let depth = depth + 1;
+        if let Some(target) = graph.instance_target(node) {
+            stack.push((target, depth));
+        }
+        stack.extend(
+            graph
+                .children_of(node)
+                .into_iter()
+                .flatten()
+                .map(|c| (c, depth)),
+        );
+    }
+    best
+}
+
 /// The shading of every material attribute of a graph, sorted. The writer
 /// collapses materials by their shading values, so the multiset of those values
 /// is what has to survive.
@@ -955,6 +984,8 @@ fn a_model_read_from_jt_needs_no_conversion() {
     // +Z, so writing it back must not insert a scaling root at all. JT itself
     // stores neither, so that declaration is the convention of the format.
     let source = sample("example_block_jt9.5");
+    let data = std::fs::read(&source).expect("the sample must be readable");
+    let file = JtFile::read(&source, &data).expect("the sample must parse");
     let model = ferrojt::open(&source).expect("the sample must open");
     assert_eq!(model.unit.as_deref(), Some("millimeter"));
     assert_eq!(model.up_axis.as_deref(), Some("+Z"));
@@ -968,12 +999,105 @@ fn a_model_read_from_jt_needs_no_conversion() {
         "a millimetre model must not be rescaled: {transform:?}"
     );
     let again = out.to_model();
-    // One node more than the source model: the writer hangs the graph it is
-    // handed under its own root partition, which is where a conversion would
-    // sit — and here it holds none.
-    assert_eq!(again.nodes.len(), model.nodes.len() + 1, "nodes");
+    // Exactly as many nodes as the source model: the partition of the model
+    // **becomes** the root partition of the file rather than hanging under a
+    // second one.
+    assert_eq!(again.nodes.len(), model.nodes.len(), "nodes");
     assert_eq!(again.meshes.len(), model.meshes.len(), "meshes");
     assert_eq!(again.triangle_count(), model.triangle_count(), "triangles");
+    // A consumer reaches a part by descending a fixed handful of classes from
+    // the root, so a root partition holding a second partition leaves the
+    // geometry out of its reach: the file parses, reports a root, and then
+    // never produces a frame. The partition of the model is therefore merged
+    // with the root of the writer, and the part stays where the sample has it.
+    assert_eq!(
+        class_counts(&out).get("Partition").copied(),
+        Some(1),
+        "a written file owns exactly one root partition"
+    );
+    assert_eq!(
+        depth_of_class(&out, "Part"),
+        depth_of_class(&file, "Part"),
+        "the part of the written file sits as close to the root as in the source"
+    );
+    assert_eq!(
+        finest_triangles(&out),
+        finest_triangles(&file),
+        "walking down from the root of the written file finds the geometry of the source"
+    );
+}
+
+#[test]
+fn a_written_file_never_stacks_a_partition_under_its_own_root() {
+    // The blocker an external renderer showed: a file that parsed, reported a
+    // root and produced no frame at all. The writer owned a root partition and
+    // then re-emitted the partition of the model as a child of it, so the part
+    // sat three levels down. A consumer reaches a part by descending a fixed
+    // handful of classes from the root, and a walk that runs out of classes
+    // before it reaches one has nothing to build a shape from.
+    //
+    // So the partition of a model is merged with the root of the writer, and the
+    // depth of the part in a written file is pinned against the file the model
+    // came from.
+    for source in samples() {
+        let label = name(&source);
+        let data = std::fs::read(&source).unwrap_or_else(|err| panic!("{label}: {err}"));
+        let file = JtFile::read(&source, &data).unwrap_or_else(|err| panic!("{label}: {err}"));
+        let model = file.to_model();
+
+        let bytes = jt::model_to_bytes(&model, None)
+            .unwrap_or_else(|err| panic!("{label}: writing failed: {err}"));
+        let out = written(&source, &bytes);
+
+        assert_eq!(
+            class_counts(&out).get("Partition").copied(),
+            Some(1),
+            "{label}: a written file owns exactly one root partition\n{}",
+            classes(&out).join(" ")
+        );
+        let want = depth_of_class(&file, "Part");
+        let got = depth_of_class(&out, "Part");
+        assert!(
+            got.is_some_and(|depth| want.is_some_and(|want| depth <= want)),
+            "{label}: the part must be no deeper than in the source: {got:?} against {want:?}"
+        );
+        assert_eq!(
+            class_counts(&out).get("Partition").copied(),
+            Some(1),
+            "{label}: a written file owns exactly one root partition\n{}",
+            classes(&out).join(" ")
+        );
+        assert_eq!(
+            finest_triangles(&out),
+            finest_triangles(&file),
+            "{label}: walking down from the root must find the geometry of the source"
+        );
+    }
+}
+
+#[test]
+fn a_level_of_detail_span_keeps_its_class_through_the_model_path() {
+    // The reader declares a range span with the class `RangeLOD`, and a model
+    // read out of a JT file carries that name in its node kinds. A writer that
+    // mapped it to a plain group would still produce a file this library reads
+    // back — but the span is what tells a consumer where the levels of detail
+    // begin, so dropping it loses the LOD structure of the file.
+    let source = sample("example_block_jt9.5");
+    let data = std::fs::read(&source).expect("the sample must be readable");
+    let file = JtFile::read(&source, &data).expect("the sample must parse");
+    let spans = class_counts(&file)
+        .get("RangeLOD")
+        .copied()
+        .unwrap_or_default();
+    assert!(spans > 0, "the sample must hold a level-of-detail span");
+
+    let bytes = jt::model_to_bytes(&file.to_model(), None).expect("writing must work");
+    let out = written(&source, &bytes);
+    assert_eq!(
+        class_counts(&out).get("RangeLOD").copied(),
+        Some(spans),
+        "every span of the source must come back as a span"
+    );
 }
 
 #[test]
@@ -1146,6 +1270,110 @@ fn a_shared_subtree_is_instantiated_not_copied() {
         2,
         "the screw must not be copied"
     );
+}
+
+#[test]
+fn an_instance_of_a_sample_keeps_its_placement_and_its_detached_target() {
+    // The plate samples hold one screw and instantiate it twice, at `y = -25`
+    // and `y = +25`. Two rules decide whether that comes out as two screws or
+    // as one:
+    //
+    // - The placement lives on the **instance**, not on the node it refers to.
+    //   A file stores the same part at two positions by giving each instance its
+    //   own `GeometricTransform`; the neutral graph keeps it the same way. An
+    //   instance written without its transform collapses every copy onto one
+    //   place.
+    // - The target is reached **only** through the reference. Hanging it under
+    //   the root as well — which is what a writer that treats it as an ordinary
+    //   child does — draws the subtree a third time, at the identity.
+    //
+    // This goes straight from a JT file through the neutral model to a written
+    // JT file, without a glTF hop, because the hop erases the JT `Instance`
+    // class and the writer would then re-derive instancing from the graph shape.
+    let source = sample("plate1_jt9.5");
+    let data = std::fs::read(&source).expect("the sample must be readable");
+    let file = JtFile::read(&source, &data).expect("the sample must parse");
+    let source_instances = placements(&file);
+    assert_eq!(
+        source_instances.len(),
+        2,
+        "the plate sample instantiates its screw twice"
+    );
+
+    let bytes = jt::model_to_bytes(&file.to_model(), None).expect("writing must work");
+    let out = written(&source, &bytes);
+    let got = placements(&out);
+    assert_eq!(
+        got, source_instances,
+        "every instance of the source must come back with its own placement and name"
+    );
+
+    // The subtree an instance refers to is not a child of anything: the
+    // reference is the only way to it, exactly as in the source.
+    for label in ["source", "written"] {
+        let file = if label == "source" { &file } else { &out };
+        let graph = file.lsg.as_ref().expect("a scene graph");
+        let referenced: Vec<usize> = graph
+            .nodes
+            .iter()
+            .filter_map(|stored| graph.instance_target(&stored.node))
+            .collect();
+        assert_eq!(
+            referenced.len(),
+            2,
+            "{label}: the two instances must name a target"
+        );
+        assert_eq!(
+            referenced[0], referenced[1],
+            "{label}: both instances must share one target rather than copy it"
+        );
+        let target = referenced[0];
+        let as_child = graph
+            .nodes
+            .iter()
+            .filter(|stored| {
+                graph
+                    .children_of(&stored.node)
+                    .into_iter()
+                    .flatten()
+                    .any(|child| child == target)
+            })
+            .count();
+        assert_eq!(
+            as_child, 0,
+            "{label}: the target of an instance must not also hang as a child — \
+             that draws the shared subtree a third time, at the identity"
+        );
+    }
+
+    // And the geometry of both instances is still reachable from the root.
+    assert_eq!(
+        finest_triangles(&out),
+        finest_triangles(&file),
+        "walking down from the root must find the geometry of the source"
+    );
+}
+
+/// Where the instances of a file sit: their translation and their name, sorted
+/// so that the writer's own node order does not matter.
+fn placements(file: &JtFile) -> Vec<([i64; 3], String)> {
+    let graph = file.lsg.as_ref().expect("a scene graph");
+    let mut out: Vec<([i64; 3], String)> = graph
+        .nodes
+        .iter()
+        .filter(|stored| matches!(stored.node, Node::Instance(_)))
+        .map(|stored| {
+            let transform = transform_of(graph, &stored.node);
+            let key = [
+                (f64::from(transform.translation[0]) * 1_000.0).round() as i64,
+                (f64::from(transform.translation[1]) * 1_000.0).round() as i64,
+                (f64::from(transform.translation[2]) * 1_000.0).round() as i64,
+            ];
+            (key, stored.node.name().to_string())
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 #[test]

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import struct
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1171,6 +1172,57 @@ def test_a_written_file_names_its_root_partition(tmp_path) -> None:
 
 
 @needs_sample
+def test_a_written_file_stacks_its_classes_only_once(tmp_path) -> None:
+    """A file written from a model owns exactly one partition, no deeper than the source.
+
+    A model read from JT already carries a root partition, and the writer used to
+    build a second one of its own and hang the model's under it. The file parsed,
+    a consumer reported a root, and then nothing was ever drawn — the part ended
+    up one level deeper than the walk a viewer performs reaches. So the check is
+    structural rather than a picture: one partition, and a part no further down
+    than in the file the model came from.
+    """
+    def depth_of(graph: Any, class_name: str) -> int | None:
+        """The shortest path from the root to a node of that class."""
+        best: int | None = None
+
+        def walk(node: Any, depth: int) -> None:
+            nonlocal best
+            if best is not None and depth >= best:
+                return
+            if node.class_name == class_name:
+                best = depth
+                return
+            for child in node.children():
+                walk(child, depth + 1)
+
+        root = graph.root()
+        if root is not None:
+            walk(root, 0)
+        return best
+
+    source = ferrojt.JtFile(str(BLOCK_95))
+    source.open()
+    model = ferrojt.open(str(BLOCK_95))
+
+    target = tmp_path / "again.jt"
+    model.save(str(target))
+    written = ferrojt.JtFile(str(target))
+    written.open()
+
+    partitions = [n for n in written.lsg.nodes() if n.class_name == "Partition"]
+    assert len(partitions) == 1, "the file owns a single root partition"
+
+    want = depth_of(source.lsg, "Part")
+    got = depth_of(written.lsg, "Part")
+    assert got is not None and want is not None
+    assert got <= want, f"the part sits at depth {got}, the source has it at {want}"
+
+    assert written.lsg.representation_count == model.mesh_count
+    assert sum(m.triangle_count for m in written.lsg.meshes()) == model.triangle_count
+
+
+@needs_sample
 def test_to_bytes_names_the_revision_of_a_jt_export(tmp_path) -> None:
     model = ferrojt.open(str(BLOCK_95))
 
@@ -1239,11 +1291,15 @@ def test_every_reader_declares_the_frame_of_its_model(tmp_path) -> None:
     assert gltf.unit == "meter"
     assert gltf.up_axis == "+Y"
 
-    # Reading a JT file and writing it again needs no conversion at all, so the
-    # graph comes back exactly as deep as it went in.
+    # Reading a JT file and writing it again needs no conversion at all, and the
+    # partition the model carries becomes the root partition of the file rather
+    # than hanging under a second one — a root partition holding another
+    # partition puts the part one level deeper than a consumer walk reaches, and
+    # such a file parses but never renders. So the graph comes back exactly as
+    # deep as it went in.
     target = tmp_path / "frame.jt"
     jt_model.save(str(target))
-    assert ferrojt.open(str(target)).node_count == jt_model.node_count + 1
+    assert ferrojt.open(str(target)).node_count == jt_model.node_count
 
 
 @needs_sample

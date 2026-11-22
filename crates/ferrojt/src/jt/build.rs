@@ -1913,7 +1913,11 @@ fn translation_matrix(translation: [f32; 3]) -> [f64; 16] {
 }
 
 /// The column major matrix of a translation, a quaternion `(x, y, z, w)` and a scale.
-fn placement_matrix(translation: [f32; 3], rotation: [f32; 4], scale: [f32; 3]) -> [f64; 16] {
+pub(crate) fn placement_matrix(
+    translation: [f32; 3],
+    rotation: [f32; 4],
+    scale: [f32; 3],
+) -> [f64; 16] {
     let [x, y, z, w] = rotation;
     let length = (x * x + y * y + z * z + w * w).sqrt();
     let (x, y, z, w) = if length > 0.0 {
