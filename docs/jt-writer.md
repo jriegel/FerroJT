@@ -151,14 +151,25 @@ Read out of the samples, since no reference writer exists:
   for **its own** revision — `1` at 9.x, `2` at 10.x. Zero is fatal: a strict
   consumer reads that value to look the class up and refuses the whole file when
   it names nothing it knows, which is the `Corrupt file detected / Unable in
-  find root node` report on a rewritten file. A rewrite at another revision
-  therefore never keeps the value of the source — but it also never re-frames
-  the atom: a JT 9.x atom carried into a JT 10.x file keeps its `i16`, because
-  the consumer takes the value and not the width of the field. Which width was
-  used is read from the state word `0x4000_0000` that follows it, never inferred
-  from the revision. This applies to a property of a class the reader does not
-  know as well — it cannot be re-serialised, so only its object id and its first
-  class version are patched in place.
+  find root node` report on a rewritten file.
+* **Both the value and the width of that field belong to the revision being
+  written, not to the source.** A JT 9.x atom carried into a JT 10.x file is
+  re-framed from `i16` to `u8`, in **both** slots, and the atom's own length
+  prefix is rewritten with it (`write.rs::set_property_class`). A consumer
+  locates the value through the state word `0x4000_0000`, so a word-framed atom
+  inside a byte-framed file makes it read two bytes early and give up on the
+  rest of the property table: the file parses, `jtinfo` reports a root, and an
+  external renderer draws **nothing** — the shape late loads further down the
+  table are never reached. The samples prove the rule: the JT 10.3 block stores
+  its one atom of the class the reader does not know (`10dd1019`) byte framed
+  (length 15) where the JT 9.5 block stores the same class word framed
+  (length 17), so a CAD system re-frames it too.
+* The same applies to a property of a class the reader does not know — it cannot
+  be re-serialised, so the atom is cloned and its object id and **both** class
+  versions are patched in place, with the body re-framed and its length prefix
+  corrected. Which width the **source** used is read from the state word, never
+  inferred from the revision; `element.base_type` is `0` for an unknown class
+  and must not be used for framing either.
 * Element: `i32 length | GUID | u8 base type | i32 object id | body`, where the
   length excludes its own field — the stride of an atom is `4 + length`. The
   envelope of a known class is 25 bytes, of an unknown class 20. A **non-LSG**
@@ -179,6 +190,49 @@ Read out of the samples, since no reference writer exists:
 * LSG body: node and attribute atoms, end of elements, property atoms, end of
   elements, then the table `i16 version | i32 rows | rows × (i32 object,
   (i32 key, i32 value)×, i32 0)`.
+* The `Shape` vertex binding tail is framed by the revision **being written**,
+  not copied from the source: three `i32` bindings plus four quantization bytes
+  at 8.x (16 bytes), an `i16` version plus an 8-byte binding plus quantization
+  plus a second binding from version 2 on at 9.x (22 bytes, quantization at
+  offset 10), and a `u8` version plus one 8-byte binding at 10.x (9 bytes). A
+  rewrite that changes revision and keeps the source layout leaves 22 bytes
+  where a consumer expects 9, and every field after it — and every node after
+  it — is read from the wrong offset. `write_shape_lod` re-frames it;
+  `a_shape_tail_is_re_framed_for_the_revision_being_written` pins the three
+  lengths.
+* A CDP data package never uses codec `0` (null) unless it is **empty**. Every
+  real file stores codec `1` (bitlength2) for its coordinates, normals, indices,
+  valences and groups, and a consumer that renders refuses a package whose codec
+  it did not expect. `package2` therefore always writes codec 1 and encodes the
+  values itself.
+* The JT 9.x **fixed-range** form of bitlength2 cannot carry a span of 2³¹ or
+  more. The decoder reads `max − min` as a *signed* integer and fills the whole
+  package with the minimum when that value is not positive, so a package holding
+  raw IEEE bit patterns — which is what `package2_words` feeds in for a
+  coordinate — silently decodes as a run of identical values. Such a package
+  goes down the **variable** branch instead (`write_variable_bits`), which the
+  same decoder reads correctly at 9.x. `every_package_we_write_decodes_back_with_its_own_codec`
+  round-trips every package the writer emits through its own decoder at both
+  revisions, which is how the overflow was found.
+* A topological shape whose vertex binding announces a flag bit must actually
+  carry the per-normal **flag package** after the normals. The OpenJT reader
+  ignores that section, a rendering consumer stops on the missing field and
+  draws nothing.
+* A **context-7 attribute mask** is widened by two **auxiliary streams**, and
+  both need one value per mask symbol even when no bit above 29 is ever set.
+  `mask_context(degree) = (degree − 2).clamp(0, 7)`, so context 7 means a coder
+  vertex of degree ≥ 9; the decoder indexes `_faceAttributeMask8_30` and
+  `_faceAttributeMask8_4` with the *same* read position as the mask itself and
+  ORs both at bit 30. `encode.rs` keeps them in `Streams::attr_masks_high`,
+  pushes a `0` for every context-7 symbol, and emits them after the eight degree
+  packages — two packages at 9.x, one at 10.x, where the second is never read.
+  A consumer that renders refuses a context-7 face whose auxiliary streams are
+  empty, so the whole shape comes out blank. A cube (degrees 4 and 6) and an
+  octahedron (degree 4) can never reach context 7, and the screws of
+  `opening_protection_plate1` are the only degree-9 coder vertices in the
+  samples — which is why every block rewrite rendered and only the plate did
+  not. `a_context_seven_face_carries_both_auxiliary_mask_streams` pins it on a
+  nine-gon bipyramid, whose two apices have degree 9.
 
 ## Deliberate deviations
 
@@ -226,7 +280,11 @@ source:
   the only comparison that survives the coder re-ordering the vertex table. The
   class version of every property atom is checked too, in the bytes of the scene
   graph rather than through the parsed graph, because a property of an unknown
-  class never reaches the parsed graph at all.
+  class never reaches the parsed graph at all. The check covers the **width** of
+  that field as well as its value, and
+  `an_unknown_property_class_is_re_framed_for_the_revision_being_written` runs it
+  on the single atom of a class the reader does not know that the JT 9.5 block
+  carries.
 * **a shape without geometry**: a write that keeps only the finest tier leaves a
   coarse `Shape` node with no late load at all, and its dump must still be valid
   JSON. None of the five reference dumps has such a node, so the byte-for-byte
@@ -237,10 +295,33 @@ source:
   glTF conversion at every revision and a hand-built chain at each of the four,
   and hands each result to `jtinfo.exe` from the JT tooling. A file counts as
   accepted only when it reports at least one assembly — `0` means the file parsed
-  but its root was lost, which is a failure. Three rejections found that way are
+  but its root was lost, which is a failure. Four rejections found that way are
   pinned above: an uncompressed capable segment, a property atom naming class
-  version zero, and a property atom of a restructured write naming the class
-  version of the source. All 46 outputs pass now.
+  version zero, a property atom of a restructured write naming the class version
+  of the source, and a root `Partition` with an empty file name. All 46 outputs
+  pass now. The number of properties `jtinfo` prints is **not** part of the
+  verdict: a good JT 9.5 rewrite reports 18 where a good 10.x rewrite reports 9
+  and a converted file reports 0, and all of them render.
+* **an external renderer**: `jtinfo.exe` reports a triangle count taken from the
+  key/value meta data, not from the geometry, so accepting a file says nothing
+  about whether anything can be drawn from it. The geometry oracle is a viewer
+  that actually renders: `node render-jt.mjs --input <file.jt> --output <png>
+  --view iso`. A file with no drawable geometry does not report an error — it
+  parses, resolves, and then **hangs** until the stream times out and no PNG is
+  written. `target/novorender.py` runs a list of files through it and prints
+  the count of non-background pixels per picture, which is how the codec,
+  flag-field, shape-tail, auxiliary-mask and instance defects above were
+  confirmed fixed. A written file has to measure what its source does:
+
+  | Input | Written | Ink pixels |
+  | --- | --- | --- |
+  | `example_block` at 9.5 or 10.3 | either revision, all levels, no filter | 590 296 |
+  | `opening_protection_plate1_jt9.5` | 9.5 and 10.3, rewriter and model path | 291 167 |
+  | `SampleJT_Server.jt` | 9.5, all levels, no filter | 356 011 |
+  | `TestBlock.glb` converted to JT | 10.3 | 628 416 |
+
+  One representation of the plate — a 152-triangle screw — measures 207 109 on
+  its own, and that is the fixture the encoder bisection ran on.
 
 ## Open work
 

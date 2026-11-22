@@ -109,7 +109,10 @@ Shape = meshes · Group = nodes − meshes + 1 · Instance = extra placements + 
 
 The five extra nodes are the wrapper of the next section; the `+1` on `Group` is
 the tier group of that wrapper, and the `+1` on `Instance` is the instance that
-names the wrapper part.
+names the wrapper part. So the written LSG holds `model.nodes.len() + 5 +
+instances` nodes for a model that arrives without JT classes — every glTF file
+and any graph built by hand — and `+ 1` for a model read out of a JT file, which
+brings its own partition and is merged with the root rather than wrapped.
 
 Two demotions are deliberate. A `Shape` node whose mesh has no geometry becomes
 a `Group` (glTF mandates a `POSITION` attribute, and an empty JT shape is not
@@ -139,9 +142,18 @@ Partition -> MetaData -> Instance -> Part -> RangeLOD -> Group -> the graph of t
 * The span holds exactly **one** tier, a `Group`, because a neutral model has one
   representation per node — LOD 0, the finest. `a_converted_file_wraps_its_graph_in_the_classes_a_consumer_walks`
   walks the six classes and pins that single tier.
-* `already_wrapped` stops a second chain: a model that came out of a JT file
-  already carries `Partition`/`Part`/`MetaData`/`LOD`/`RangeLOD` classes, so its
-  graph is written as it is and gains only the root partition.
+* `partition_root` merges instead of stacking. The builder always owns a root
+  partition, and a model read out of a JT file brings one of its own. Adopting
+  that node — moving its children and its transform onto the builder root — is
+  what keeps the file to exactly one partition. Stacking a second one under the
+  root puts the `Part` a level deeper than the fixed handful of classes a
+  consumer descends to reach geometry, and such a file parses, reports a root,
+  and then never produces a frame: the external renderer sits idle until its
+  stream times out rather than reporting an error.
+* `already_wrapped` stops a second chain for the rest of the classes: a model
+  that carries a `Part`, `MetaData`, `LOD` or `RangeLOD` but no partition of its
+  own has its graph written as it is, because wrapping it would duplicate the
+  classes a consumer walks down to the geometry.
 
 `a_converted_file_wraps_its_graph_in_the_classes_a_consumer_walks` (Rust) and
 `test_a_converted_file_wraps_its_graph_in_the_classes_a_consumer_walks` (Python)
@@ -168,6 +180,27 @@ subtree. That doubles as the cycle guard.
 one screw twice, the source has two `Instance` nodes, the written file has one
 (the second placement is reached through the shared subtree), and the model read
 back still reports two meshes.
+
+Two things belong to the `Instance` itself rather than to the subtree it refers
+to, and both were missing at first:
+
+* **Its placement and its name.** The `GeometricTransform` of an instance node
+  goes on the `Instance` (`set_node_transform`), as does its name. Putting it on
+  the target instead — or dropping it — collapses every placement of a part onto
+  one place: the two screws of the plate, at `y = −25` and `y = +25`, drew on top
+  of each other.
+* **A target no child list refers to.** `Writer::place` writes a node detached
+  (`add_detached_node`) when nothing above it names it as a child, which is how
+  every sample stores a part: it is reached only through the reference of an
+  `Instance`. Hanging it under the root as well draws the shared subtree a third
+  time, at the identity.
+
+`an_instance_of_a_sample_keeps_its_placement_and_its_detached_target` pins both
+for `opening_protection_plate1_jt9.5` — the translations and names of the two
+instances, that they share one target, and that this target is a child of no
+node at all. It goes from the file straight through `to_model()` and
+`model_to_bytes` **without a glTF hop**, because a glTF hop turns the JT
+`Instance` class into a `Group` and the test would then prove nothing.
 
 ## Materials
 

@@ -701,18 +701,35 @@ Upload with `python -m twine upload dist\*`.
   single rule — 1 at 9.x, 2 at 10.x — used by the builder in both slots and by
   `write.rs::string_property_body` / `late_loaded_property_body`. An **unknown**
   class cannot be re-serialised, so `write_property_atom` clones the atom and
-  patches the object id and the first version in place (`set_property_class`).
-  **Keep the framing of the source** — a consumer takes the value, not the width
-  of the field, and re-framing alone still gave exit 5. Detect the width from the
-  state word `PROPERTY_STATE = 0x4000_0000` (`has_state` at `at+1` = byte, `at+2`
-  = word), **never from the revision**; `PROPERTY_VERSION_OFFSET = 25` is the
-  first version inside the atom. `element.base_type` is `0` for an unknown class,
-  so never use it for framing. Pinned by four unit tests in `write.rs` and, at
-  file level, by `a_rewritten_file_names_the_class_version_of_its_own_revision`
-  in `tests/write.rs` — which frames the LSG payload itself (two end-of-elements
+  patches the object id and **both** versions in place (`set_property_class`).
+  **The width of the version field belongs to the revision being written, not to
+  the source** — byte at 10.x, word below. A consumer finds the value at the
+  state word, so a word-framed atom inside a 10.x file makes it read the value
+  two bytes early and give up on the rest of the property table: the file
+  parses, `jtinfo` reports a root, and an external renderer draws **nothing**,
+  because the shape late loads further down the table are never reached. That
+  was the last blank render of a 9.5 → 10.3 rewrite. The real 10.3 sample proves
+  the rule: it stores its one atom of the unknown class `10dd1019` **byte**
+  framed (`len 15`) where the 9.5 sample stores the same class **word** framed
+  (`len 17`) — a CAD system re-frames it. `set_property_class` re-frames the
+  body and rewrites the atom's own **length prefix**, which changes with it.
+  Detect the *source* width from the state word `PROPERTY_STATE = 0x4000_0000`
+  (`has_state` at `at+1` = byte, `at+2` = word); `PROPERTY_VERSION_OFFSET = 25`
+  is the first version inside the atom. `element.base_type` is `0` for an unknown
+  class, so never use it for framing. Pinned by five unit tests in `write.rs`
+  and, at file level, by `a_rewritten_file_names_the_class_version_of_its_own_revision`
+  (which now also asserts the **width** matches the revision) and
+  `an_unknown_property_class_is_re_framed_for_the_revision_being_written` in
+  `tests/write.rs` — both frame the LSG payload itself (two end-of-elements
   sections; the property atoms are in the second) because
   `model.rs::read_property_atoms` **skips** an unknown-class atom entirely, so
-  the parsed graph cannot show it.
+  the parsed graph cannot show it. Note `class_of` returns `None` for that class,
+  so a scan must test `!matches!(known, Some(c) if c != Class::Property)`, not
+  `== Some(Class::Property)`.
+- **`jtinfo`'s `# Properties:` count is NOT a geometry oracle.** The 9.5 source
+  and a good 9.5 rewrite report 18, but a *good* 10.x rewrite reports 9 and a
+  model-path 10.x file reports 0 — all of them render. Only `# JtkAssemblies: ≥ 1`
+  plus the NOVO render decide anything.
 - **A root `Partition` MUST carry a non-empty file name and a property-table row,
   or a strict consumer refuses the file.** `JTData_SceneGraph.cxx:152-176` creates
   the root node **only when `FileName()` is non-empty** and then asserts one
@@ -757,6 +774,54 @@ Upload with `python -m twine upload dist\*`.
   therefore compares `values()` (every property that is *not* a late load) for
   equality and `late_loads()` as `<=` — asserting the whole property list equal
   is wrong.
+- **A CDP package is never codec 0 unless it is empty.** `encode.rs::package2`
+  writes the value count first, and only the count-0 case may return before the
+  codec byte; emitting `0` (null) for a non-empty package makes every consumer
+  read **zero** vertices, i.e. a file that loads and draws nothing.
+- **The JT 9.x fixed-range bitlength2 branch cannot carry a span ≥ 2³¹** — the
+  spec reads the range back as a *signed* word and fills every value with `min`
+  when it is not positive. Such packages take the variable branch
+  (`encode.rs::write_variable_bits`, `CHANGE_BITS`/`RUN_BITS` = 3).
+- **A topological shape needs a flag package per normal**, after the normals:
+  `i32 count` + `package2(&vec![0; n])`. Without it the decoder stops short of
+  the next channel.
+- **The `Shape` vertex-binding tail is framed by the revision being written,
+  not the source**: 16 B at 8.x, 22 B at 9.x, 9 B at 10.x. Keeping the source
+  framing across a revision change shifts every following node.
+- **`class_of` must map `"RangeLOD"` and `"LOD"` to `BuildNode::RangeLod`.**
+  Anything else silently downgrades a level-of-detail span to a `Group`, and a
+  consumer walking `Part → RangeLod → tier` finds no tier.
+- **A context-7 attribute mask needs one value in *each* auxiliary mask stream,
+  even a zero.** `mask_context(degree) = (degree - 2).clamp(0, 7)`, so context 7
+  means a coder vertex of degree ≥ 9, and the reader
+  (`JtDecode_MeshCoderDriver.cxx:1390-1411`) indexes `_faceAttributeMask8_30` and
+  `_faceAttributeMask8_4` with the **same read position** as the mask itself and
+  ORs both at bit 30. `encode.rs` therefore pushes a `0` into
+  `Streams::attr_masks_high` for every context-7 mask symbol and emits it after
+  the eight degree packages — **two** packages at 9.x, **one** at 10.x, where the
+  second is never read. Empty aux packages make a strict consumer refuse that
+  face, i.e. the whole shape renders blank. A cube (degrees 4/6) and an
+  octahedron (degree 4) can never reach context 7, and the **plate** is the only
+  sample with degree-9 coder vertices (its screws) — which is why every block
+  rewrite rendered and only the plate came out empty. Splice proof: swapping only
+  those two packages of the CAD's own shape segment gives 207 109 ink px, while
+  swapping only the context-7 mask word gives 0. Pinned by
+  `a_context_seven_face_carries_both_auxiliary_mask_streams` (`encode.rs::tests`,
+  fixture `enneagon_bipyramid()` = two apices of 9 triangles). When walking the
+  body by hand, the 64-bit vertex binding is **8** bytes (flag + `i32` + 3), not
+  9, and a count-0 package decodes to `Payload::Null(vec![])` — test emptiness
+  with `out_val_count()`, never `is_empty()`.
+- **`jtinfo.exe` is not a geometry oracle.** Its `# Triangles:` comes from
+  key/value metadata, so it reports a healthy number for a file that draws
+  nothing. Use it only for the structural verdict; the geometry oracle is
+  `C:\Tools\20261113_Mercedes_NOVO\render-jt.mjs` (Node + Playwright driving
+  `UberEngineServer.exe`), wrapped by `target\novorender.py`, which prints the
+  count of ink pixels of the PNG it writes (`-1` = no PNG = hang). Every good
+  render measures the same as its source: block **590 296** at 9.5 and at 10.3,
+  plate1-9.5 **291 167** (rewriter *and* model path), `SampleJT_Server.jt`
+  **356 011** (written at 9.5, all LODs, no layer filter), and a `TestBlock.glb`
+  conversion **628 416**. One plate representation (a 152-triangle screw) alone
+  measures 207 109 — that is the fixture the encoder bisection used.
 - **The revision a file is written at is `jt::JtVersion`** (`jt/version.rs`,
   re-exported, `Default = V10_3`). Consts `V8_0/V8_1/V9_5/V10_3`; the gates are
   methods — `offsets_are_32_bit()` (<10), `versions_are_bytes()` (≥10),
@@ -902,9 +967,35 @@ Upload with `python -m twine upload dist\*`.
   Shape = meshes · Group = nodes − meshes + 1 · Instance = extra + 1`;
   `Node::kind` is the free-form class carrier that round-trips through
   `class_of`, and anything unknown becomes `Group`. Written LSG node count ==
-  `model.nodes.len() + 6 + instances` for a glTF-sourced model, `+ 1` for a
-  JT-sourced one — `already_wrapped()` sees a `Partition`/`Part`/`MetaData`/`LOD`/
-  `RangeLOD` class in the model and skips the wrapper.
+  `model.nodes.len() + 5 + instances` for a glTF-sourced model, `+ 1` for a
+  JT-sourced one — `already_wrapped()` sees a `Part`/`MetaData`/`LOD`/`RangeLOD`
+  class in the model and skips the wrapper, `partition_root()` sees a `Partition`
+  and **merges** it (see the next bullet).
+- **A model that carries its own `Partition` is merged with the builder root, not
+  stacked under it.** `partition_root()` finds the scene root whose class is
+  `Partition` and `Writer::adopt` moves its children and transform onto the
+  builder's own root, so the file owns exactly one partition. Stacking a second
+  one put the `Part` one level deeper than the fixed handful of classes a
+  consumer descends to reach geometry: the file **parses**, `jtinfo` reports
+  `# JtkAssemblies: 1`, and the external renderer then produces **no frame at
+  all** — `render-jt.mjs` sits idle for 300 s and dies with
+  `WebSocket closed unexpectedly (code 1000, clean=false)`, exit 1, no PNG. That
+  silent hang, not an error, was the "viewers show an empty render" report.
+- **An `Instance` carries its own placement, and its target is a *detached* node.**
+  In `jt/from_model.rs` the `GeometricTransform` **and** the name of an instance
+  node go on the `Instance` (`set_node_transform` / `set_name`), never on the node
+  it refers to. Dropping them collapses every instance of a part onto one place —
+  the two screws of the plate (t = [0,−25,15] and [0,+25,15]) drew on top of each
+  other. And the target must be created with `JtBuilder::add_detached_node`:
+  `Writer::place(index, Option<JtNode>)` / `Writer::detached()` write it when no
+  child list refers to it, exactly as every sample stores a part. Hanging it under
+  the root as well draws the shared subtree a **third** time at the identity.
+  Plate model path: 280 046 → 267 466 (transform) → **291 167** (detached) = the
+  exact source baseline. Pinned by
+  `an_instance_of_a_sample_keeps_its_placement_and_its_detached_target`
+  (`tests/gltf.rs`, plate1-9.5 straight through `to_model()` → `model_to_bytes`
+  with **no glTF hop**, so the JT `Instance` class survives; a glTF hop turns it
+  into a `Group` and the test would prove nothing).
 - **A converted file must carry the chain a consumer walks.** Shapes straight
   under the root partition leave a strict importer with nothing, which is the
   "the external program cannot load the converted JT" report. `Writer::wrap` in
