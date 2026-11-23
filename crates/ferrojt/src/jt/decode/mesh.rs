@@ -567,7 +567,7 @@ pub struct MeshInput {
     attr_masks: [Package; 8],
     mask8_30: Package,
     mask8_4: Package,
-    attr_masks_large: Package,
+    attr_masks_large: Vec<u32>,
     split_faces: Package,
     split_positions: Package,
 }
@@ -595,7 +595,10 @@ impl MeshInput {
         } else {
             Package::load2(cursor)?
         };
-        let attr_masks_large = Package::load2(cursor)?;
+        // The masks of faces with more than 64 attributes are a plain VecU32,
+        // not a codec package; files without such faces store an empty one.
+        let attr_masks_large_count = cursor.read_len()?;
+        let attr_masks_large = cursor.read_u32_vec(attr_masks_large_count)?;
         let split_faces = Package::load2(cursor)?;
         let split_positions = Package::load2(cursor)?;
         // A trailing checksum over the symbols is not verified by the reader.
@@ -634,12 +637,7 @@ impl MeshInput {
             face_flags: self.face_flags.decode(order, Unpack::Lag1)?,
             mask8_30: self.mask8_30.decode(order, Unpack::Null)?,
             mask8_4: self.mask8_4.decode(order, Unpack::Null)?,
-            attr_masks_large: self
-                .attr_masks_large
-                .decode(order, Unpack::Null)?
-                .into_iter()
-                .map(|value| value as u32)
-                .collect(),
+            attr_masks_large: self.attr_masks_large,
             split_faces: self.split_faces.decode(order, Unpack::Lag1)?,
             split_positions: self.split_positions.decode(order, Unpack::Null)?,
             ..Symbols::default()
@@ -1230,6 +1228,28 @@ mod tests {
         // stream, so a short tail reads past it; the zeros stand in for that.
         let bits = symbols.next_attr_mask_bits(96);
         assert_eq!(bits, vec![8, 0, 0, 0]);
+    }
+
+    #[test]
+    fn wide_masks_are_stored_as_plain_words() {
+        // Every package of the symbol block is empty except the wide masks,
+        // which are a count and that many raw words, then the hash follows.
+        let empty = 0i32.to_le_bytes();
+        let mut data = Vec::new();
+        for _ in 0..20 {
+            data.extend_from_slice(&empty);
+        }
+        data.extend_from_slice(&3i32.to_le_bytes());
+        for word in [0x8000_0001u32, 2, 0xFFFF_FFFF] {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        data.extend_from_slice(&empty); // split faces
+        data.extend_from_slice(&empty); // split positions
+        data.extend_from_slice(&0x1234_5678u32.to_le_bytes()); // hash
+        let mut cursor = Cursor::new(&data, ByteOrder::Little, 10);
+        let input = MeshInput::load(&mut cursor).expect("load");
+        assert_eq!(cursor.remaining(), 0);
+        assert_eq!(input.attr_masks_large, [0x8000_0001, 2, 0xFFFF_FFFF]);
     }
 
     #[test]
