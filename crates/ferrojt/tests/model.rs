@@ -1081,3 +1081,21 @@ fn asking_for_a_filter_the_file_does_not_declare_fails() {
         );
     }
 }
+
+#[test]
+fn a_move_to_front_package_decodes() {
+    // The JT 10.5 NIST assembly stores integer packages with the move-to-front
+    // codec (mark 2 codec 5). Before that codec was read, every shape segment
+    // that used it failed and the assembly exported no mesh at all.
+    let model = sample("NIST/nist-mtc-assembly.jt").to_model();
+    assert!(
+        model.meshes.len() >= 7,
+        "the assembly holds only {} meshes",
+        model.meshes.len()
+    );
+    assert!(
+        model.triangle_count() >= 43_924,
+        "the assembly holds only {} triangles",
+        model.triangle_count()
+    );
+}
