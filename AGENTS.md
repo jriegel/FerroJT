@@ -141,6 +141,16 @@ Upload with `python -m twine upload dist\*`.
   element end; the Rust reader mirrors that tolerance. `JtData_Vector::operator[]`
   is unbounds-checked — never reproduce an out-of-bounds read (the `RangeLOD`
   `limits` off-by-one is fixed as `limits.get(1..).unwrap_or(&[])`).
+- **The topology of a real CAD file can name a vertex index past its own
+  coordinate array** — 98 of the 9,302 files of `C:\Data\CLA_EXPORT_JR` do it,
+  usually exactly `index == unique_vertex_count`. `decode/vertex.rs::Decoded::get`
+  must stay bounds-safe and read `0.0` (it panicked on `data[i * comp_count + j]`
+  until that was fixed, and one bad index lost the whole file); the copy loop in
+  `object.rs` pads zeros and emits one `tracing::warn!` per shape naming how many
+  components were out of range. `is_within(i)` is the predicate. Pinned by
+  `a_read_past_the_decoded_array_reads_as_zero`. Sweeping such a corpus from
+  Python needs `except BaseException`: pyo3 surfaces a Rust panic as
+  `PanicException`, which does **not** derive from `Exception`.
 - **LOD tier is positional, not encoded.** JT never stores a tier: it is the child
   position under `RangeLod` (first group = 0, next = 1, …). Segment type cannot
   identify it — JT 8.x/10.x use types 7..10 for LOD0..LOD3, but JT 9.x uses type 6

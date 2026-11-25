@@ -127,6 +127,15 @@ it against the symbols (`TopologySymbols::composite`). A mismatch is reported as
 warning naming both hashes — the strongest available check that a stream was read
 with the right framing, since a wrong reading of any package changes the hash.
 
+Last, a file can be internally inconsistent: the topology of a shape may name a
+vertex index at or just past the end of the coordinate array the file itself
+declares (98 of the 9,302 files of one Teamcenter export do it, usually exactly
+`index == unique_vertex_count`). The C++ reference walks off the end there,
+because `JtData_Vector::operator[]` is unbounds-checked. FerroJT never reproduces
+that read: `Decoded::get` returns 0 for an index outside the array, and
+`object::read_topologically_compressed_data` counts the affected components and
+reports them with one warning per shape. The rest of the shape survives.
+
 ## Materials and colours
 
 A JT file stores a fixed-function colour set — ambient, diffuse, specular,

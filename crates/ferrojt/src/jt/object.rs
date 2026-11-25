@@ -1537,12 +1537,25 @@ fn read_topologically_compressed_data(
         let indices = unified.indices().to_vec();
         let mut vertices = Vec::with_capacity(pairs * unique_vertices.comp_count());
         let mut normals = Vec::with_capacity(pairs * unique_normals.comp_count());
+        let mut past_end = 0_usize;
         for &source in unified.sources().iter().take(pairs) {
             let index = usize::try_from(source).unwrap_or(usize::MAX);
             let vertex = vertex_indices.get(index).copied().unwrap_or(-1);
             let normal = normal_indices.get(index).copied().unwrap_or(-1);
-            copy_component(&unique_vertices, vertex, &mut vertices);
-            copy_component(&unique_normals, normal, &mut normals);
+            if !copy_component(&unique_vertices, vertex, &mut vertices) {
+                past_end += 1;
+            }
+            if !copy_component(&unique_normals, normal, &mut normals) {
+                past_end += 1;
+            }
+        }
+        if past_end != 0 {
+            tracing::warn!(
+                "a shape names {past_end} vertex components outside its decoded arrays \
+                 ({} vertices, {} normals); they read as zero",
+                unique_vertices.count(),
+                unique_normals.count()
+            );
         }
         return Ok(LodGeometry {
             indices,
@@ -1574,13 +1587,23 @@ fn read_topologically_compressed_data(
 }
 
 /// Copy one vertex/normal out of a decoded component array.
-fn copy_component(decoded: &Decoded, index: i32, out: &mut Vec<f32>) {
+///
+/// Returns whether `index` really names an element: the reference reads the
+/// array unchecked, so a shape whose topology names a vertex past its end used
+/// to read whatever followed it in memory. Zero is the deterministic stand-in.
+fn copy_component(decoded: &Decoded, index: i32, out: &mut Vec<f32>) -> bool {
     let Ok(index) = usize::try_from(index) else {
         out.resize(out.len() + decoded.comp_count(), 0.0);
-        return;
+        return false;
     };
-    for component in 0..decoded.comp_count() {
-        out.push(decoded.get(index, component));
+    if decoded.is_within(index) {
+        for component in 0..decoded.comp_count() {
+            out.push(decoded.get(index, component));
+        }
+        true
+    } else {
+        out.resize(out.len() + decoded.comp_count(), 0.0);
+        false
     }
 }
 

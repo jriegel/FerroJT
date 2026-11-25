@@ -464,9 +464,23 @@ impl Decoded {
     }
 
     /// The component `j` of element `i`.
+    ///
+    /// An index past the end reads as zero: the reference indexes the decoded
+    /// array without a bounds check, so a file whose data runs short would read
+    /// whatever follows it in memory. See [`Decoded::is_within`].
     #[must_use]
     pub fn get(&self, i: usize, j: usize) -> f32 {
-        self.data[i * self.comp_count + j]
+        i.checked_mul(self.comp_count)
+            .and_then(|at| at.checked_add(j))
+            .and_then(|at| self.data.get(at))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Whether element `i` really is in the array.
+    #[must_use]
+    pub fn is_within(&self, i: usize) -> bool {
+        i < self.count
     }
 
     /// The raw values, row major.
@@ -574,6 +588,32 @@ mod tests {
         assert_eq!(vertices.out_comp_count(), 1);
         let decoded = vertices.decode(ByteOrder::Little).expect("decode");
         assert_eq!(decoded.get(0, 0), 2.5);
+    }
+
+    #[test]
+    fn a_read_past_the_decoded_array_reads_as_zero() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1i32.to_le_bytes()); // element count
+        data.push(1); // components
+        for _ in 0..3 {
+            data.extend_from_slice(&0.0f32.to_le_bytes());
+            data.extend_from_slice(&0.0f32.to_le_bytes());
+            data.push(0); // no quantization
+        }
+        // 2.5 = 0x40200000 -> exponent field 0x80, mantissa 0x200000.
+        null_package2(&[0x80], &mut data);
+        null_package2(&[0x0020_0000], &mut data);
+        data.extend_from_slice(&0i32.to_le_bytes()); // hash
+        let mut cursor = Cursor::new(&data, ByteOrder::Little, 9);
+        let mut vertices = VertexData::load_compressed_coords(&mut cursor).expect("load");
+        let decoded = vertices.decode(ByteOrder::Little).expect("decode");
+        assert_eq!(decoded.get(0, 0), 2.5);
+        assert!(decoded.is_within(0));
+        assert!(!decoded.is_within(1));
+        // A topology naming the element past the end used to panic here; the
+        // reference reads unbounds-checked memory instead.
+        assert_eq!(decoded.get(1, 0), 0.0);
+        assert_eq!(decoded.get(usize::MAX, usize::MAX), 0.0);
     }
 
     #[test]
