@@ -978,6 +978,19 @@ fn package2_words(words: &[u32], version: JtVersion, out: &mut Vec<u8>) {
     package2(&values, version, out);
 }
 
+/// Appends the high-degree face attribute masks: a bare `VecU32`, i.e. `i32
+/// count` followed by the words themselves.
+///
+/// Of all the symbol streams of a topological shape this is the only one the
+/// format does not store as an integer codec package, so no codec byte follows
+/// the count. The reader mirrors that in `mesh::read_u32_array`.
+fn write_u32_array(words: &[u32], out: &mut Vec<u8>) {
+    write_u32(out, words.len() as u32);
+    for &word in words {
+        write_u32(out, word);
+    }
+}
+
 /// The smallest nibble count a `nibblerGet` of that many nibbles returns `value`
 /// for. Each nibble carries four bits low-first and the reader sign-extends from
 /// the whole run, so the count has to be exact.
@@ -1091,7 +1104,7 @@ fn write_mesh_input(streams: &Streams, version: JtVersion, out: &mut Vec<u8>) {
     if auxiliary_pair {
         package2(&streams.attr_masks_high, version, out);
     }
-    package2_words(&streams.attr_masks_large, version, out);
+    write_u32_array(&streams.attr_masks_large, out);
     package2(&lag1_residuals(&streams.split_faces), version, out);
     package2(&streams.split_positions, version, out);
     write_u32(
@@ -1591,6 +1604,45 @@ mod tests {
             indices.extend_from_slice(&[1, 2 + next, 2 + step]);
         }
         MeshData::new(vertices, indices).expect("a bipyramid is a valid mesh")
+    }
+
+    /// A closed bipyramid over a seventy-gon: its two apices are coder faces of
+    /// **degree seventy**. That is the first degree whose attribute mask no
+    /// longer fits the eight inline streams — the reader takes
+    /// `ceil(70 / 32) = 3` words per apex from the high-degree array, which the
+    /// format stores as a plain array rather than a codec package.
+    fn heptegintagon_bipyramid() -> MeshData {
+        let base = 70i32;
+        let mut vertices = vec![0.0, 0.0, 1.0, 0.0, 0.0, -1.0];
+        for step in 0..base {
+            let angle = std::f32::consts::TAU * step as f32 / base as f32;
+            vertices.extend_from_slice(&[angle.cos(), angle.sin(), 0.0]);
+        }
+        let mut indices = Vec::new();
+        for step in 0..base {
+            let next = (step + 1) % base;
+            indices.extend_from_slice(&[0, 2 + step, 2 + next]);
+            indices.extend_from_slice(&[1, 2 + next, 2 + step]);
+        }
+        MeshData::new(vertices, indices).expect("a bipyramid is a valid mesh")
+    }
+
+    /// The high-degree attribute masks must be framed exactly as the format
+    /// stores them. Written as a codec package they shift every following
+    /// stream, and because the array is the last one before the split symbols
+    /// the coder then dies on garbage: the shape is dropped without a word of
+    /// complaint beyond the exhausted-stream message.
+    #[test]
+    fn a_wide_attribute_mask_round_trips_through_the_plain_array() {
+        let mesh = heptegintagon_bipyramid();
+        let encoded = encode(&mesh).expect("the bipyramid can be encoded");
+        assert!(
+            !encoded.streams.attr_masks_large.is_empty(),
+            "the fixture never reached the high-degree attribute masks, so it \
+             proves nothing"
+        );
+        // 140 triangles of three corners each.
+        round_trip(&mesh, 420);
     }
 
     /// The two auxiliary attribute-mask streams of a body, read in the order

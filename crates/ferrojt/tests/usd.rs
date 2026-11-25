@@ -73,7 +73,7 @@ const EXPECTED: &[(&str, Expectation)] = &[
     (
         "SampleJT_Server.jt",
         Expectation {
-            meshes: 105,
+            meshes: 106,
             materials: 23,
             shared: 529,
             filter: None,

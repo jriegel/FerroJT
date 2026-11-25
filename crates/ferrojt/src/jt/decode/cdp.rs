@@ -7,7 +7,10 @@
 //!
 //! Both framings wrap one of the codecs in [`super::codecs`], optionally with a
 //! nested out-of-band package for the values the probability table cannot
-//! express. The compressed words are kept as loaded and only turned into
+//! express. Codec id 5 is a *move-to-front* package instead: it holds two
+//! complete nested packages, the window values and the window offsets.
+//!
+//! The compressed words are kept as loaded and only turned into
 //! integers by [`Package::decode`], which consumes the package.
 
 use super::bits::{raw_cursor, u32_slice};
@@ -28,6 +31,17 @@ const CODEC_HUFFMAN: u8 = 2;
 const CODEC_ARITHMETIC: u8 = 3;
 /// Mark 2 split value codec.
 const CODEC_CHOPPER: u8 = 4;
+/// Move-to-front pseudo-codec, legal in both framings.
+const CODEC_MTF: u8 = 5;
+
+/// How many recent values a move-to-front window remembers.
+const MTF_WINDOW: usize = 16;
+
+/// How deeply packages may nest before the file is refused.
+///
+/// The spec allows eight levels; real writers stay far below that, and the
+/// guard keeps a hostile file from recursing until the stack is gone.
+const MAX_DEPTH: u8 = 32;
 
 /// The bit-based codecs reachable from a package header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +91,14 @@ enum Payload {
         /// Bias added to the result.
         bias: i32,
     },
+    /// A move-to-front package: offsets into a window of recent values, plus
+    /// the values that were not in the window when they were needed.
+    MoveToFront {
+        /// The escaped values, consumed one per escape.
+        values: Box<Package>,
+        /// One window offset per output value.
+        offsets: Box<Package>,
+    },
 }
 
 /// An integer codec package.
@@ -116,16 +138,32 @@ impl Package {
             Some(Payload::Null { words }) => words.len(),
             Some(Payload::Bits { out_count, .. }) => *out_count,
             Some(Payload::Chopper { msb, .. }) => msb.out_val_count(),
+            Some(Payload::MoveToFront { offsets, .. }) => offsets.out_val_count(),
         }
     }
 
     /// Reads a mark 1 package from `cursor`.
     pub fn load1(cursor: &mut Cursor<'_>) -> Result<Self> {
+        Self::load1_depth(cursor, 0)
+    }
+
+    fn load1_depth(cursor: &mut Cursor<'_>, depth: u8) -> Result<Self> {
+        if depth > MAX_DEPTH {
+            return Err(cursor.error("integer codec packages nest too deeply"));
+        }
         let codec = cursor.read_u8()?;
         if codec == CODEC_NULL {
             let count = cursor.read_len()?;
             let words = cursor.read_u32_vec(count)?;
             return Ok(Self::null(words));
+        }
+        if codec == CODEC_MTF {
+            // The window values and the window offsets are complete packages.
+            let values = Box::new(Self::load1_depth(cursor, depth + 1)?);
+            let offsets = Box::new(Self::load1_depth(cursor, depth + 1)?);
+            return Ok(Self {
+                payload: Some(Payload::MoveToFront { values, offsets }),
+            });
         }
         let kind = match codec {
             CODEC_BITLENGTH => Kind::Bitlength,
@@ -164,7 +202,7 @@ impl Package {
             // value simply means "no out-of-band package".
             let oob_count = cursor.read_i32()?;
             if oob_count > 0 {
-                oob = Some(Box::new(Self::load1(cursor)?));
+                oob = Some(Box::new(Self::load1_depth(cursor, depth + 1)?));
             }
         }
 
@@ -203,6 +241,13 @@ impl Package {
 
     /// Reads a mark 2 package from `cursor`.
     pub fn load2(cursor: &mut Cursor<'_>) -> Result<Self> {
+        Self::load2_depth(cursor, 0)
+    }
+
+    fn load2_depth(cursor: &mut Cursor<'_>, depth: u8) -> Result<Self> {
+        if depth > MAX_DEPTH {
+            return Err(cursor.error("integer codec packages nest too deeply"));
+        }
         let value_count_raw = cursor.read_i32()?;
         if value_count_raw == 0 {
             return Ok(Self::null(Vec::new()));
@@ -218,12 +263,12 @@ impl Package {
         if codec == CODEC_CHOPPER {
             let chop = cursor.read_u8()?;
             if chop == 0 {
-                return Self::load2(cursor);
+                return Self::load2_depth(cursor, depth + 1);
             }
             let bias = cursor.read_i32()?;
             let span = cursor.read_u8()?;
-            let msb = Box::new(Self::load2(cursor)?);
-            let lsb = Box::new(Self::load2(cursor)?);
+            let msb = Box::new(Self::load2_depth(cursor, depth + 1)?);
+            let lsb = Box::new(Self::load2_depth(cursor, depth + 1)?);
             if msb.out_val_count() != value_count || lsb.out_val_count() != value_count {
                 return Err(cursor.error(format!(
                     "chopped data size mismatch: expected {value_count}, got {} and {}",
@@ -240,6 +285,22 @@ impl Package {
                     shift,
                     bias,
                 }),
+            });
+        }
+
+        if codec == CODEC_MTF {
+            // The offsets carry one entry per output value; the values only
+            // supply the escapes, so their count is whatever the writer needed.
+            let values = Box::new(Self::load2_depth(cursor, depth + 1)?);
+            let offsets = Box::new(Self::load2_depth(cursor, depth + 1)?);
+            if offsets.out_val_count() != value_count {
+                return Err(cursor.error(format!(
+                    "move-to-front offset count {} does not match the value count {value_count}",
+                    offsets.out_val_count()
+                )));
+            }
+            return Ok(Self {
+                payload: Some(Payload::MoveToFront { values, offsets }),
             });
         }
 
@@ -290,7 +351,7 @@ impl Package {
             }
             let has_escape = !is_v10 || contexts[0].has_escape();
             if has_escape {
-                oob = Some(Box::new(Self::load2(cursor)?));
+                oob = Some(Box::new(Self::load2_depth(cursor, depth + 1)?));
             }
         }
 
@@ -326,6 +387,14 @@ impl Package {
                     .zip(low.iter())
                     .map(|(hi, lo)| (hi.wrapping_shl(shift) | *lo).wrapping_add(bias))
                     .collect()
+            }
+            Payload::MoveToFront {
+                mut values,
+                mut offsets,
+            } => {
+                let escapes = values.decode(order, Unpack::Null)?;
+                let slots = offsets.decode(order, Unpack::Null)?;
+                decode_move_to_front(&slots, &escapes)?
             }
             Payload::Bits {
                 kind,
@@ -368,6 +437,32 @@ fn read_words(cursor: &mut Cursor<'_>, words: usize) -> Result<Vec<u8>> {
         .checked_mul(4)
         .ok_or_else(|| cursor.error("code text length overflow"))?;
     Ok(cursor.read_bytes(len)?.to_vec())
+}
+
+/// Rebuilds the values a move-to-front package describes.
+///
+/// The window holds the [`MTF_WINDOW`] most recent values. A slot outside the
+/// current window is the escape and pulls the next stored value; neither spec
+/// prints the escape number, so any out-of-range slot is treated as one.
+fn decode_move_to_front(slots: &[i32], escapes: &[i32]) -> Result<Vec<i32>> {
+    let mut window: Vec<i32> = Vec::with_capacity(MTF_WINDOW);
+    let mut out = Vec::with_capacity(slots.len());
+    let mut escapes = escapes.iter();
+    for slot in slots {
+        let hit = usize::try_from(*slot)
+            .ok()
+            .filter(|slot| *slot < window.len());
+        let value = match hit {
+            Some(slot) => window.remove(slot),
+            None => *escapes.next().ok_or_else(|| {
+                Error::corrupt("a move-to-front package ran out of escaped values")
+            })?,
+        };
+        window.insert(0, value);
+        window.truncate(MTF_WINDOW);
+        out.push(value);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -462,5 +557,85 @@ mod tests {
             .decode(ByteOrder::Little, Unpack::Lag1)
             .expect("decode");
         assert_eq!(values, [0, 0, 0, 0, 5]);
+    }
+    /// A move-to-front package: the stored values, then the window slots.
+    fn mark2_mtf(value_count: i32, values: &[i32], slots: &[i32]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&value_count.to_le_bytes());
+        data.push(CODEC_MTF);
+        for package in [values, slots] {
+            data.extend_from_slice(&(package.len() as i32).to_le_bytes());
+            data.push(CODEC_NULL);
+            data.extend_from_slice(&((package.len() * 32) as i32).to_le_bytes());
+            data.extend_from_slice(&little_endian(package));
+        }
+        data
+    }
+
+    #[test]
+    fn mark2_move_to_front_rebuilds_the_window() {
+        // The stored values are 7 and 9. The slots escape twice, then reuse the
+        // window, which by then is [9, 7]: 7, 9, 7, 7. Any slot outside the
+        // current window counts as the escape, whatever number the writer used.
+        let data = mark2_mtf(4, &[7, 9], &[20, 20, 1, 0]);
+        let mut cursor = Cursor::new(&data, ByteOrder::Little, 10);
+        let mut package = Package::load2(&mut cursor).expect("load");
+        assert_eq!(package.out_val_count(), 4);
+        let values = package
+            .decode(ByteOrder::Little, Unpack::Null)
+            .expect("decode");
+        assert_eq!(values, [7, 9, 7, 7]);
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn mark1_move_to_front_rebuilds_the_window() {
+        let mut data = vec![CODEC_MTF];
+        data.push(CODEC_NULL); // the stored values
+        data.extend_from_slice(&2i32.to_le_bytes());
+        data.extend_from_slice(&little_endian(&[7, 9]));
+        data.push(CODEC_NULL); // the window slots
+        data.extend_from_slice(&4i32.to_le_bytes());
+        data.extend_from_slice(&little_endian(&[-1, 16, 1, 0]));
+        let mut cursor = Cursor::new(&data, ByteOrder::Little, 9);
+        let mut package = Package::load1(&mut cursor).expect("load");
+        assert_eq!(package.out_val_count(), 4);
+        let values = package
+            .decode(ByteOrder::Little, Unpack::Null)
+            .expect("decode");
+        assert_eq!(values, [7, 9, 7, 7]);
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn a_move_to_front_window_moves_a_hit_to_the_front() {
+        // No escapes: the first three values fill the window, the slots then
+        // reach behind it.
+        let data = mark2_mtf(6, &[7, 9, 5], &[16, 16, 16, 2, 1, 0]);
+        let mut cursor = Cursor::new(&data, ByteOrder::Little, 10);
+        let mut package = Package::load2(&mut cursor).expect("load");
+        let values = package
+            .decode(ByteOrder::Little, Unpack::Null)
+            .expect("decode");
+        assert_eq!(values, [7, 9, 5, 7, 5, 5]);
+    }
+
+    #[test]
+    fn move_to_front_slots_must_number_the_values() {
+        let data = mark2_mtf(4, &[7, 9], &[16, 16, 16]);
+        let mut cursor = Cursor::new(&data, ByteOrder::Little, 10);
+        let error = Package::load2(&mut cursor).expect_err("mismatch");
+        assert!(format!("{error}").contains("does not match"));
+    }
+
+    #[test]
+    fn move_to_front_cannot_escape_more_values_than_it_stored() {
+        let data = mark2_mtf(3, &[7], &[16, 16, 16]);
+        let mut cursor = Cursor::new(&data, ByteOrder::Little, 10);
+        let mut package = Package::load2(&mut cursor).expect("load");
+        let error = package
+            .decode(ByteOrder::Little, Unpack::Null)
+            .expect_err("out of escapes");
+        assert!(format!("{error}").contains("ran out of escaped values"));
     }
 }

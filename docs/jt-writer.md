@@ -233,6 +233,14 @@ Read out of the samples, since no reference writer exists:
   samples — which is why every block rewrite rendered and only the plate did
   not. `a_context_seven_face_carries_both_auxiliary_mask_streams` pins it on a
   nine-gon bipyramid, whose two apices have degree 9.
+* The **high-degree face attribute masks** are **not** a codec package: the
+  stream between the split stream masks and *Split Face Syms* is an `i32` count
+  followed by that many raw `u32` words. `encode.rs` writes it with
+  `write_u32_array` next to `package2_words`, which stays a plain value package
+  because the vertex data hashes share it. A reader that expects a package here
+  desynchronises on any file with a face of more than 64 edges, and the shape is
+  lost; `heptegintagon_bipyramid` is the smallest mesh that reaches that stream
+  and `a_wide_attribute_mask_round_trips_through_the_plain_array` pins it.
 * A JT 10.x topological shape wraps its coder input in a **second, embedded
   logical element**, immediately after the first vertex binding:
   `i32 length | GUID | u8 base type 9 | i32 object id 1 | u8 version 1 |

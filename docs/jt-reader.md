@@ -41,8 +41,9 @@ Submodules:
    declares no vertices at all contributes no mesh: glTF needs a `POSITION`
    attribute in every primitive, so there is nothing to write. The node that
    holds it is kept, exactly as for a filtered part or a coarse tier — the graph
-   keeps its shape, only the drawing is skipped. `SampleJT_Server.jt` declares
-   36 such empty shapes out of 850 representations.
+   keeps its shape, only the drawing is skipped. No reference sample reaches
+   that case any more: the shapes of `SampleJT_Server.jt` that used to come back
+   without vertices were a decode failure, not empty shapes.
 4. Only the finest level of detail of a range LOD. A `RangeLOD` lists its
    children from the finest tier down and JT does not store that tier, so it is
    counted while walking: the first group below a `RangeLOD` is tier 0, the next
@@ -97,6 +98,34 @@ now:
 
 None of it reaches `jt::dump` or the neutral `Model`, so the reference JSON dumps
 and the pinned export counts are unchanged by it.
+
+## Codec packages
+
+`jt::decode::cdp` reads the integer codec packages of the vertex coders and the
+mesh coder in both framings (mark 1 `loadCDP1`, mark 2 `loadCDP2`). Two framings
+of real CAD exports were missing and cost a whole Teamcenter export corpus its
+geometry:
+
+* **Codec id 5 is move-to-front.** A mark 2 package of that id holds two complete
+  nested packages — the window *values* and the window *offsets*. A negative slot
+  escapes to the next stored value, a slot in the window selects it, and selecting
+  moves the value to the front of a window whose capacity is 16. The window starts
+  empty, so a slot for a slot not yet filled escapes too; that is what makes an
+  offset stream such as `-1, 16, 1, 0, 1, 2, 3` decode to the values first stored
+  in slots 4 and 5. TKJT cannot read such a package either.
+* **The high-degree face attribute masks are a plain array.** The
+  *High-Degree Face Attribute Masks* stream of the mesh coder — between the split
+  stream masks and *Split Face Syms* — is `i32` count plus that many `u32`, with
+  **no codec byte**, while every sibling is a codec package. TKJT reads it as a
+  package, so any file with a face of more than 64 edges desynchronises there:
+  the next package header reads as garbage (commonly `codec 255`) and the whole
+  shape is lost. An empty array frames identically under both readings, which is
+  why no sample in `data/ExampleFiles` exposes it.
+
+A decoded topology also carries a composite hash, and `jt::decode::mesh` verifies
+it against the symbols (`TopologySymbols::composite`). A mismatch is reported as a
+warning naming both hashes — the strongest available check that a stream was read
+with the right framing, since a wrong reading of any package changes the hash.
 
 ## Materials and colours
 
@@ -204,9 +233,9 @@ its target share one id. That id is the instancing key:
   `[4, 5, 6]`, and `mesh(0)` is an `IndexError`.
 * Unlike `to_model()`, the file view **keeps** a representation with no vertices:
   glTF mandates a `POSITION` attribute and drops it, a python consumer may still
-  want to see it. `SampleJT_Server.jt` declares 36 such shapes, which collapse to
-  one shared representation because they are instanced — `representation_count`
-  is 106, the pinned 105 meshes plus that one.
+  want to see it. No reference sample has such a representation today — the ones
+  in `SampleJT_Server.jt` were a decode failure that is now fixed — so all 106
+  representations of that sample carry geometry and its export view has 106 meshes.
 
 ### Zero-copy arrays
 
@@ -258,7 +287,7 @@ slot then, so pyo3 compiles `__getbuffer__` out below it.
   diffuse colours of the file — both in the model and in the exported glTF — as
   one material per distinct colour, and exports to glTF for every sample: each
   primitive of each one has a non-empty `POSITION` attribute, which is what
-  `SampleJT_Server.jt` and its 36 empty representations used to break.
+  a shape whose topology cannot be decoded used to break.
 * `crates/ferrojt/tests/dump.rs` — every sample with a reference dump under
   `data/Reference` matches it semantically, and every dump is valid JSON.
 * Unit tests in `jt/decode` compare the codecs against the reference output byte

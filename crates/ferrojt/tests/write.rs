@@ -92,10 +92,9 @@ const EXPECTED: &[(&str, Expectation)] = &[
             triangles: 486,
         },
     ),
-    // The server sample has 36 empty representations. The file view keeps them
-    // as one shared representation because they are instanced; the export view
-    // drops them because glTF mandates a POSITION attribute. Its range LODs
-    // each hold exactly one tier, so nothing is filtered away.
+    // The server sample instances its shapes, so its file view holds one
+    // representation per shape and its export view has a mesh for each of them.
+    // Its range LODs each hold exactly one tier, so nothing is filtered away.
     (
         "SampleJT_Server.jt",
         Expectation {
@@ -104,8 +103,8 @@ const EXPECTED: &[(&str, Expectation)] = &[
             nodes: 2158,
             representations: 106,
             finest: 106,
-            meshes: 105,
-            triangles: 124_154,
+            meshes: 106,
+            triangles: 129_067,
         },
     ),
 ];

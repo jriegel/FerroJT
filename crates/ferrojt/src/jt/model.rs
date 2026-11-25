@@ -914,10 +914,11 @@ fn build_node(
         for load in node.late_loads() {
             if let Some(geometry) = graph.geometry_for(load) {
                 if geometry.vertices.is_empty() {
-                    // A file may declare a representation with no vertices at
-                    // all — `SampleJT_Server.jt` does for 36 of its shapes. The
-                    // node stays, there is simply nothing to draw, and a
-                    // primitive without positions is not expressible in glTF.
+                    // A file can hand over a representation with no vertices at
+                    // all: either it really declares none, or its symbol streams
+                    // could not be decoded. The node stays, there is simply
+                    // nothing to draw, and a primitive without positions is not
+                    // expressible in glTF.
                     tracing::debug!(
                         node = node.name(),
                         "a representation declares no vertices and is left out"

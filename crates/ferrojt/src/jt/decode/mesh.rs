@@ -58,6 +58,20 @@ fn mask_word_count(bits: i32) -> usize {
     usize::try_from(bits).unwrap_or(0) / 32 + 1
 }
 
+/// Reads a plain array of unsigned integers: `i32 count` then `count` values.
+///
+/// The high-degree face attribute masks are the one symbol stream of a
+/// topological shape that the format stores as a bare `VecU32` instead of an
+/// integer codec package, so no codec byte may be read after the count.
+fn read_u32_array(cursor: &mut Cursor<'_>) -> Result<Vec<u32>> {
+    let count = cursor.read_len()?;
+    let mut values = Vec::with_capacity(count.min(1 << 16));
+    for _ in 0..count {
+        values.push(cursor.read_u32()?);
+    }
+    Ok(values)
+}
+
 /// Reads index `index` out of `values`, yielding `-1` when out of range.
 ///
 /// The reference implementation indexes its slot arrays directly; clamping
@@ -568,7 +582,9 @@ pub struct MeshInput {
     attr_masks: [Package; 8],
     mask8_30: Package,
     mask8_4: Package,
-    attr_masks_large: Package,
+    /// The high-degree attribute masks, stored as a plain array of unsigned
+    /// integers rather than as a codec package.
+    attr_masks_large: Vec<u32>,
     split_faces: Package,
     split_positions: Package,
     /// Whether the file stores the pair of auxiliary context-7 mask streams of
@@ -605,7 +621,7 @@ impl MeshInput {
         } else {
             Package::empty()
         };
-        let attr_masks_large = Package::load2(cursor)?;
+        let attr_masks_large = read_u32_array(cursor)?;
         let split_faces = Package::load2(cursor)?;
         let split_positions = Package::load2(cursor)?;
         // A checksum over the symbols, verified in [`MeshInput::decode`].
@@ -646,12 +662,7 @@ impl MeshInput {
             face_flags: self.face_flags.decode(order, Unpack::Lag1)?,
             mask8_30: self.mask8_30.decode(order, Unpack::Null)?,
             mask8_4: self.mask8_4.decode(order, Unpack::Null)?,
-            attr_masks_large: self
-                .attr_masks_large
-                .decode(order, Unpack::Null)?
-                .into_iter()
-                .map(|value| value as u32)
-                .collect(),
+            attr_masks_large: std::mem::take(&mut self.attr_masks_large),
             split_faces: self.split_faces.decode(order, Unpack::Lag1)?,
             split_positions: self.split_positions.decode(order, Unpack::Null)?,
             ..Symbols::default()

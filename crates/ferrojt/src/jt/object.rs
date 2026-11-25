@@ -1728,7 +1728,9 @@ pub fn read_element_envelope(
     if end > cursor.position() + cursor.remaining() {
         return Err(cursor.error("element extends past the end of its segment"));
     }
-    let body_len = end - body_offset;
+    let body_len = end
+        .checked_sub(body_offset)
+        .ok_or_else(|| cursor.error("element is shorter than its own header"))?;
     Ok(Some(RawElement {
         guid,
         base_type,

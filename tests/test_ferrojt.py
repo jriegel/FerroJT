@@ -731,8 +731,8 @@ def test_a_file_without_layer_information_has_no_default_filter() -> None:
     assert jt.model().triangle_count == jt.model(all_layers=True).triangle_count
 
 
-#: The one sample without a reference dump. It is also the only one whose file
-#: declares representations with no vertices at all — 36 of them.
+#: The one sample without a reference dump. It is also the biggest one: 2158
+#: nodes, 106 shapes and a little over a million triangles.
 SERVER = SAMPLES / "SampleJT_Server.jt"
 
 needs_server = pytest.mark.skipif(
@@ -741,17 +741,18 @@ needs_server = pytest.mark.skipif(
 
 
 @needs_server
-def test_shapes_without_vertices_are_left_out_of_the_export() -> None:
-    """A representation that declares no vertices keeps its node, not a mesh.
+def test_every_primitive_of_the_export_has_a_position() -> None:
+    """No shape of the biggest sample reaches the glTF writer without vertices.
 
-    glTF requires a ``POSITION`` attribute in every primitive, so such a shape
+    glTF requires a ``POSITION`` attribute in every primitive, and this file
     used to abort the whole document with "a primitive without a POSITION
-    attribute cannot be exported to glTF".
+    attribute cannot be exported to glTF": one of its shapes failed to decode,
+    and the reader kept the node but had no geometry for it.
     """
     model = ferrojt.read(str(SERVER))
     assert model.node_count == 2158
-    assert model.mesh_count == 105
-    assert model.triangle_count == 124154
+    assert model.mesh_count == 106
+    assert model.triangle_count == 129067
 
     document = glb_json(model.to_bytes("glb"))
     assert len(document["nodes"]) == model.node_count
@@ -763,12 +764,13 @@ def test_shapes_without_vertices_are_left_out_of_the_export() -> None:
 
 
 @needs_server
-def test_the_file_view_keeps_a_representation_without_vertices() -> None:
-    """The export drops a shape with no vertices, the file view keeps it.
+def test_the_file_view_decodes_every_representation_of_the_sample() -> None:
+    """Every representation of the server sample holds real arrays.
 
-    ``SampleJT_Server.jt`` declares 36 such shapes; they are instanced, so the
-    file has exactly one representation for them. The arrays stay empty rather
-    than missing, which lets a consumer walk the graph without special cases.
+    One of its shapes used to fail to decode, which left the shape it belongs to
+    with an empty vertex array: the export dropped it, the file view kept it.
+    The two views now agree on the geometry, and no ``JtArray`` of a decoded
+    shape is empty.
     """
     numpy = pytest.importorskip("numpy")
     jt = ferrojt.JtFile(str(SERVER))
@@ -779,22 +781,20 @@ def test_the_file_view_keeps_a_representation_without_vertices() -> None:
     assert len(graph.nodes()) == 2158
     assert len(graph.root().descendants()) == 2157
 
-    # 106 representations, one of them empty — the export keeps the other 105.
+    meshes = list(graph.meshes())
     assert graph.representation_count == 106
-    empty = [mesh.id for mesh in graph.meshes() if mesh.is_empty]
-    assert len(empty) == 1
-    assert len([mesh for mesh in graph.meshes() if not mesh.is_empty]) == 105
+    assert len(meshes) == 106
+    assert [mesh.id for mesh in meshes if mesh.is_empty] == []
+    assert sum(mesh.triangle_count for mesh in meshes) == 129067
 
-    mesh = graph.mesh(empty[0])
-    assert mesh.vertex_count == 0
-    assert mesh.triangle_count == 0
-    for name in mesh.array_names:
-        array = mesh.array(name)
-        assert len(array) == 0
-        data = numpy.asarray(array)
-        assert data.size == 0
-        assert data.dtype == (numpy.int32 if name == "indices" else numpy.float32)
-        assert memoryview(array).nbytes == 0
+    for mesh in meshes:
+        assert "vertices" in mesh.array_names, mesh.id
+        for name in mesh.array_names:
+            array = mesh.array(name)
+            assert len(array) == mesh.vertex_count or name == "indices"
+            data = numpy.asarray(array)
+            assert data.size > 0, (mesh.id, name)
+            assert data.dtype == (numpy.int32 if name == "indices" else numpy.float32)
 
 
 # ---------------------------------------------------------------------------

@@ -158,7 +158,7 @@ Upload with `python -m twine upload dist\*`.
 - **`JtFile::to_model_with_all_lods()` keeps every tier** (viewer only; `to_model()`
   is unchanged by construction). Pinned in `every_level_of_detail_can_be_loaded()`:
   block 8.1/9.5/10.3 → 3 meshes / 36 tris / 3 tiers; plate1-8.0 → 8 / 1137 / 4;
-  plate1-9.5 → 6 / 922 / 3; `SampleJT_Server.jt` → 105 / 124154 / **1** — its 584
+  plate1-9.5 → 6 / 922 / 3; `SampleJT_Server.jt` → 106 / 129067 / **1** — its 584
   `RangeLOD`s each have exactly one `Group` child, so screen-area LOD switching is
   a **no-op there** and the toolbar checkbox is hidden. Use block/plate to demo it.
 - **The viewer row tree is a tree, not the graph.** `ViewerScene::new` walks the
@@ -168,7 +168,7 @@ Upload with `python -m twine upload dist\*`.
   triangles **per attachment** on both sides of the fraction —
   `ViewerScene::total_triangle_count()` (sum of `Slot::triangles`) and
   `drawn_triangle_count()` share that basis, and `Model::triangle_count()`
-  (unique meshes, 124154) does **not**: mixing them printed
+  (unique meshes, 129067) does **not**: mixing them printed
   `1016789 of 124154 triangles`. `meshes::triangle_count` was deleted for this.
 - **`ViewerScene` cannot be built in a test.** `SceneNode3d::mesh()` needs the
   kiss3d `WINDOW_CACHE` thread-local (`window_cache.rs:13`, `texture_manager.rs:392`
@@ -276,20 +276,42 @@ Upload with `python -m twine upload dist\*`.
   re-exported from `ferrojt::jt`. `jt::dump` stays unfiltered. No sample loses a
   part to its own filter, so the pinned counts above are unchanged — a drop can
   only be shown with a forced filter or the synthetic fixture in `jt/model.rs`.
-- **`SampleJT_Server.jt` declares 36 empty representations** (of 850): the dump
-  says `NumIndices/NumVertices/NumNormals: 0`, so nothing failed to decode — the
-  file simply has shapes with no vertices. `push_mesh` skips an empty channel, so
-  such a shape yields a `Primitive` with **no attributes at all**, and
-  `export/gltf.rs::to_primitive` refuses the whole document ("a primitive without
-  a POSITION attribute cannot be exported to glTF") because glTF mandates
-  POSITION. The reader drops the representation in `build_node` (`geometry.vertices
-  .is_empty()` → `continue`): the node stays, no mesh is made — same policy as the
-  layer filters and the coarse LOD tiers. `JtGltfMesh.cpp` instead appends
-  zero-length accessors; deliberate deviation. Counts for that sample: nodes 2158,
-  **meshes 105** (was 106), materials 23, triangles 124154 — pinned in
-  `tests/model.rs` and `tests/test_ferrojt.py`. None of the five reference samples
-  has an empty representation, which is why no test caught it. Keep the POSITION
-  check in the writer: it is the guard for hand-built models.
+- **The server sample's "36 empty representations" were a decode failure, not
+  empty shapes.** `SampleJT_Server.jt` has one shape (file-view representation
+  id 164, reached from many nodes) whose topological stream could not be read, so
+  its `LodGeometry` came back with no vertices: `push_mesh` skipped the empty
+  channel, the `Primitive` had **no attributes at all**, and
+  `export/gltf.rs::to_primitive` refused the whole document ("a primitive without
+  a POSITION attribute cannot be exported to glTF"). The reader still drops a
+  representation without vertices in `build_node` (`geometry.vertices.is_empty()`
+  → `continue`) — keep that policy and the POSITION guard, which are the right
+  answer for hand-built and degenerate models — but no reference sample hits it
+  any more. Counts for that sample: nodes 2158, **meshes 106**, materials 23,
+  triangles 129067 — pinned in `tests/model.rs`, `tests/gltf.rs`, `tests/write.rs`,
+  `tests/usd.rs` and `tests/test_ferrojt.py`. `JtGltfMesh.cpp` would instead append
+  zero-length accessors; deliberate deviation.
+- **`jt/decode/cdp.rs` implements codec 5 (Move-to-Front).** A MARK-2 integer
+  package may carry `CodecId 5`: *Window Values* (a `ByteCDP` package, count ≤ 16)
+  and *Window Offsets* (an `Int32CDP` package of the **same** count) first, then
+  the coded values. The window starts **empty** (capacity 16), an index at or
+  beyond the current window size is an escape that pulls the next raw value from
+  the offset stream, and inserting at the front truncates the window back to 16.
+  Real CAD exports (the `C:\Data\CLA_EXPORT_JR` corpus) use it for the split-face
+  stream of nearly every shape. TKJT reads those files no further than we used
+  to: it `Load2`s that package and dies with `invalid CodecId 5`, so the PSI/JT
+  spec plus a byte walk are the oracle there, not `example/`.
+- **The High-Degree Face Attribute Masks stream is a bare `VecU32`, not a CDP
+  package.** It is an `i32 count` followed by `count` `u32` words with **no codec
+  byte**, at every revision (spec: "all remaining face attribute bit vectors,
+  adjoined end-to-end, and encoded as a single array of unsigned integers"), and
+  it sits between *Face Attribute Mask 8 (32 MSBs)* and *Split Face Syms*. Every
+  sibling stream is a `VecI32{Int32CDP}` and TKJT calls `Load2` here, so a file
+  with a single face of degree > 64 desynchronises the whole shape in TKJT — and
+  used to here, as `unknown mark 2 codec 255` (the first mask word's low byte).
+  `decode/mesh.rs::read_u32_array` reads it, `encode.rs::write_u32_array` writes
+  it. An **empty** array frames identically under both readings, which is why none
+  of the reference samples caught it; the regression fixture is
+  `encode.rs::heptegintagon_bipyramid` (two coder vertices of degree 70).
 - `pyo3` 0.30 cannot express a tri-state keyword: nested
   `Option<Option<&str>>` is ambiguous (`SomeWrap<T>` matches both `T` and
   `Option<T>`, E0283). Model it as two parameters — the Python API is
@@ -317,10 +339,9 @@ Upload with `python -m twine upload dist\*`.
   `SceneGraph::loaded` (`model.rs::loaded_pos`, keyed by `loaded_ids`/`property_id`
   so an `Instance` and its target share it) and is the instancing key: an
   `Instance` has `mesh_ids == []` and shares `subtree_mesh_ids()` with its twin.
-  The server sample's **36 empty shapes collapse to one** representation (id 164,
-  one node) because they are instanced — `representation_count` is 106, i.e. the
-  pinned 105 non-empty meshes plus that one, and the file view **keeps** it while
-  `to_model()` drops it (glTF mandates POSITION).
+  The server sample **instances one shape into many nodes**, so 106 representations
+  carry its geometry — `representation_count` is 106 and every one of them decodes
+  now; the file view and the export view agree on it.
 - **`Lsg::representations()` must filter `element.geometry().is_some()`.**
   `SceneGraph::loaded` also holds Meta Data / `ProxyMetaData` late loads, so the
   raw length counts too much: block 9.5 went 7 → 3. The ids are **not**
@@ -626,7 +647,7 @@ Upload with `python -m twine upload dist\*`.
 - **USD counts are pinned in `crates/ferrojt/tests/usd.rs`** — meshes / triangles /
   materials / shared wrappers: block 8.1, 9.5, 10.3 → 1 / 12 / 1 / 0;
   plate1-8.0 → 2 / 617 / 2 / 1; plate1-9.5 → 2 / 486 / 2 / 1;
-  `SampleJT_Server.jt` → 105 / 124154 / 23 / **529**. Materials collapse by
+  `SampleJT_Server.jt` → 106 / 129067 / 23 / **529**. Materials collapse by
   **shading values** (diffuse, opacity, metallic, roughness, emissive, `doubleSided`)
   — not name — so `def Material "Material_` count ≤ `Model::materials.len()`; the test's
   `shading()` key is `[u32;10]` and must mirror `UsdMaterial::same_shading` exactly.

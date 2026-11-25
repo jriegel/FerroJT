@@ -502,13 +502,13 @@ fn expectation(path: &Path) -> Expected {
         // The server assembly has thousands of edges the topological coder
         // cannot cross, so it falls back to the revision that can hold its
         // meshes. Its 23 source materials collapse to 20 because the source
-        // repeats three colour sets across its 105 shapes.
+        // repeats three colour sets across its 106 shapes.
         _ if stem.contains("Server") => Expected {
             major: 8,
             minor: 1,
             nodes: 2_693,
-            meshes: 105,
-            triangles: 124_154,
+            meshes: 106,
+            triangles: 129_067,
             materials: 20,
         },
         _ if stem.contains("example_block_jt8.1") => block(),
@@ -875,7 +875,7 @@ fn an_uncodable_mesh_falls_back_to_the_revision_that_holds_it() {
     let _ = std::fs::remove_file(&path);
     assert_eq!((header.major, header.minor), (8, 1));
     let out = written(&source, &bytes);
-    assert_eq!(out.to_model().triangle_count(), 124_154);
+    assert_eq!(out.to_model().triangle_count(), 129_067);
 }
 
 // ---------------------------------------------------------------------------

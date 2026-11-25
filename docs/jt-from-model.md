@@ -116,8 +116,8 @@ brings its own partition and is merged with the root rather than wrapped.
 
 Two demotions are deliberate. A `Shape` node whose mesh has no geometry becomes
 a `Group` (glTF mandates a `POSITION` attribute, and an empty JT shape is not
-worth writing) — the same policy the reader applies to the 36 empty
-representations of the server sample. And a node holding several representations
+worth writing) — the same policy the reader applies to a representation that
+comes back without vertices. And a node holding several representations
 keeps only the first, because the builder has no level-of-detail node; the
 reader collects tiers finest-first, so that is the finest one.
 
@@ -214,7 +214,7 @@ One material attribute is written per **shape node**, not per distinct material,
 so a written file carries as many material attributes as it has shapes while
 `Model::materials` of the read-back file counts the distinct ones. The server
 sample's 23 source materials collapse to 20 because the source repeats three
-colour sets across its 105 shapes.
+colour sets across its 106 shapes.
 
 ## Entry points
 

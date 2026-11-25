@@ -174,8 +174,8 @@ fn every_level_of_detail_can_be_loaded() {
         (
             "SampleJT_Server.jt",
             All {
-                meshes: 105,
-                triangles: 124_154,
+                meshes: 106,
+                triangles: 129_067,
                 tiers: 1,
             },
         ),
@@ -271,9 +271,10 @@ fn every_level_of_detail_can_be_loaded() {
 #[test]
 fn every_sample_exports_to_gltf() {
     // glTF requires a POSITION attribute in every primitive, so a
-    // representation that declares no vertices at all must never reach the
-    // writer. `SampleJT_Server.jt` carries 36 such shapes and used to abort the
-    // whole document with "a primitive without a POSITION attribute".
+    // representation that ends up without vertices must never reach the writer.
+    // `SampleJT_Server.jt` used to abort the whole document with "a primitive
+    // without a POSITION attribute": one of its shapes failed to decode, and
+    // the reader kept the node but had no geometry to give it.
     for path in samples() {
         let name = path
             .file_name()
@@ -313,32 +314,31 @@ fn every_sample_exports_to_gltf() {
 }
 
 #[test]
-fn a_sample_with_empty_representations_still_exports_its_graph() {
+fn the_server_sample_keeps_every_node_of_its_graph() {
     // `SampleJT_Server.jt` is the odd one out of the samples: it has no
-    // reference dump, its shapes are mostly empty, and it is the file that
-    // showed the POSITION failure. Its counts are pinned so that a change in
-    // how empty representations are handled becomes visible.
+    // reference dump, it reaches its 106 shapes through hundreds of shape
+    // nodes, and it is the file that once showed the POSITION failure. Its
+    // counts are pinned so that a change in how a shape without geometry is
+    // handled becomes visible.
     let file = sample("SampleJT_Server.jt");
     let model = file.to_model();
 
     assert_eq!(model.nodes.len(), 2_158, "nodes");
-    assert_eq!(model.meshes.len(), 105, "meshes");
+    assert_eq!(model.meshes.len(), 106, "meshes");
     assert_eq!(model.materials.len(), 23, "materials");
-    assert_eq!(model.triangle_count(), 124_154, "triangles");
+    assert_eq!(model.triangle_count(), 129_067, "triangles");
 
-    // The empty shapes keep their node — dropping geometry never drops a node —
-    // so there are more shape nodes than there are meshes.
+    // Every shape node of this sample draws a mesh now. Before the topological
+    // decoder could read its instanced shape, the count here was larger than the
+    // mesh count, because a shape that yields no geometry keeps its node while
+    // dropping its mesh — the policy `to_model` still applies to any file whose
+    // representation has no vertices.
     let shapes = model
         .nodes
         .iter()
         .filter(|node| node.kind.as_deref() == Some("Shape"))
         .count();
-    assert!(
-        shapes > model.meshes.len(),
-        "the empty shapes vanished instead of keeping their node: {shapes} shape \
-         nodes for {} meshes",
-        model.meshes.len()
-    );
+    assert_eq!(shapes, model.meshes.len(), "a shape lost its mesh");
     let drawn = model
         .nodes
         .iter()

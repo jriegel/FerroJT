@@ -113,7 +113,7 @@ const TREE_OPEN_LEVEL: usize = 1;
 ///
 /// The clip planes are what makes or breaks a CAD model: JT parts sit flush
 /// against each other by design — `SampleJT_Server.jt` has 44 pairs of node
-/// boxes closer than 0.02 mm and 79 of its 105 instances thinner than 0.6 mm —
+/// boxes closer than 0.02 mm and 79 of its 106 instances thinner than 0.6 mm —
 /// and the depth buffer is a `Depth32Float`, whose spacing at distance `z` is
 /// about `z² / (near · 2²⁴)`. With the wide frustum this viewer used to start
 /// from (`1e-3 .. 1e6` on an 82 mm model) that is 0.12 mm at the centre of the
