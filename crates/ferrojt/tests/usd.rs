@@ -17,7 +17,8 @@ struct Expectation {
     materials: usize,
     /// Wrapper prims for nodes reachable from more than one parent.
     shared: usize,
-    /// The layer filter the export records, `None` when the file has none.
+    /// The layer filter the export records, `None` when the file names no
+    /// active filter — which is how every sample stores its layers.
     filter: Option<&'static str>,
 }
 
@@ -28,7 +29,7 @@ const EXPECTED: &[(&str, Expectation)] = &[
             meshes: 1,
             materials: 1,
             shared: 0,
-            filter: Some("ALL"),
+            filter: None,
         },
     ),
     // JT 8.1 stores no layer information at all.
@@ -47,7 +48,7 @@ const EXPECTED: &[(&str, Expectation)] = &[
             meshes: 1,
             materials: 1,
             shared: 0,
-            filter: Some("ALL"),
+            filter: None,
         },
     ),
     (
@@ -66,7 +67,7 @@ const EXPECTED: &[(&str, Expectation)] = &[
             meshes: 2,
             materials: 2,
             shared: 1,
-            filter: Some("ALL"),
+            filter: None,
         },
     ),
     // 2158 nodes, 198 of them shared, and 23 appearances that really differ.
@@ -218,7 +219,7 @@ fn every_sample_produces_a_well_formed_layer() {
             }
             None => assert!(
                 !text.contains("ferrojt:layer_filter"),
-                "{name}: a filter was recorded for a file that declares none"
+                "{name}: a filter was recorded for a file that names none"
             ),
         }
     }

@@ -97,21 +97,25 @@ nothing was collapsed that should have stayed apart.
 
 ## Layer filters
 
-The reader already gates `Node::Part` on the layer filters of the file, so the
-writer only has to record what ran. `Model::extras["layer_filter"]` becomes
+The reader already gates `Node::Part` on the layer filter of the file, so the
+writer only has to record what ran. When a filter ran, `Model::extras["layer_filter"]`
+becomes
 
 ```text
 customLayerData = {
     string "ferrojt:generator" = "FerroJT 0.1.0"
     string "ferrojt:source" = "data\\ExampleFiles\\example_block_jt9.5.jt"
-    string "ferrojt:layer_filter" = "ALL"
+    string "ferrojt:layer_filter" = "LAYCUR"
     int[] "ferrojt:layers" = [1, 2, 3, ...]
 }
 ```
 
-A file that declares no filters (`SampleJT_Server.jt`, the JT 8.1 block) records
-nothing, and `to_model_unfiltered()` records nothing either — which is how a
-consumer can tell the two apart.
+A file that names no active filter records nothing — which covers every sample,
+since none of them fills `ACTIVELAYERFILTER::` — and `to_model_unfiltered()`
+records nothing either. So the key is a positive statement: it is present exactly
+when a filter was really applied (`to_model_with_filter("NAME")`, or a file whose
+`ACTIVELAYERFILTER::` names one), and a consumer can tell "unfiltered" from
+"filtered by a file whose filter accepts nothing".
 
 ## Syntax details that bite
 

@@ -633,17 +633,18 @@ fn every_instance_keeps_the_subtree_it_instantiates() {
 }
 
 /// The layer filters the samples declare, and the one the export applies by
-/// default. A file of the JT 8.x era has none at all, and the newer ones all
-/// leave `ACTIVELAYERFILTER::` empty, so the first of the sorted names wins.
+/// default. A file of the JT 8.x era has none at all, and every newer sample
+/// leaves `ACTIVELAYERFILTER::` empty — so none of them filters anything, which
+/// is what the C++ exporter and a viewer such as NOVO do with such a file.
 const FILTERS: &[(&str, &[&str], Option<&str>)] = &[
-    ("example_block_jt10.3.jt", &["ALL", "LAYCUR"], Some("ALL")),
+    ("example_block_jt10.3.jt", &["ALL", "LAYCUR"], None),
     ("example_block_jt8.1.jt", &[], None),
-    ("example_block_jt9.5.jt", &["ALL", "LAYCUR"], Some("ALL")),
+    ("example_block_jt9.5.jt", &["ALL", "LAYCUR"], None),
     ("opening_protection_plate1_jt8.0.jt", &[], None),
     (
         "opening_protection_plate1_jt9.5.jt",
         &["ALL", "LAYCUR"],
-        Some("ALL"),
+        None,
     ),
 ];
 
@@ -902,10 +903,9 @@ fn the_declared_layer_filters_are_the_ones_of_the_reference_dumps() {
 
 #[test]
 fn no_sample_loses_a_part_to_its_own_filter() {
-    // Every part of the samples is either tagged with a layer the default
-    // filter covers or carries no tag at all, so the layer filter must not
-    // change what the export writes.
-    for (name, _, _) in FILTERS {
+    // None of the samples names an active filter, so the default export writes
+    // the same geometry as the unfiltered one — and records no filter either.
+    for (name, declared, _) in FILTERS {
         let file = sample(name);
         let filtered = file.to_model();
         let unfiltered = file.to_model_unfiltered();
@@ -921,22 +921,23 @@ fn no_sample_loses_a_part_to_its_own_filter() {
             "{name}: the filter dropped geometry"
         );
 
-        let declared = FILTERS
-            .iter()
-            .find(|(key, _, _)| key == name)
-            .expect("expectation")
-            .1;
         let extras = filtered.extras.expect("the model carries extras");
+        assert!(
+            extras.get("layer_filter").is_none(),
+            "{name}: an export that filters nothing records a filter"
+        );
         if declared.is_empty() {
-            assert!(
-                extras.get("layer_filter").is_none(),
-                "{name}: a file without filters records one"
-            );
             continue;
         }
+        // A filter that is merely declared still resolves by name, and then the
+        // model says which one it was built with.
+        let named = file
+            .to_model_with_filter("LAYCUR")
+            .expect("LAYCUR is declared");
+        let extras = named.extras.expect("the model carries extras");
         assert_eq!(
             extras["layer_filter"]["name"].as_str().expect("a name"),
-            "ALL",
+            "LAYCUR",
             "{name}: the applied filter is not recorded"
         );
     }

@@ -361,8 +361,8 @@ impl JtFile {
     /// still translated, and [`Mesh::lod_level`] records which tier a mesh
     /// came from.
     ///
-    /// When the file declares layer filters, the default one also decides
-    /// which parts contribute geometry; see [`JtFile::layer_filter`].
+    /// When the file names an active layer filter, it also decides which
+    /// parts contribute geometry; see [`JtFile::layer_filter`].
     #[must_use]
     pub fn to_model(&self) -> Model {
         self.build_model(self.layer_filter(None).ok().flatten().as_ref(), false)
@@ -404,13 +404,17 @@ impl JtFile {
         Ok(self.build_model(filter.as_ref(), false))
     }
 
-    /// The filter an export uses, `None` when the file has no layer
-    /// information at all.
+    /// The filter an export uses, `None` when nothing is to be filtered.
     ///
     /// `name` selects one of the filters the file declares. `None` asks for
-    /// the default one: the filter named by `ACTIVELAYERFILTER::`, or, when
-    /// the file leaves that empty as most writers do, the first filter in
-    /// sorted order — the selection the classic JT viewer makes.
+    /// the default one, which is the filter named by `ACTIVELAYERFILTER::` —
+    /// and no filter at all when the file leaves that key empty or names
+    /// nothing, as most writers do. Only a filter that is actually in effect
+    /// hides a part, which is how the C++ exporter reads the same keys
+    /// (`if (layerInfo.ActiveLayerFilter.size() != 0)` in `JtGltfMesh.cpp`)
+    /// and how a viewer such as NOVO displays the file. Picking an arbitrary
+    /// declared filter instead would drop the geometry of a Teamcenter export
+    /// whose active filter happens to be a drawing or publication layer.
     ///
     /// # Errors
     ///
@@ -442,16 +446,14 @@ impl JtFile {
                 })
             }
             None => {
-                // An empty `ACTIVELAYERFILTER::` is the common case: the writer
-                // knows the filters but has not picked one, so the first of the
-                // sorted names is used, exactly as the viewer's filter box does.
-                let active = if info.active.is_empty() {
-                    info.filters.keys().next()
-                } else {
-                    info.filters
-                        .get_key_value(&info.active)
-                        .map(|(name, _)| name)
-                };
+                // An empty `ACTIVELAYERFILTER::` means nothing is in effect.
+                // The filters are merely declared, and a CAD system such as
+                // Teamcenter declares a dozen of them while showing all the
+                // geometry; only the named one may hide a part.
+                let active = info
+                    .filters
+                    .get_key_value(&info.active)
+                    .map(|(name, _)| name);
                 let Some(active) = active else {
                     return Ok(None);
                 };
@@ -1235,6 +1237,10 @@ mod tests {
     /// 20, and the file leaves the active one unset.
     const FILTERS: &[u8] = b"LAYERFILTER001::\x00ALL=1,2,256\x00LAYERFILTER000::\x00LAYCUR=20\x00ACTIVELAYERFILTER::\x00\x00";
 
+    /// The same filters, but with one of them named as the active one.
+    const ACTIVE_FILTERS: &[u8] =
+        b"LAYERFILTER001::\x00ALL=1,2,256\x00LAYERFILTER000::\x00LAYCUR=20\x00ACTIVELAYERFILTER::\x00LAYCUR\x00";
+
     /// The layer tag of the tagged part of the fixture.
     const TAG: &[u8] = b"LAYER::\x001\x00";
 
@@ -1433,21 +1439,58 @@ mod tests {
         );
     }
 
+    /// A file that declares filters but names none of them as the active one
+    /// hides nothing — the common Teamcenter case, where the declared filters
+    /// are drawing, mass-properties or publication layers.
     #[test]
-    fn the_default_filter_is_the_first_of_the_declared_ones() {
+    fn a_file_that_names_no_active_filter_applies_none() {
         let file = fixture(Some(FILTERS), Some(TAG));
+        assert_eq!(
+            file.layer_filter(None).expect("the fixture resolves"),
+            None,
+            "an empty ACTIVELAYERFILTER:: filters nothing"
+        );
+
+        let model = file.to_model();
+        assert_eq!(model.meshes.len(), 2, "every part survives");
+        let extras = model.extras.expect("the model carries extras");
+        assert!(
+            extras.get("layer_filter").is_none(),
+            "no filter means nothing to record"
+        );
+
+        // Any of the declared filters can still be asked for by name.
+        let all = file
+            .layer_filter(Some("ALL"))
+            .expect("ALL is declared")
+            .expect("ALL is a filter");
+        assert_eq!(all.layers, vec![1, 2, 256]);
+        let extras = file
+            .to_model_with_filter("ALL")
+            .expect("ALL is declared")
+            .extras
+            .expect("extras");
+        assert_eq!(extras["layer_filter"]["name"], "ALL");
+        assert_eq!(extras["layer_filter"]["layers"], json!([1, 2, 256]));
+    }
+
+    /// A file that *does* name an active filter gets exactly that filter, and
+    /// the parts it rejects lose their geometry.
+    #[test]
+    fn the_active_filter_named_by_the_file_drives_the_default() {
+        let file = fixture(Some(ACTIVE_FILTERS), Some(TAG));
         let filter = file
             .layer_filter(None)
             .expect("the fixture resolves")
-            .expect("the fixture declares filters");
-        assert_eq!(filter.name.as_deref(), Some("ALL"));
-        assert_eq!(filter.layers, vec![1, 2, 256]);
+            .expect("the fixture names an active filter");
+        assert_eq!(filter.name.as_deref(), Some("LAYCUR"));
+        assert_eq!(filter.layers, vec![20]);
 
         let model = file.to_model();
-        assert_eq!(model.meshes.len(), 2, "layer 1 is part of ALL");
+        assert_eq!(model.meshes.len(), 1, "the tagged part is filtered out");
         let extras = model.extras.expect("the model carries extras");
-        assert_eq!(extras["layer_filter"]["name"], "ALL");
-        assert_eq!(extras["layer_filter"]["layers"], json!([1, 2, 256]));
+        assert_eq!(extras["layer_filter"]["name"], "LAYCUR");
+        assert_eq!(extras["layer_filter"]["layers"], json!([20]));
     }
 
     #[test]
@@ -1471,22 +1514,40 @@ mod tests {
         assert_eq!(all.nodes[kept].children.len(), 1);
     }
 
+    /// A real export declares a dozen filters — publication, wireframe,
+    /// mass-properties — and names exactly one of them. Only the named one may
+    /// drop a part, no matter which one sorts first.
     #[test]
-    fn a_part_on_another_layer_is_dropped_by_the_default_filter() {
-        let file = fixture(Some(FILTERS), Some(b"LAYER::\x0020\x00"));
-        assert_eq!(file.to_model().meshes.len(), 1, "ALL does not cover 20");
+    fn only_the_filter_named_active_drops_a_part() {
+        const TC_FILTERS: &[u8] = b"LAYERFILTER000::\x00Additional Publications=259,260\x00LAYERFILTER001::\x00DMU=257\x00ACTIVELAYERFILTER::\x00DMU\x00";
+        let tag: Option<&[u8]> = Some(b"LAYER::\x00257\x00");
+
+        let file = fixture(Some(TC_FILTERS), tag);
+        let filter = file
+            .layer_filter(None)
+            .expect("the fixture resolves")
+            .expect("the fixture names DMU active");
+        assert_eq!(filter.name.as_deref(), Some("DMU"));
         assert_eq!(
-            file.to_model_unfiltered().meshes.len(),
+            file.to_model().meshes.len(),
             2,
-            "ignoring the filters keeps both parts"
+            "the active filter covers the part"
         );
         assert_eq!(
-            file.to_model_with_filter("LAYCUR")
-                .expect("LAYCUR is declared")
+            file.to_model_with_filter("Additional Publications")
+                .expect("the publication filter is declared")
                 .meshes
                 .len(),
+            1,
+            "a part on a layer nobody shows loses its geometry"
+        );
+
+        // The same file without an active filter keeps everything.
+        const NO_ACTIVE: &[u8] = b"LAYERFILTER000::\x00Additional Publications=259,260\x00LAYERFILTER001::\x00DMU=257\x00";
+        assert_eq!(
+            fixture(Some(NO_ACTIVE), tag).to_model().meshes.len(),
             2,
-            "LAYCUR covers 20"
+            "a declared filter that is not active hides nothing"
         );
     }
 

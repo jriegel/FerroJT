@@ -63,7 +63,7 @@ Submodules:
    exporter can compute them.
 7. `Model::bounds` as the union of the root nodes.
 8. `Model::extras["layer_filter"]` naming the filter the export applied, when
-   the file declares any; see below.
+   the file actually names an active one; see below.
 9. One `Material` per distinct appearance, reached from
    `Primitive::material`; see the materials section below.
 10. `Node::extras["properties"]` holding every key/value pair of the meta data
@@ -180,10 +180,15 @@ scanning, and FerroJT mirrors the result:
   the same concatenated `ProxyMetaData` streams the JSON dump reports, so the
   dump and the export never disagree about what the file says.
 * `JtFile::layer_filter(name)` resolves a filter. Omitting the name yields the
-  filter named by `ACTIVELAYERFILTER::`, falling back to the first one in name
-  order when the file leaves that empty — the samples all do, and the JT Layer
-  tool's combo box lands on index 0 in exactly that case. An unknown name is an
-  `Error::Invalid` that lists the available filters.
+  filter named by `ACTIVELAYERFILTER::`, and **nothing at all** when that value
+  is empty or names no declared filter — the same rule the reference glTF writer
+  uses (`ToolsLib/src/JtGltfMesh.cpp`: a filter is applied only when
+  `ActiveLayerFilter` is non-empty). Falling back to the alphabetically first
+  declared filter, as the JT Layer tool's combo box does when its `findText`
+  fails, is a user-interface habit and not a file semantic: real exports (for
+  example Teamcenter) name a publication or wireframe filter first, and applying
+  it silently hides the geometry the CAD viewer itself draws. An unknown name is
+  an `Error::Invalid` that lists the available filters.
 * `build_node` gates `Node::Part` only: a part whose tag shares no layer with
   the filter contributes no geometry and no children. Everything else —
   `Partition`, `MetaData`, `LOD`, `RangeLOD`, `Group`, `Instance` — is never
@@ -196,9 +201,14 @@ scanning, and FerroJT mirrors the result:
   tag and every part, whatever the export decides to do.
 
 Of the samples, the JT 8.x files declare no filter at all, and the JT 9.5/10.3
-ones declare `ALL` and `LAYCUR` with an empty active name; every part of every
-sample survives its own default filter, so the pinned export counts do not
-change.
+ones declare `ALL` and `LAYCUR` with an empty active name — so none of them
+applies a filter by default, and no part of any sample is ever lost to its own
+layer model. Naming a filter explicitly (`to_model_with_filter("LAYCUR")`) does
+gate parts, which is what the synthetic fixture in `jt/model.rs` covers. Real
+CAD exports are the case that matters: a Teamcenter export typically declares
+`DMU (DMU)`, `Additional Publications` or a `[WIREFRAME]` variant and leaves the
+active name empty, so the default export shows the whole assembly while
+selecting one of those names deliberately hides parts of it.
 
 ## The file view (`JtLsg` / `JtNode` / `JtMesh` / `JtArray`)
 

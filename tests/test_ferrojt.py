@@ -634,14 +634,15 @@ def test_node_handles_compare_by_position_in_the_graph() -> None:
 
 
 #: The layer filters each sample declares, and the one an export uses by
-#: default. A JT 8.x file declares none at all, and the newer ones all leave
-#: ``ACTIVELAYERFILTER::`` empty, so the first name in sorted order wins.
+#: default. A JT 8.x file declares none at all, and every newer sample leaves
+#: ``ACTIVELAYERFILTER::`` empty — so none of them filters anything, exactly as
+#: the C++ exporter and a viewer such as NOVO treat such a file.
 FILTERS = {
-    "example_block_jt10.3.jt": (["ALL", "LAYCUR"], "ALL"),
+    "example_block_jt10.3.jt": (["ALL", "LAYCUR"], None),
     "example_block_jt8.1.jt": ([], None),
-    "example_block_jt9.5.jt": (["ALL", "LAYCUR"], "ALL"),
+    "example_block_jt9.5.jt": (["ALL", "LAYCUR"], None),
     "opening_protection_plate1_jt8.0.jt": ([], None),
-    "opening_protection_plate1_jt9.5.jt": (["ALL", "LAYCUR"], "ALL"),
+    "opening_protection_plate1_jt9.5.jt": (["ALL", "LAYCUR"], None),
 }
 
 
@@ -655,10 +656,23 @@ def test_the_declared_layer_filters_are_the_ones_of_the_reference() -> None:
     assert jt.open()
 
     assert jt.layer_filters() == ["ALL", "LAYCUR"]
-    assert jt.active_layer_filter() == "ALL"
+    assert jt.active_layer_filter() is None
 
     # The dump still shows every filter of the file, filtered export or not.
     assert "layer-filter" in jt.json()
+
+
+def test_a_filter_that_is_not_active_hides_nothing() -> None:
+    """A CAD system declares a dozen filters; only the named one may hide a part.
+
+    Every sample leaves ``ACTIVELAYERFILTER::`` empty, so its own export keeps
+    all the geometry — the way NOVO displays such a file.
+    """
+    jt = ferrojt.JtFile(str(BLOCK_95))
+    assert jt.open()
+
+    assert jt.active_layer_filter() is None
+    assert jt.model().triangle_count == jt.model(all_layers=True).triangle_count
 
 
 @pytest.mark.parametrize("name", sample_ids(), ids=sample_ids())

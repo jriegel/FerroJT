@@ -274,18 +274,24 @@ Upload with `python -m twine upload dist\*`.
   `ProxyMetaData` late loads via `scan_for_layer_filter` / `scan_for_layer`
   (`jt::dump` helpers), so dump and export agree on what the file says.
   `JtFile::layer_filter(name)`: no name → the filter named by
-  `ACTIVELAYERFILTER::`, else the **first key of the sorted `BTreeMap`** (all
-  samples leave it empty; the JT Layer tool combo box lands on index 0).
+  `ACTIVELAYERFILTER::`, and **no filter at all** when that value is empty or
+  names nothing declared — the rule of `JtGltfMesh.cpp:305-308`
+  (`if (layerInfo.ActiveLayerFilter.size() != 0)`). The old fallback to the
+  **first key of the sorted `BTreeMap`** was the JT Layer combo box's habit of
+  landing on index 0 when its `findText` fails (`JTGui_MainWindow.cxx:475-493`):
+  a UI artifact, and it hid *all* geometry of every Teamcenter export whose
+  alphabetically first filter is `Additional Publications` / `[WIREFRAME]`.
   Unknown name → `Error::invalid(0, …)` listing the available names. A part with
   no tag is **kept** (deviation from `JtGltfMesh.cpp`, keeps plate1-9.5 at
   2/486); `Partition`/`MetaData`/`LOD`/`RangeLOD`/`Group`/`Instance` are never
   gated, and a rejected part keeps its node but loses geometry, children and
   instance target. API: `to_model()` / `to_model_unfiltered()` /
   `to_model_with_filter(&str)`; the effective filter is
-  `Model::extras["layer_filter"] = {"name", "layers"}`. `LayerFilter` is
-  re-exported from `ferrojt::jt`. `jt::dump` stays unfiltered. No sample loses a
-  part to its own filter, so the pinned counts above are unchanged — a drop can
-  only be shown with a forced filter or the synthetic fixture in `jt/model.rs`.
+  `Model::extras["layer_filter"] = {"name", "layers"}`, recorded **only when a
+  filter ran**. `LayerFilter` is re-exported from `ferrojt::jt`. `jt::dump` stays
+  unfiltered. No sample names an active filter, so every sample exports
+  unfiltered by default and the pinned counts are unchanged — a drop needs a
+  named filter or the synthetic fixture in `jt/model.rs`.
 - **The server sample's "36 empty representations" were a decode failure, not
   empty shapes.** `SampleJT_Server.jt` has one shape (file-view representation
   id 164, reached from many nodes) whose topological stream could not be read, so
@@ -663,14 +669,15 @@ Upload with `python -m twine upload dist\*`.
   `shading()` key is `[u32;10]` and must mirror `UsdMaterial::same_shading` exactly.
   `number()` uses Rust's shortest round-trip form, so asserts expect
   `translate = (1, 2, 3)` and `extent = [(0, 0, 0), (1, 1, 0)]`, **not** `25.0`.
-- **JT 8.x samples and `SampleJT_Server.jt` declare NO layer filters**, so their layers
-  record no `ferrojt:layer_filter` in `customLayerData` (that is how a consumer tells
-  "unfiltered" from "filtered by a file with no layers"). block-9.5/10.3 and plate1-9.5
-  declare `ALL` (+ `LAYCUR`); plate1-9.5 tags the **instance target** (the `MetaData`
-  node the two `Instance`s point at, position 11) with `LAYER:: = 20`, **not** the
-  `Part` — the block 9.5 `Part` (position 2) is the sample where the tag sits on the
-  part itself. Recorded via
-  `Model::extras["layer_filter"]` → `ferrojt:layer_filter` / `int[] ferrojt:layers`.
+- **No sample names an active layer filter**, so no sample's USD records
+  `ferrojt:layer_filter` in `customLayerData` (that is how a consumer tells
+  "unfiltered" from "filtered"). block-9.5/10.3 and plate1-9.5 *declare* `ALL`
+  (+ `LAYCUR`) and leave `ACTIVELAYERFILTER::` empty; plate1-9.5 tags the
+  **instance target** (the `MetaData` node the two `Instance`s point at, position
+  11) with `LAYER:: = 20`, **not** the `Part` — the block 9.5 `Part` (position 2)
+  is the sample where the tag sits on the part itself. A *named* filter is
+  recorded via `Model::extras["layer_filter"]` → `ferrojt:layer_filter` /
+  `int[] ferrojt:layers`.
 - **usd-core 26.11 Python API** (for `target\usd_*.py` probes): no
   `Stage.GetCustomLayerData` — read `stage.GetRootLayer().customLayerData`; `Prim` has
   no `GetCompositionErrors` (only `Stage`); `Relationship::GetTargets()`, not

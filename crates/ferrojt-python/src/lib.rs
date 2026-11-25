@@ -518,8 +518,9 @@ impl JtFile {
             .unwrap_or_default()
     }
 
-    /// The filter an export uses when none is asked for, or `None` when the
-    /// file carries no layer information at all.
+    /// The filter an export uses when none is asked for: the one the file
+    /// names in `ACTIVELAYERFILTER::`, or `None` when the file carries no
+    /// layer information or names no active filter.
     fn active_layer_filter(&self) -> Option<String> {
         self.parsed()
             .and_then(|file| file.layer_filter(None).ok())
