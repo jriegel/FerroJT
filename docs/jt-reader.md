@@ -319,8 +319,15 @@ slot then, so pyo3 compiles `__getbuffer__` out below it.
 * The key/value stream is dumped exactly like the reference tool, which means a
   value containing a double quote comes out as `\\"` and makes the dump
   unparseable JSON. That is byte parity, not a bug: in a Teamcenter export of
-  9 302 files, 118 of the 704 whose dump once broke on a dangling comma now fail
+  9 302 files, 118 of the 702 whose dump once broke on a dangling comma now fail
   only here, and the reference JSON writer fails on them identically.
+* What a real corpus still cannot draw: of 9 302 exported files, 8 223 yield
+  geometry through the layer filter the file itself declares and 9 000 with
+  `all_layers` — the 777 difference are parts the CAD system hid on a layer, and
+  the reference picture the NOVO Viewer drew for them is itself empty. The last
+  302 carry no tessellation anywhere in the file: they are PMI-only "SKELETON"
+  parts and stubs, and of the 24 of them that have a reference picture, the NOVO
+  Viewer left half of those empty as well.
 
 ## Tests
 
