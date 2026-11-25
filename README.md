@@ -227,6 +227,12 @@ Hiding a node or filtering the tree never removes it from the graph: a hidden
 subtree keeps its rows, its place in the tree and its selection, and `View All`
 frames only what is drawn.
 
+The `LOD by screen size` checkbox picks a level of detail per part from the area
+it covers. A tier that carries no geometry is not offered as a level: a CAD
+system that stores the tessellation one level down would otherwise leave the
+viewport empty while the part sits in another tier, which is the same
+fall-through the reader applies when it exports.
+
 ## Python
 
 ```sh

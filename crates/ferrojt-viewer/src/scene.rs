@@ -684,6 +684,12 @@ fn detect_stacks(rows: &[Row], child_rows: &[Vec<usize>]) -> Vec<LodGroup> {
 /// A tier's cost is the geometry of its whole subtree, because the shapes of a
 /// tier hang below its group row, not on the row itself. Where a stack nests in
 /// another one, only the tier of the inner stack that is on screen is counted.
+///
+/// A tier with no geometry at all is dropped from the stack: it is what a CAD
+/// system leaves behind when it stores the tessellation one level down, and a
+/// stack that may select it draws nothing while the part is in another tier. The
+/// reader applies the same rule when it exports (`jt::JtFile::to_model`). If
+/// every tier is empty there is nothing to select, and the stack is left alone.
 fn measure_stacks(
     groups: &mut [LodGroup],
     child_rows: &[Vec<usize>],
@@ -701,18 +707,28 @@ fn measure_stacks(
 
     let mut measured = Vec::with_capacity(groups.len());
     for group in 0..groups.len() {
-        let mut triangles = Vec::new();
+        let declared = groups[group].tiers.clone();
+        let mut tiers = Vec::with_capacity(declared.len());
+        let mut triangles = Vec::with_capacity(declared.len());
         let mut bounds: Option<(Vec3, Vec3)> = None;
-        for index in 0..groups[group].tiers.len() {
-            let root = groups[group].tiers[index];
+        for &root in &declared {
             let (count, box_) =
                 subtree_cost(root, group, &owner, groups, counts, child_rows, boxes);
-            triangles.push(count);
-            bounds = union_box(bounds, box_);
+            if count > 0 {
+                tiers.push(root);
+                triangles.push(count);
+                bounds = union_box(bounds, box_);
+            }
         }
-        measured.push((triangles, bounds));
+        if tiers.is_empty() {
+            // No tier of the stack has geometry, so there is nothing to prefer.
+            triangles = vec![0; declared.len()];
+            tiers = declared;
+        }
+        measured.push((tiers, triangles, bounds));
     }
-    for (group, (triangles, bounds)) in measured.into_iter().enumerate() {
+    for (group, (tiers, triangles, bounds)) in measured.into_iter().enumerate() {
+        groups[group].tiers = tiers;
         groups[group].triangles = triangles;
         groups[group].bounds = bounds;
     }
@@ -964,6 +980,42 @@ mod tests {
         let (min, max) = stacks[0].bounds.expect("the stack has geometry");
         assert_eq!(min, Vec3::ZERO);
         assert_eq!(max, Vec3::new(3.0, 1.0, 1.0));
+    }
+
+    /// A tier with no geometry is a placeholder a CAD system leaves behind when
+    /// it stores the tessellation one level down. It may not be a selectable
+    /// level of detail, or the viewport stays empty while the part is there.
+    #[test]
+    fn a_tier_without_geometry_is_not_a_level_of_detail() {
+        let (rows, child_rows) = stacked_rows(3);
+        let (mut counts, boxes) = costs(&rows, 3);
+        counts[2] = 0; // the finest tier of the file declares no triangles
+        let mut stacks = detect_stacks(&rows, &child_rows);
+        measure_stacks(&mut stacks, &child_rows, &counts, &boxes);
+        // The empty tier is gone and the numbering follows the tiers that remain.
+        assert_eq!(stacks[0].triangles, [6, 3]);
+        assert_eq!(stacks[0].tiers, vec![rows[3].id, rows[5].id]);
+
+        let visible = vec![true; rows.len()];
+        stacks[0].tier = 0;
+        assert_eq!(
+            drawn_triangle_count(&rows, &visible, &hidden_tiers(&stacks), &counts),
+            6
+        );
+    }
+
+    /// A stack whose tiers are all empty keeps its declared tiers, so the
+    /// outliner still shows what the file declares.
+    #[test]
+    fn a_stack_without_any_geometry_keeps_its_tiers() {
+        let (rows, child_rows) = stacked_rows(3);
+        let counts = vec![0usize; rows.len()];
+        let boxes = vec![None; rows.len()];
+        let mut stacks = detect_stacks(&rows, &child_rows);
+        measure_stacks(&mut stacks, &child_rows, &counts, &boxes);
+        assert_eq!(stacks[0].tiers.len(), 3);
+        assert_eq!(stacks[0].triangles, [0, 0, 0]);
+        assert!(stacks[0].bounds.is_none());
     }
 
     /// An out-of-range tier must not hide the part: the coarsest tier wins.
