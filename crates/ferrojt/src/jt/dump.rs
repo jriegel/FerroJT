@@ -626,14 +626,21 @@ pub fn recurse_down_the_tree(
         write_name(out, *indent, &shape.name, true)?;
         // The geometry follows the attributes, so the last attribute ends with
         // a separator. A shape whose representation is not in the file — a
-        // coarse level of detail left out of a filtered write, or a
-        // representation without vertices — has nothing to separate, and the
-        // separator would leave the object unparseable.
+        // coarse level of detail left out of a filtered write, a representation
+        // whose segment could not be read, or a representation without
+        // vertices — has nothing to separate, and the separator would leave the
+        // object unparseable.
         let geometry: Vec<&LodGeometry> = node
             .late_loads()
             .iter()
             .filter_map(|load| graph.geometry_for(load))
             .collect();
+        write_name(
+            out,
+            *indent,
+            &shape.name,
+            has_attributes || !geometry.is_empty(),
+        )?;
         handle_attributes(config, indent, out, graph, node, !geometry.is_empty())?;
         for geometry in geometry {
             write_geometry(config, out, *indent, geometry)?;

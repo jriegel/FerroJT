@@ -295,6 +295,15 @@ slot then, so pyo3 compiles `__getbuffer__` out below it.
 * Every malformed byte sequence must return `Error::Invalid { offset, message }`
   with the offset of the offending field, never panic and never read past the
   buffer.
+* Two Siemens specific segment kinds are not decoded: kind 23 (`"STT"`, the
+  structured tessellation a JT 10.5 export writes) keeps its payload XZ encoded,
+  because that kind carries no compression envelope — the reference reader skips
+  the envelope there too — and kind 17 (`"XT B-rep"`) does decompress, but its
+  TLV framed objects are not parsed. A shape whose representation lives in such a
+  segment keeps its node, loses that tier's geometry, and the level of detail
+  fall-through takes the tier below it. Out of 9 302 exported files in a
+  Teamcenter sweep exactly two were affected, and in both the tier below LOD0
+  drew the part.
 * Truncated files must be detected before a slice is indexed.
 * A single damaged element must not lose the file: the reader logs a warning and
   skips to the end of the element, the way the reference implementation does.

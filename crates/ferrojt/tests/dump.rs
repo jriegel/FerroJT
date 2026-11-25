@@ -160,3 +160,52 @@ fn dump_is_valid_json_for_every_sample() {
         }
     }
 }
+
+#[test]
+fn dump_stays_valid_json_when_a_shape_loses_its_segment() {
+    // A Shape node whose representation cannot be read stays in the graph with
+    // nothing to write: a level of detail left out of a filtered write, or a
+    // segment the reader does not decode (a Siemens "STT" segment, for example,
+    // hides an XZ payload behind a segment type that carries no compression
+    // envelope). The object must still close cleanly - a separator after its
+    // name makes the whole dump unparseable. The builder writes a bare
+    // partition and a shape with no attribute, which is the thinnest case.
+    let mut build = ferrojt::jt::JtBuilder::new();
+    build
+        .set_version(ferrojt::jt::JtVersion::V8_1)
+        .expect("JT 8.1 is a supported revision");
+    let part = build
+        .add_node(build.root(), ferrojt::jt::BuildNode::Part, "part")
+        .expect("the root takes a part");
+    let triangle = ferrojt::jt::MeshData::new(
+        vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        vec![0, 1, 2],
+    )
+    .expect("a single triangle");
+    build.add_shape(part, "shape", triangle).expect("a shape");
+
+    let path = PathBuf::from("shape-without-a-segment.jt");
+    let mut data = build.write_to_bytes().expect("the graph can be written");
+    let at = usize::try_from(
+        ferrojt::jt::JtFile::read(&path, &data)
+            .expect("read the built file")
+            .toc
+            .iter()
+            .find(|entry| matches!(entry.kind, 3 | 7 | 8))
+            .expect("a shape segment")
+            .offset,
+    )
+    .expect("the segment offset");
+    // The envelope of a segment is its GUID (16 bytes), its type and its size;
+    // a size of zero leaves the element inside nothing to read.
+    data[at + 20..at + 24].copy_from_slice(&0i32.to_le_bytes());
+
+    let broken = ferrojt::jt::JtFile::read(&path, &data).expect("read the broken file");
+    let text = dump(&broken, DUMP_ALL, 1).expect("dump the broken file");
+    assert!(
+        text.contains("\"jt_type\":\"TriStripSet\""),
+        "the shape node is gone from the dump"
+    );
+    serde_json::from_str::<serde_json::Value>(&text)
+        .unwrap_or_else(|err| panic!("the dump of a shape without its segment: {err}"));
+}
