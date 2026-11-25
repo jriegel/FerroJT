@@ -525,8 +525,15 @@ pub fn recurse_down_the_tree(
     if let Node::Part(part) = node {
         tabs(out, *indent)?;
         out.write_all(b"\"jt_type\":\"Part\",\n")?;
-        write_name(out, *indent, &part.name, has_attributes || has_children)?;
+        // The key/value stream is a member of its own: a part with properties
+        // but no attributes and no children still has to separate its name.
         let meta = handle_late_loads_meta(graph, node.late_loads());
+        write_name(
+            out,
+            *indent,
+            &part.name,
+            has_attributes || has_children || !meta.is_empty(),
+        )?;
         if !meta.is_empty() {
             tabs(out, *indent)?;
             out.write_all(b"\"properties\":\n")?;
@@ -543,13 +550,16 @@ pub fn recurse_down_the_tree(
     } else if let Node::MetaData(meta_data) = node {
         tabs(out, *indent)?;
         out.write_all(b"\"jt_type\":\"MetaData\",\n")?;
+        // The key/value stream is a member of its own: meta data with
+        // properties but no attributes and no children still has to separate
+        // its name.
+        let meta = handle_late_loads_meta(graph, node.late_loads());
         write_name(
             out,
             *indent,
             &meta_data.name,
-            has_attributes || has_children,
+            has_attributes || has_children || !meta.is_empty(),
         )?;
-        let meta = handle_late_loads_meta(graph, node.late_loads());
         if !meta.is_empty() {
             tabs(out, *indent)?;
             out.write_all(b"\"properties\":\n")?;
@@ -609,21 +619,29 @@ pub fn recurse_down_the_tree(
     } else if let Node::Instance(instance) = node {
         tabs(out, *indent)?;
         out.write_all(b"\"jt_type\":\"Instance\",\n")?;
-        // The instanced object always follows the attributes.
-        write_name(out, *indent, &instance.name, true)?;
-        handle_attributes(config, indent, out, graph, node, true)?;
-        tabs(out, *indent)?;
-        out.write_all(b"\"InstancedObject\":\n")?;
-        if let Some(target) = graph
+        // The instanced object follows the attributes, so an instance with a
+        // target always separates what comes before it. A target the graph
+        // cannot resolve — a stub file that names an object id it does not
+        // contain — leaves the member out entirely, because a member with no
+        // value cannot be parsed.
+        let target = graph
             .instance_target(node)
-            .and_then(|pos| graph.node_at(pos))
-        {
+            .and_then(|pos| graph.node_at(pos));
+        write_name(
+            out,
+            *indent,
+            &instance.name,
+            has_attributes || target.is_some(),
+        )?;
+        handle_attributes(config, indent, out, graph, node, target.is_some())?;
+        if let Some(target) = target {
+            tabs(out, *indent)?;
+            out.write_all(b"\"InstancedObject\":\n")?;
             recurse_down_the_tree(config, indent, out, graph, target)?;
         }
     } else if let Node::ShapeTriStripSet(shape) = node {
         tabs(out, *indent)?;
         out.write_all(b"\"jt_type\":\"TriStripSet\",\n")?;
-        write_name(out, *indent, &shape.name, true)?;
         // The geometry follows the attributes, so the last attribute ends with
         // a separator. A shape whose representation is not in the file — a
         // coarse level of detail left out of a filtered write, a representation

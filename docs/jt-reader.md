@@ -307,6 +307,20 @@ slot then, so pyo3 compiles `__getbuffer__` out below it.
 * Truncated files must be detected before a slice is indexed.
 * A single damaged element must not lose the file: the reader logs a warning and
   skips to the end of the element, the way the reference implementation does.
+* `jt::dump` separates a member only when a member really follows it. A node that
+  lost its children — a `Shape` whose representation segment was dropped, a
+  `RangeLod` filtered down to no tier, an `Instance` whose target object id the
+  file does not contain — must not end with the separator after its name, or the
+  JSON stops parsing. That happens in the wild: a stub export can hold 767 nodes
+  and 766 dangling commas. The reference C++ writer has the same shape and the
+  same flaw (it emits a dangling comma for a `Shape_Vertex` child of an
+  `Instance`); the Rust writer reproduces that one case deliberately and fixes
+  the rest.
+* The key/value stream is dumped exactly like the reference tool, which means a
+  value containing a double quote comes out as `\\"` and makes the dump
+  unparseable JSON. That is byte parity, not a bug: in a Teamcenter export of
+  9 302 files, 118 of the 704 whose dump once broke on a dangling comma now fail
+  only here, and the reference JSON writer fails on them identically.
 
 ## Tests
 
@@ -322,7 +336,11 @@ slot then, so pyo3 compiles `__getbuffer__` out below it.
   primitive of each one has a non-empty `POSITION` attribute, which is what
   a shape whose topology cannot be decoded used to break.
 * `crates/ferrojt/tests/dump.rs` — every sample with a reference dump under
-  `data/Reference` matches it semantically, and every dump is valid JSON.
+  `data/Reference` matches it semantically, every dump is valid JSON, a shape
+  whose representation segment was deleted still dumps as valid JSON, and every
+  rewrite variant of every sample (all LODs on/off, each declared layer filter,
+  or no filter at all) dumps as valid JSON — a filtered write leaves a level of
+  detail span with no tier and a part with no representation.
 * Unit tests in `jt/decode` compare the codecs against the reference output byte
   for byte.
 * Unit tests in `jt/model` build a synthetic scene graph, because no sample has

@@ -209,3 +209,67 @@ fn dump_stays_valid_json_when_a_shape_loses_its_segment() {
     serde_json::from_str::<serde_json::Value>(&text)
         .unwrap_or_else(|err| panic!("the dump of a shape without its segment: {err}"));
 }
+
+/// A member that is not there must not be separated. Every rewrite variant of a
+/// sample is checked: a filtered write leaves a level-of-detail span without
+/// tiers, a part without its representation and a meta data node whose layer
+/// filters were dropped — containers that end right after their last real
+/// member. An instance whose target the graph cannot resolve (a stub file that
+/// names an object id it does not have) needs the same care, but no sample of
+/// ours carries one.
+#[test]
+fn every_rewrite_variant_dumps_as_valid_json() {
+    let mut instances = 0;
+    for (sample, _) in pairs() {
+        let source = std::fs::read(&sample)
+            .unwrap_or_else(|err| panic!("reading {}: {err}", sample.display()));
+        let original = ferrojt::jt::JtFile::open(&sample)
+            .unwrap_or_else(|err| panic!("opening {}: {err}", sample.display()));
+        // The two filters every sample with filters declares, probed because a
+        // name the file does not know is an error rather than an empty filter.
+        let mut filters: Vec<String> = Vec::new();
+        for name in ["ALL", "LAYCUR"] {
+            if original.layer_filter(Some(name)).is_ok() {
+                filters.push(name.to_string());
+            }
+        }
+        for all_lods in [false, true] {
+            for no_layer_filter in [false, true] {
+                for filter in filters.iter().map(Some).chain([None]) {
+                    if filter.is_some() && no_layer_filter {
+                        continue; // the writer refuses both at once
+                    }
+                    let options = ferrojt::jt::WriteOptions {
+                        all_lods,
+                        no_layer_filter,
+                        layer_filter: filter.cloned(),
+                        ..Default::default()
+                    };
+                    let what = format!(
+                        "{} (lods {all_lods}, no filter {no_layer_filter}, filter {:?})",
+                        sample.display(),
+                        filter
+                    );
+                    let data = ferrojt::jt::write_to_bytes(&original, &source, &options)
+                        .unwrap_or_else(|err| panic!("rewriting {what}: {err}"));
+                    let file = ferrojt::jt::JtFile::read(&sample, &data)
+                        .unwrap_or_else(|err| panic!("reading the rewrite of {what}: {err}"));
+                    for config in [ferrojt::jt::DUMP_TOC, DUMP_ALL] {
+                        let text = dump(&file, config, 1)
+                            .unwrap_or_else(|err| panic!("dumping the rewrite of {what}: {err}"));
+                        if text.contains("\"InstancedObject\"") {
+                            instances += 1;
+                        }
+                        serde_json::from_str::<serde_json::Value>(&text).unwrap_or_else(|err| {
+                            panic!("the rewrite of {what} does not dump as JSON: {err}")
+                        });
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        instances > 0,
+        "no rewrite carried an instance, so the instance members were not checked"
+    );
+}
