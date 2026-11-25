@@ -17,6 +17,7 @@ use super::cdp::Package;
 use super::unpack::Unpack;
 use crate::codec::ByteOrder;
 use crate::error::{Error, Result};
+use crate::jt::hash::{TopologySymbols, composite_hash, slices};
 use crate::jt::reader::Cursor;
 
 /// Number of faces inspected when choosing the next active face.
@@ -570,6 +571,14 @@ pub struct MeshInput {
     attr_masks_large: Package,
     split_faces: Package,
     split_positions: Package,
+    /// Whether the file stores the pair of auxiliary context-7 mask streams of
+    /// JT 8.x/9.x rather than the single one of JT 10.x. The composite hash
+    /// makes one call more for a pair, so the reader has to remember which it
+    /// loaded.
+    auxiliary_pair: bool,
+    /// The composite hash stored after the symbol streams, which
+    /// [`MeshInput::decode`] compares against one it computes itself.
+    stored_hash: u32,
 }
 
 impl MeshInput {
@@ -589,17 +598,18 @@ impl MeshInput {
         for package in &mut attr_masks {
             *package = Package::load2(cursor)?;
         }
+        let auxiliary_pair = cursor.major() < 10;
         let mask8_30 = Package::load2(cursor)?;
-        let mask8_4 = if cursor.major() >= 10 {
-            Package::empty()
-        } else {
+        let mask8_4 = if auxiliary_pair {
             Package::load2(cursor)?
+        } else {
+            Package::empty()
         };
         let attr_masks_large = Package::load2(cursor)?;
         let split_faces = Package::load2(cursor)?;
         let split_positions = Package::load2(cursor)?;
-        // A trailing checksum over the symbols is not verified by the reader.
-        let _hash = cursor.read_u32()?;
+        // A checksum over the symbols, verified in [`MeshInput::decode`].
+        let stored_hash = cursor.read_u32()?;
         Ok(Self {
             degrees,
             valences,
@@ -611,6 +621,8 @@ impl MeshInput {
             attr_masks_large,
             split_faces,
             split_positions,
+            auxiliary_pair,
+            stored_hash,
         })
     }
 
@@ -652,6 +664,32 @@ impl MeshInput {
             attr_counter: 0,
         };
         decoder.run()?;
+        let symbols = &decoder.symbols;
+        // A strict consumer refuses to draw a shape whose stored composite hash
+        // does not match its symbols, so the mismatch is worth reporting even
+        // though the walk itself succeeded.
+        let hash = composite_hash(
+            &TopologySymbols {
+                degrees: slices(&symbols.degrees),
+                valences: &symbols.valences,
+                groups: &symbols.groups,
+                face_flags: &symbols.face_flags,
+                attr_masks: slices(&symbols.attr_masks),
+                attr_masks_high: &symbols.mask8_30,
+                attr_masks_aux: &symbols.mask8_4,
+                attr_masks_large: &symbols.attr_masks_large,
+                split_faces: &symbols.split_faces,
+                split_positions: &symbols.split_positions,
+            },
+            self.auxiliary_pair,
+        );
+        if hash != self.stored_hash {
+            tracing::warn!(
+                "the composite hash of a topology is {:08x}, its symbols give {:08x}",
+                self.stored_hash,
+                hash
+            );
+        }
         if !decoder.symbols.is_exhausted() {
             // The reference drops the mesh when symbols are left over; doing
             // the same keeps the output identical.

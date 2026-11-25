@@ -233,6 +233,54 @@ Read out of the samples, since no reference writer exists:
   samples — which is why every block rewrite rendered and only the plate did
   not. `a_context_seven_face_carries_both_auxiliary_mask_streams` pins it on a
   nine-gon bipyramid, whose two apices have degree 9.
+* A JT 10.x topological shape wraps its coder input in a **second, embedded
+  logical element**, immediately after the first vertex binding:
+  `i32 length | GUID | u8 base type 9 | i32 object id 1 | u8 version 1 |
+  u32 vertex-records id 0 | u8 flag 1` — 31 bytes
+  (`encode::TOPOLOGY_EMBEDDED_HEADER`), with the coder input starting 31 bytes
+  after the length field. At 9.x the same three last fields sit there **loose**
+  and unframed. The embedded length stops exactly one byte before the outer
+  element closes, because the caller appends the version byte that closes it:
+  `length = outer − 1 − (at + 4)`. The mis-framed header has the **same total
+  width**, so a lenient reader, a lenient renderer and `jtinfo` all accept the
+  file and a strict one draws nothing. The reader rejects a foreign GUID
+  outright (`object::read_shape_lod_data`). That GUID, `ada530f8-4cbe-bc4f-9b5f-
+  b9269278d2e1`, appears in no specification, in no file of `example/` and in no
+  `guid::types` — it is taken from the sample bytes and is a named constant in
+  both `encode.rs` and `object.rs`. `write_topological_body` also writes **two**
+  version fields before the first vertex binding, word-wide at 9.x and byte-wide
+  at 10.x, so the coder input sits at body offset 18 at 9.x and 41 at 10.x.
+  `a_ten_x_shape_wraps_its_coder_input_in_an_embedded_element` and
+  `a_nine_x_shape_carries_no_embedded_element` pin both.
+
+## The hashes a strict consumer verifies
+
+A JT file carries three checksums per topological shape, and a strict consumer
+recomputes all of them and **refuses to draw the shape** when one disagrees — it
+does not warn, and it does not fall back. The primitive is Bob Jenkins' lookup2
+hash (1996), published in the format specification itself; `jt/hash.rs` holds it
+(`hash32` over `u32` words, `hash16` over `u16` shorts, `composite_hash`). The
+spec prints `hash()` and `hash3()` but never the body of `hash2()`, so the word
+form is pinned by evidence: three words per `mix`, the word count added **after**
+the main loop and **before** the tail switch, a one-word remainder feeding `a`, a
+two-word remainder feeding `a` then `b`, a final `mix`, return `c`. It reproduces
+the stored value of every shape of every sample.
+
+* The **Composite Hash** of the topology is a chain of `hash16` calls over the
+  symbol arrays, and the chain is **revision dependent**: eight degree arrays,
+  valences, groups, the flag array, attribute masks 0..6, the low and high 32
+  bits of mask 7, the large masks, the split symbols and the split positions —
+  eleven calls at 9.x and **ten** at 10.x, where the `mask8_4` region is not
+  hashed. The vertex records are not part of it. The flag is
+  `MeshInput::auxiliary_pair = cursor.major() < 10`, and the reader verifies the
+  same chain it reports. Reproduced for all twelve CAD shapes of the samples.
+* The **vertex-data hashes** of the coordinates and normals are revision
+  dependent in their **granularity**, not their content: JT 9.x feeds one word
+  per `hash32` call and chains the seed through, JT 10.x feeds one whole
+  component array per call. Component-major, record-minor, over the **unique**
+  coordinates. `encode::attribute_hash` implements both; verified 6/6 at 9.5 and
+  6/6 at 10.3. Getting only the content right — feeding one array at both
+  revisions — reproduces the 10.x value and blanks every 9.x shape.
 
 ## Deliberate deviations
 
@@ -322,6 +370,21 @@ source:
 
   One representation of the plate — a 152-triangle screw — measures 207 109 on
   its own, and that is the fixture the encoder bisection ran on.
+* **the strict consumer**: that renderer is **lenient**, and so is `jtinfo`. Both
+  accepted every file that Siemens JT2Go drew blank, so "it renders here" proves
+  nothing about a real consumer. `tests/jt2go_picture.py` is the strict oracle:
+  it drives an installed JT2Go through `ctypes`, waits for the MDI document,
+  captures the `DMUtils` drawing surface with `PrintWindow(..,
+  PW_RENDERFULLCONTENT)` and counts the pixels differing from the background.
+  Three outcomes, never to be conflated: a large ink count, **352 px** (the file
+  loads and the shape is rejected — 352 is the trihedron icon alone), and no MDI
+  document at all after 120 s (the file is structurally refused). It is the only
+  oracle that caught the composite hash, the vertex hash granularity and the
+  embedded element defects above, and `tests/test_jt2go.py` runs the three writer
+  paths — rewrite, model path and hand-built chain — through it. Baselines: the
+  block at every revision and every path **387 467**, the plate **226 982**
+  (226 971 for the 8.0 → 8.1 rewrite), a hand-built cube and a `TestBlock.glb`
+  conversion **352 001**, the server sample written at 9.5 **143 741**.
 
 ## Open work
 

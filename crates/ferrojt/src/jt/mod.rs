@@ -44,6 +44,7 @@ mod dump;
 mod encode;
 mod from_model;
 mod guid;
+mod hash;
 mod model;
 mod object;
 mod reader;

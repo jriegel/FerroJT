@@ -12,10 +12,16 @@ use crate::jt::decode::{Decoded, MeshInput, Package, UnifiedMesh, Unpack, Vertex
 use crate::jt::guid::{Guid, types};
 use crate::jt::reader::Cursor;
 
-/// The 16 bytes a JT 10.x topologically compressed tri-strip representation is
-/// prefixed with.
-const TOPOLOGY_MARKER: [u8; 16] = [
-    0x30, 0xf8, 0x4c, 0xbe, 0xbc, 0x4f, 0x9b, 0x5f, 0xb9, 0x26, 0x92, 0x78, 0xd2, 0xe1, 0x09, 0x01,
+/// The object type id of the logical element a JT 10.x tri-strip set embeds
+/// around its topological coder input.
+///
+/// JT 10.x nests a second element header — length, object type id, base type
+/// and object id — inside the shape representation, immediately after the
+/// first vertex binding, and the coder input follows the `TopoMesh LOD Data`
+/// that closes it. Neither published format description names this id and no
+/// OpenJT source contains it, so it is recorded from the sample files.
+const TOPOLOGY_ELEMENT_GUID: [u8; 16] = [
+    0xad, 0xa5, 0x30, 0xf8, 0x4c, 0xbe, 0xbc, 0x4f, 0x9b, 0x5f, 0xb9, 0x26, 0x92, 0x78, 0xd2, 0xe1,
 ];
 
 /// The `PerVertex` value of the JT 8.x vertex binding enumeration.
@@ -1216,15 +1222,29 @@ fn read_shape_lod_data(cursor: &mut Cursor<'_>, tri_strip: bool) -> Result<Optio
     let _version = cursor.read_version()?;
     let binding = read_vertex_binding2(cursor)?;
     if major >= 10 {
-        let _version4 = cursor.read_version()?;
-        let _mesh_version = cursor.read_version()?;
-        let _tri_id = cursor.read_i32()?;
+        // A JT 10.x tri-strip set wraps its coder input in a second, embedded
+        // logical element: the length of that element, its object type id, base
+        // type and object id, then the `TopoMesh LOD Data` closing its header.
+        // The width is the same as the fields a JT 9.x file stores here, so a
+        // header mis-framed as opaque padding still reads — and leaves a strict
+        // consumer unable to find the coder input.
         if tri_strip {
-            let marker = cursor.read_bytes(16)?;
-            if marker != TOPOLOGY_MARKER {
-                return Err(Error::corrupt("the topology marker of the LOD is invalid"));
+            let _length = cursor.read_len()?;
+            let guid = cursor.read_bytes(16)?;
+            if guid != TOPOLOGY_ELEMENT_GUID {
+                return Err(Error::corrupt(
+                    "the object type id of the embedded topological element is invalid",
+                ));
             }
-            cursor.skip(9)?;
+            let _base_type = cursor.read_u8()?;
+            let _object_id = cursor.read_i32()?;
+            let _lod_version = cursor.read_u8()?;
+            let _vertex_records = cursor.read_u32()?;
+            let _flag = cursor.read_u8()?;
+        } else {
+            let _version4 = cursor.read_version()?;
+            let _mesh_version = cursor.read_version()?;
+            let _tri_id = cursor.read_i32()?;
         }
     } else {
         let _mesh_version = cursor.read_version()?;

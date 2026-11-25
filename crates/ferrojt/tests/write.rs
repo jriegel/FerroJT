@@ -1292,3 +1292,129 @@ fn atoms_name_the_class_version(file: &JtFile, bytes: &[u8], class: Option<u32>)
     assert!(checked > 0, "no property atom could be framed");
     unknown
 }
+
+/// The object type id of the element a JT 10.x tri-strip set embeds around its
+/// coder input, as every sample stores it.
+///
+/// Neither published format description names this id and no OpenJT source
+/// contains it, so it cannot be a named constant of the library here either —
+/// the writer keeps it privately, and a test that reaches into the bytes has to
+/// carry its own copy.
+const TOPOLOGY_ELEMENT: [u8; 16] = [
+    0xad, 0xa5, 0x30, 0xf8, 0x4c, 0xbe, 0xbc, 0x4f, 0x9b, 0x5f, 0xb9, 0x26, 0x92, 0x78, 0xd2, 0xe1,
+];
+
+/// A JT 10.x shape stores its topological coder input inside a second, nested
+/// logical element, and the length of that element has to stop exactly where
+/// the element containing it stops.
+///
+/// The nested header is the same width as the three fields a JT 9.x file keeps
+/// loose in the same place, so a body that stores those fields unframed shifts
+/// nothing: this reader, `jtinfo` and the NOVO renderer all take it, and only a
+/// consumer that walks the nesting notices — and it notices by drawing nothing.
+/// That is what makes the framing worth pinning at file level rather than only
+/// in the encoder.
+#[test]
+fn a_ten_x_shape_wraps_its_coder_input_in_an_embedded_element() {
+    for stem in [
+        "example_block_jt9.5.jt",
+        "example_block_jt10.3.jt",
+        "opening_protection_plate1_jt9.5.jt",
+    ] {
+        let path = sample(stem);
+        let (file, again, bytes) = rewrite(&path, "10.3");
+        assert_eq!(
+            representation_count(&again),
+            representation_count(&file),
+            "{stem}: a representation was lost"
+        );
+        let found = embedded_elements(&again, &bytes);
+        assert_eq!(
+            found,
+            representation_count(&again),
+            "{stem}: written at 10.3, its representations must each carry one \
+             embedded topological element"
+        );
+    }
+}
+
+/// The same three fields of a JT 9.x file stand on their own, with no nesting
+/// to walk and nothing to measure.
+#[test]
+fn a_nine_x_shape_carries_no_embedded_element() {
+    let path = sample("example_block_jt9.5.jt");
+    let (_, again, bytes) = rewrite(&path, "9.5");
+    assert_eq!(
+        embedded_elements(&again, &bytes),
+        0,
+        "JT 9.x has no embedded element to frame"
+    );
+}
+
+/// How many embedded topological elements the shape segments of a written file
+/// carry, checking each one as it is found: the object type id, the base type,
+/// and a length that ends exactly at the end of the element containing it.
+fn embedded_elements(file: &JtFile, bytes: &[u8]) -> usize {
+    let major = file.header.major;
+    let mut found = 0;
+    for row in file.toc.iter().filter(|row| (6..=16).contains(&row.kind)) {
+        let at = usize::try_from(row.offset).expect("a segment offset");
+        // A shape segment carries no compression envelope, so its first element
+        // atom follows the segment envelope directly.
+        let mut segment = Cursor::new(&bytes[at..], file.header.order, major);
+        segment.read_guid().expect("the segment guid");
+        segment.read_i32().expect("the segment type");
+        segment.read_i32().expect("the segment length");
+        let payload = at + segment.position();
+        let mut cursor = Cursor::new(&bytes[payload..], file.header.order, major);
+        let Some(atom) = read_element_envelope(&mut cursor, major > 8).expect("an element atom")
+        else {
+            continue;
+        };
+        let body = bytes
+            .get(payload + atom.body_offset..payload + atom.body_offset + atom.body_len)
+            .expect("the body of a shape element");
+        // The shape LOD base: its class version, the element version, and the
+        // 64-bit vertex binding. Only a tri-strip set nests anything.
+        let mut shape = Cursor::new(body, file.header.order, major);
+        shape.read_version().expect("the shape LOD base version");
+        shape.read_version().expect("the shape LOD element version");
+        shape.read_bytes(8).expect("the vertex binding");
+        if major < 10 {
+            continue;
+        }
+        // The length prefix of the embedded element counts everything behind
+        // its own header: the object type id, the base type, the object id and
+        // the whole coder input.
+        let at = cursor.position() + shape.position();
+        let length = shape.read_len().expect("the embedded element length");
+        let guid = shape.read_bytes(16).expect("the embedded object type id");
+        assert_eq!(
+            guid, TOPOLOGY_ELEMENT,
+            "a JT {major}.x shape embeds an element of type {guid:?}, which is \
+             not the topological one"
+        );
+        assert_eq!(
+            shape.read_u8().expect("the embedded base type"),
+            9,
+            "the embedded topological element must declare no base class"
+        );
+        shape.read_i32().expect("the embedded object id");
+        shape.read_u8().expect("the top mesh version");
+        shape.read_u32().expect("the vertex records object id");
+        shape.read_u8().expect("the top mesh flag");
+        assert_ne!(length, 0, "the embedded topological element is empty");
+        // The nested element stops exactly one byte before the element holding
+        // it: the version byte closing the outer element sits between the two.
+        let outer = atom.body_offset + atom.body_len;
+        let short = outer - 1 - (at + 4);
+        assert_eq!(
+            length, short,
+            "the embedded topological element of a JT {major}.x shape covers \
+             {length} bytes from its header, but only {short} are left before \
+             the version byte closing the element containing it"
+        );
+        found += 1;
+    }
+    found
+}

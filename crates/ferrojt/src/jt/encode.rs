@@ -37,23 +37,51 @@ use std::collections::HashMap;
 use crate::codec::{ByteOrder, WriterExt};
 use crate::error::{Error, Result};
 use crate::jt::build::MeshData;
+use crate::jt::hash::{TopologySymbols, composite_hash, hash32, slices};
 use crate::jt::version::JtVersion;
 use crate::jt::write::write_version;
 
-/// The 16-byte marker a JT 10.x tri-strip set stores before its embedded
-/// element header; the reader compares it and skips nine opaque bytes.
-const TOPOLOGY_MARKER: [u8; 16] = [
-    0x30, 0xf8, 0x4c, 0xbe, 0xbc, 0x4f, 0x9b, 0x5f, 0xb9, 0x26, 0x92, 0x78, 0xd2, 0xe1, 0x09, 0x01,
+/// The object type id of the logical element a JT 10.x tri-strip set embeds
+/// around its coder input.
+///
+/// JT 10.x wraps the topological data in a **second, nested element header** —
+/// length, object type id, base type and object id — sitting immediately after
+/// the first vertex binding. A strict consumer walks through it to reach the
+/// coder input, so a file that stores the same bytes without that framing
+/// parses here and renders nothing elsewhere. Neither published format
+/// description names this id and no OpenJT source contains it, so it is taken
+/// verbatim from the sample files.
+const TOPOLOGY_ELEMENT_GUID: [u8; 16] = [
+    0xad, 0xa5, 0x30, 0xf8, 0x4c, 0xbe, 0xbc, 0x4f, 0x9b, 0x5f, 0xb9, 0x26, 0x92, 0x78, 0xd2, 0xe1,
 ];
+
+/// The base type of that embedded element: 9 is "no base class".
+const TOPOLOGY_ELEMENT_BASE_TYPE: u8 = 9;
+
+/// The object id of the embedded element. Every sample stores 1, and nothing
+/// resolves it against the property table.
+const TOPOLOGY_ELEMENT_OBJECT_ID: u32 = 1;
+
+/// The `TopoMesh LOD Data` of Figure 88 that follows the embedded element's
+/// envelope: a version, the object id of the vertex records this top mesh
+/// shares with other top meshes, and a flag. Every sample stores 0 for the
+/// vertex records of a single-mesh file, and 0 renders identically.
+const TOPOLOGY_LOD_VERSION: u8 = 1;
+
+/// The object id of the vertex records of the embedded element.
+const TOPOLOGY_VERTEX_RECORDS_ID: u32 = 0;
+
+/// The flag closing the `TopoMesh LOD Data`.
+const TOPOLOGY_LOD_FLAG: u8 = 1;
+
+/// The width of the embedded element header written before the coder input of
+/// a JT 10.x tri-strip set: its length, object type id, base type, object id,
+/// and the three members of the `TopoMesh LOD Data`.
+const TOPOLOGY_EMBEDDED_HEADER: usize = 4 + 16 + 1 + 4 + 1 + 4 + 1;
 
 /// The low byte of a 64-bit vertex binding: three position components, one
 /// normal component, no colour.
 const BINDING_LSB: u8 = 0x4a;
-
-/// The nine bytes a JT 10.x tri-strip set stores after the topology marker.
-/// They hold a logical element header (GUID tail, flag, id) that the reader
-/// skips without inspecting, so a neutral value is written.
-const EMBEDDED_HEADER: [u8; 9] = [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01];
 
 /// The symbol streams of a dual walk, as *intended* values.
 ///
@@ -1055,15 +1083,35 @@ fn write_mesh_input(streams: &Streams, version: JtVersion, out: &mut Vec<u8>) {
     }
     // The two auxiliary mask arrays of context 7. JT 10.x folds them into one
     // stream and never reads the second. Both hold one value per context-7 mask
-    // symbol; the mask here never reaches past bit 30, so both are zero.
+    // symbol; the mask here never reaches past bit 30, so both are zero. The
+    // composite hash below makes one call per stream the file stores, so the
+    // pair has to be hashed only where the pair is written.
     package2(&streams.attr_masks_high, version, out);
-    if version.major < 10 {
+    let auxiliary_pair = version.major < 10;
+    if auxiliary_pair {
         package2(&streams.attr_masks_high, version, out);
     }
     package2_words(&streams.attr_masks_large, version, out);
     package2(&lag1_residuals(&streams.split_faces), version, out);
     package2(&streams.split_positions, version, out);
-    write_u32(out, 0);
+    write_u32(
+        out,
+        composite_hash(
+            &TopologySymbols {
+                degrees: slices(&streams.degrees),
+                valences: &streams.valences,
+                groups: &streams.groups,
+                face_flags: &streams.face_flags,
+                attr_masks: slices(&streams.attr_masks),
+                attr_masks_high: &streams.attr_masks_high,
+                attr_masks_aux: &streams.attr_masks_high,
+                attr_masks_large: &streams.attr_masks_large,
+                split_faces: &streams.split_faces,
+                split_positions: &streams.split_positions,
+            },
+            auxiliary_pair,
+        ),
+    );
 }
 
 /// Writes the 64-bit vertex binding of JT 9.x/10.x: three position components
@@ -1091,6 +1139,32 @@ fn write_quantizer(out: &mut Vec<u8>) {
         write_f32(out, 0.0);
         write_u8(out, 0);
     }
+}
+
+/// The combined hash of one array of vertex attributes: the words of each
+/// component in turn, as the specification prescribes for a coordinate or
+/// normal set written without quantization.
+///
+/// The granularity of the chain belongs to the revision. A nine-revision file
+/// hashes one word per step, a ten-revision file one whole component array per
+/// step, even though both store the very same words. The two CAD samples of the
+/// same block prove it: their decoded vertex records are identical word for
+/// word, and their stored hashes differ exactly in that respect.
+fn attribute_hash(values: &[[f32; 3]], version: JtVersion) -> u32 {
+    let mut hash = 0;
+    if version.major >= 10 {
+        for axis in 0..3 {
+            let words: Vec<u32> = values.iter().map(|value| value[axis].to_bits()).collect();
+            hash = hash32(&words, hash);
+        }
+        return hash;
+    }
+    for axis in 0..3 {
+        for value in values {
+            hash = hash32(&[value[axis].to_bits()], hash);
+        }
+    }
+    hash
 }
 
 /// Writes the coordinate payload: raw IEEE words from JT 10.x on, an
@@ -1125,7 +1199,7 @@ fn write_coords(encoded: &Encoded, version: JtVersion, out: &mut Vec<u8>) {
             package2(&lag1_residuals(&mantissas), version, out);
         }
     }
-    write_u32(out, 0);
+    write_u32(out, attribute_hash(&encoded.positions, version));
 }
 
 /// Writes the normal payload. The reader applies no predictor to normals, so
@@ -1155,7 +1229,7 @@ fn write_normals(encoded: &Encoded, version: JtVersion, out: &mut Vec<u8>) {
             package2(&mantissas, version, out);
         }
     }
-    write_u32(out, 0);
+    write_u32(out, attribute_hash(&encoded.normals, version));
 }
 
 /// Serialises the body of a JT 9.x/10.x topologically compressed tri-strip set.
@@ -1179,17 +1253,28 @@ pub(crate) fn write_topological_body(
     write_version(out, order, version.major, 1)?;
     write_version(out, order, version.major, 1)?;
     write_binding(out);
-    if version.major >= 10 {
-        write_version(out, order, version.major, 1)?;
-        write_version(out, order, version.major, 2)?;
+    // Where the coder input of a JT 10.x tri-strip set begins: it is wrapped in
+    // a second, embedded logical element whose header the reader must walk
+    // through to find it. The width is the same as the fields a JT 9.x file
+    // stores in its place, which is why a mis-framed header still parses here
+    // and renders nothing in a consumer that follows the nesting.
+    let embedded = if version.major >= 10 {
+        let at = out.len();
         write_u32(out, 0);
-        out.extend_from_slice(&TOPOLOGY_MARKER);
-        out.extend_from_slice(&EMBEDDED_HEADER);
+        out.extend_from_slice(&TOPOLOGY_ELEMENT_GUID);
+        write_u8(out, TOPOLOGY_ELEMENT_BASE_TYPE);
+        write_u32(out, TOPOLOGY_ELEMENT_OBJECT_ID);
+        write_u8(out, TOPOLOGY_LOD_VERSION);
+        write_u32(out, TOPOLOGY_VERTEX_RECORDS_ID);
+        write_u8(out, TOPOLOGY_LOD_FLAG);
+        debug_assert_eq!(out.len() - at, TOPOLOGY_EMBEDDED_HEADER);
+        Some(at)
     } else {
         write_version(out, order, version.major, 2)?;
         write_u32(out, 0);
         write_version(out, order, version.major, 1)?;
-    }
+        None
+    };
     // The dual walk, then the binding and counts framing the two payloads.
     write_mesh_input(&encoded.streams, version, out);
     write_binding(out);
@@ -1207,6 +1292,14 @@ pub(crate) fn write_topological_body(
     // version closing the body follows in the caller.
     write_u32(out, encoded.normals.len() as u32);
     package2(&vec![0; encoded.normals.len()], version, out);
+    // The embedded element of a JT 10.x tri-strip set stops exactly one byte
+    // before the element containing it: the version byte the caller appends
+    // closes the outer element, and the length written here spans everything
+    // between its own header and that byte.
+    if let Some(at) = embedded {
+        let length = u32::try_from(out.len() - at - 4).unwrap_or(u32::MAX);
+        out[at..at + 4].copy_from_slice(&length.to_le_bytes());
+    }
     Ok(())
 }
 
@@ -1317,6 +1410,109 @@ mod tests {
         out
     }
 
+    /// The hash of a vertex array chains at a different granularity per
+    /// revision, and the difference is invisible in the bytes: both chains see
+    /// the same words in the same order and differ only in where the length
+    /// terms and the `mix` calls fall. A strict viewer checks that hash and
+    /// blanks the shape when it disagrees, so the split must stay pinned.
+    #[test]
+    fn the_vertex_hash_chains_one_word_at_nine_and_one_array_at_ten() {
+        let values = [[1.0f32, 2.0, 4.0], [0.5, 3.0, 5.0]];
+        let words =
+            |axis: usize| -> Vec<u32> { values.iter().map(|v| v[axis].to_bits()).collect() };
+        let mut per_word = 0;
+        for axis in 0..3 {
+            for value in values {
+                per_word = hash32(&[value[axis].to_bits()], per_word);
+            }
+        }
+        let mut per_array = 0;
+        for axis in 0..3 {
+            per_array = hash32(&words(axis), per_array);
+        }
+        assert_ne!(per_word, per_array, "the two chains must differ");
+        assert_eq!(attribute_hash(&values, JtVersion::V9_5), per_word);
+        assert_eq!(attribute_hash(&values, JtVersion::V10_3), per_array);
+    }
+
+    /// A JT 10.x tri-strip set wraps its coder input in a second, nested
+    /// logical element. The header is the same width as the fields a JT 9.x
+    /// file stores in the same place, so a body that carries those fields
+    /// unframed still reads here — and renders nothing in a consumer that
+    /// walks the nesting. The length must then stop one byte before the outer
+    /// element, whose closing version the caller appends.
+    #[test]
+    fn a_ten_x_body_wraps_its_coder_input_in_an_embedded_element() {
+        let mut body = Vec::new();
+        write_topological_body(&cube(), JtVersion::V10_3, &mut body)
+            .expect("the cube is a valid mesh for the coder");
+        let guid = body
+            .windows(TOPOLOGY_ELEMENT_GUID.len())
+            .position(|window| window == TOPOLOGY_ELEMENT_GUID)
+            .expect("the embedded element must name its object type id");
+        // Two byte-wide versions and the 64-bit vertex binding precede it, and
+        // its own length prefix precedes the object type id.
+        let at = guid - 4;
+        assert_eq!(at, 2 + 8);
+        assert_eq!(body[at + 20], TOPOLOGY_ELEMENT_BASE_TYPE);
+        assert_eq!(
+            &body[at + 21..at + 25],
+            TOPOLOGY_ELEMENT_OBJECT_ID.to_le_bytes()
+        );
+        assert_eq!(body[at + 25], TOPOLOGY_LOD_VERSION);
+        assert_eq!(
+            &body[at + 26..at + 30],
+            TOPOLOGY_VERTEX_RECORDS_ID.to_le_bytes()
+        );
+        assert_eq!(body[at + 30], TOPOLOGY_LOD_FLAG);
+        // The coder input begins immediately behind the embedded header, and it
+        // begins at the same place a JT 9.x file keeps the same three fields
+        // loose: the two revisions carry the identical dual walk, so the value
+        // count of its first package is the same number at the same distance
+        // behind the vertex binding. A header that is merely those bytes
+        // without the framing moves that distance and the shape renders blank.
+        let mut nine = Vec::new();
+        write_topological_body(&cube(), JtVersion::V9_5, &mut nine)
+            .expect("the cube is a valid mesh for the coder");
+        // Two word-wide versions and the 64-bit vertex binding, then the same
+        // three fields standing loose: a word, a double word and a word.
+        let nine_at = 2 + 2 + 8 + 2 + 4 + 2;
+        assert_eq!(
+            &body[at + TOPOLOGY_EMBEDDED_HEADER..at + TOPOLOGY_EMBEDDED_HEADER + 4],
+            &nine[nine_at..nine_at + 4],
+            "the coder input of a JT 10.x shape must begin right behind the \
+             embedded header, at the same distance a JT 9.x file keeps its \
+             unframed fields"
+        );
+
+        // The element containing the embedded one closes with its own version,
+        // which the caller appends after this body.
+        write_version(&mut body, ByteOrder::Little, 10, 1)
+            .expect("writing to a vector cannot fail");
+        let length =
+            u32::from_le_bytes(body[at..at + 4].try_into().expect("four bytes make a u32"));
+        assert_ne!(length, 0, "the embedded element must not be empty");
+        assert_eq!(
+            usize::try_from(length).expect("the length fits a usize"),
+            body.len() - at - 4 - 1,
+            "the embedded element must stop exactly where the outer element's \
+             closing version begins"
+        );
+    }
+
+    /// JT 9.x has no such nesting: the same three fields stand on their own.
+    #[test]
+    fn a_nine_x_body_carries_no_embedded_element() {
+        let mut body = Vec::new();
+        write_topological_body(&cube(), JtVersion::V9_5, &mut body)
+            .expect("the cube is a valid mesh for the coder");
+        assert!(
+            !body
+                .windows(TOPOLOGY_ELEMENT_GUID.len())
+                .any(|window| window == TOPOLOGY_ELEMENT_GUID)
+        );
+    }
+
     #[test]
     fn a_closed_cube_survives_the_topological_round_trip() {
         round_trip(&cube(), 36);
@@ -1412,11 +1608,11 @@ mod tests {
             .expect("the shape LOD base");
         cursor.skip(8).expect("the vertex binding");
         if version.major >= 10 {
-            // The tri-strip set of JT 10.x announces itself with two versions, a
-            // zero count, the topology marker and its embedded header.
+            // The tri-strip set of JT 10.x wraps its coder input in an embedded
+            // logical element header.
             cursor
-                .skip(2 + 4 + TOPOLOGY_MARKER.len() + EMBEDDED_HEADER.len())
-                .expect("the topology marker of a JT 10.x shape");
+                .skip(TOPOLOGY_EMBEDDED_HEADER)
+                .expect("the embedded element header of a JT 10.x shape");
         } else {
             cursor.skip(2 + 4 + 2).expect("the representation version");
         }
