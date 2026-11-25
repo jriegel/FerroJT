@@ -93,12 +93,16 @@ only runs when the major version actually changes.
 `Plan::build` walks the graph the way `JtFile::to_model` does, with the same
 two filters:
 
-* **Level of detail.** Below a `RangeLOD` only the finest tier keeps its
-  representation unless `all_lods` is set — the same positional tier count the
-  reader uses, because JT never stores the tier.
+* **Level of detail.** Below a `RangeLOD` only the finest tier that really has
+  vertices keeps its representation unless `all_lods` is set — the same
+  positional tier count the reader uses, because JT never stores the tier, and
+  the same fall-through: a tier whose shape declares no vertices (an empty
+  LOD0) leaves the next one in, so a rewrite of such a file still shows the
+  part.
 * **Layer filter.** A `Part` the filter rejects keeps its node but loses its
   attributes, its representations, its children and its instance target. By
-  default the filter the file declares as active is applied;
+  default the filter the file declares active in `ACTIVELAYERFILTER::` is
+  applied, and nothing at all when that value is empty;
   `no_layer_filter` writes every part, and `layer_filter` names another one.
 
 Nodes are never dropped, only geometry — the tree of the file keeps its shape.

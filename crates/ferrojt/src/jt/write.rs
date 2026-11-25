@@ -347,7 +347,8 @@ fn collect_kinds(
             kinds,
             path,
         )?;
-        tier.next_tier(graph.nodes[child_pos].node.class_name());
+        // This walk only numbers tiers, it never decides which survive.
+        tier.next_tier(graph.nodes[child_pos].node.class_name(), false);
     }
     if let Some(target) = kept.target {
         let target_pos = plan.kept[target].pos;
@@ -404,6 +405,9 @@ struct Plan {
     index_of: HashMap<usize, usize>,
     /// Segments a surviving node still references.
     segments: HashSet<Guid>,
+    /// Representations kept so far that really carry vertices. A range span
+    /// compares this around each child to find its finest tier with geometry.
+    geometry_rows: usize,
 }
 
 impl Plan {
@@ -411,8 +415,9 @@ impl Plan {
     ///
     /// The walk mirrors [`JtFile::to_model`]: a part the layer filter rejects
     /// keeps its node but loses its attributes, its representations and its
-    /// children, and below a range LOD only the finest tier keeps its
-    /// representations. A subtree reached more than once — an instance and the
+    /// children, and below a range LOD only the finest tier that has geometry
+    /// keeps its representations — an empty LOD0 falls through to the next one.
+    /// A subtree reached more than once — an instance and the
     /// shape it instantiates — is kept once, so the rewrite stays an instance
     /// rather than turning into a copy.
     fn build(graph: &SceneGraph, options: &WriteOptions, filter: Option<&LayerFilter>) -> Self {
@@ -420,6 +425,7 @@ impl Plan {
             kept: Vec::new(),
             index_of: HashMap::new(),
             segments: HashSet::new(),
+            geometry_rows: 0,
         };
         if let Some(root) = graph.root {
             plan.walk(graph, options, filter, root, LodWalk::ROOT);
@@ -475,6 +481,16 @@ impl Plan {
                 self.segments.insert(stored.segment);
             }
             self.kept[index].loads.push(*load);
+            // Only a representation with vertices makes a tier the finest one
+            // of its span; an empty LOD0 lets the next tier through.
+            if loaded.is_some_and(|stored| {
+                stored
+                    .element
+                    .geometry()
+                    .is_some_and(|lod| !lod.vertices.is_empty())
+            }) {
+                self.geometry_rows += 1;
+            }
         }
 
         let mut tier = if matches!(node, Node::RangeLod(_)) {
@@ -487,9 +503,13 @@ impl Plan {
                 self.kept[index].children.push(None);
                 continue;
             };
+            let before = self.geometry_rows;
             let kept = self.walk(graph, options, filter, child, tier.for_child());
             self.kept[index].children.push(Some(kept));
-            tier.next_tier(graph.nodes[child].node.class_name());
+            tier.next_tier(
+                graph.nodes[child].node.class_name(),
+                self.geometry_rows > before,
+            );
         }
         if let Some(target) = graph.instance_target(node) {
             let kept = self.walk(graph, options, filter, target, tier.for_child());

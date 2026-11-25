@@ -154,14 +154,24 @@ Upload with `python -m twine upload dist\*`.
 - **LOD tier is positional, not encoded.** JT never stores a tier: it is the child
   position under `RangeLod` (first group = 0, next = 1, …). Segment type cannot
   identify it — JT 8.x/10.x use types 7..10 for LOD0..LOD3, but JT 9.x uses type 6
-  ("Shape") for every tier. `to_model()` exports only the finest tier, mirroring
-  `example/ToolsLib/src/JtGltfMesh.cpp`; the state is
-  `LodWalk { inside, level, tiers }` threaded through `build_node`. Only the
+  ("Shape") for every tier. `to_model()` exports only the finest tier **that has
+  vertices**, mirroring `example/ToolsLib/src/JtGltfMesh.cpp` with one deliberate
+  deviation: a tier whose shape declares no vertices at all does not settle the
+  span, so the next tier that really has geometry is exported (a strict tier-0 rule
+  draws nothing for those files); the state is
+  `LodWalk { inside, level, tiers, keep }` threaded through `build_node`, and
+  `next_tier(class, produced)` clears `keep` as soon as a tier delivered
+  geometry — `jt::write.rs::Plan` uses the same rule via its `geometry_rows`
+  counter, so a rewrite and an export agree. Only the
   **direct** children of a range span are tiers — `for_child()` clears `tiers` one
   level down — because a span may wrap an assembly whose nested groups are not
   tiers; the reference counts any nested group, which is invisible in the samples
   and fatal for a written wrapper. Nodes are never dropped, only geometry, and
-  each mesh records `Mesh::lod_level`. `jt::dump` is *not* filtered.
+  each mesh records `Mesh::lod_level`. `jt::dump` is *not* filtered. Pinned by
+  `a_span_keeps_the_finest_tier_that_has_geometry` and
+  `an_empty_finest_tier_falls_through_to_the_next_one`; found by sweeping
+  `C:\Data\CLA_EXPORT_JR`, where **171 files** store their only shape in tier 1
+  because their LOD0 is empty (and draw fine in the NOVO viewer).
 - Pinned LOD0 counts (`crates/ferrojt/tests/model.rs`): block 8.1/9.5/10.3 →
   1 mesh / 12 triangles; plate1-8.0 → 2 / 617; plate1-9.5 → 2 / 486.
   `tests/test_ferrojt.py` asserts `mesh_count == 1`, `triangle_count == 12`.

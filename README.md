@@ -300,8 +300,8 @@ The keywords work on `ferrojt.open`, `ferrojt.read`, `JtFile.model`,
 
 ### Walking the scene graph
 
-`Model` is what the exporters build: one node tree, only the finest LOD tier, the
-layer filter already applied. `JtFile.lsg` is the other view — the logical scene
+`Model` is what the exporters build: one node tree, only the finest LOD tier that
+has geometry, the layer filter already applied. `JtFile.lsg` is the other view — the logical scene
 graph **of the file**, with every tier, the JT class names, the key/value
 properties a translator wrote, the layer tags and the attributes.
 

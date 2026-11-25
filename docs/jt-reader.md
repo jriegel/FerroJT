@@ -44,12 +44,17 @@ Submodules:
    keeps its shape, only the drawing is skipped. No reference sample reaches
    that case any more: the shapes of `SampleJT_Server.jt` that used to come back
    without vertices were a decode failure, not empty shapes.
-4. Only the finest level of detail of a range LOD. A `RangeLOD` lists its
-   children from the finest tier down and JT does not store that tier, so it is
-   counted while walking: the first group below a `RangeLOD` is tier 0, the next
-   tier 1, and so on. A shape at any other tier contributes no mesh, which is
-   what the reference glTF writer does. The nodes themselves are all kept, so
-   the graph keeps its shape, and `Mesh::lod_level` records the tier a mesh came
+4. Only the finest level of detail of a range LOD *that has geometry*. A
+   `RangeLOD` lists its children from the finest tier down and JT does not store
+   that tier, so it is counted while walking: the first group below a `RangeLOD`
+   is tier 0, the next tier 1, and so on. A shape at a coarser tier contributes
+   no mesh, which is what the reference glTF writer does — with one deliberate
+   deviation: a tier whose shape declares no vertices at all (an empty LOD0,
+   which real CAD files do write) does not settle the span, so the next tier
+   that really has vertices is the one that is kept. A consumer displays the
+   part from that tier, while a strict "tier 0 only" export would draw nothing.
+   The nodes themselves are all kept, so the graph keeps its shape, and
+   `Mesh::lod_level` records the tier a mesh came
    from. `jt::dump` is not filtered — a dump still reports every tier.
 5. An `Instance` node keeps the subtree it points at. JT stores an instantiated
    part once and refers to it from several `Instance` nodes — the plate samples

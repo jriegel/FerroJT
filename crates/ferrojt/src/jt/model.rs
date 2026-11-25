@@ -866,6 +866,11 @@ struct Built {
     done: HashMap<usize, usize>,
     /// Keep every tier of a range LOD instead of only the finest one.
     all_lods: bool,
+    /// How many representations have been added to the model so far.
+    ///
+    /// A range span compares this before and after walking one of its tiers to
+    /// learn whether that tier had anything to draw.
+    kept: usize,
 }
 
 /// Recursively translate one graph node into a [`model::Node`].
@@ -928,6 +933,7 @@ fn build_node(
                     continue;
                 }
                 let mesh = push_mesh(model, geometry, material, name.clone(), level);
+                built.kept += 1;
                 out.instances.push(model::Instance {
                     mesh,
                     material,
@@ -944,12 +950,10 @@ fn build_node(
     }
 
     let mut children = Vec::new();
-    let mut walk = if matches!(node, Node::RangeLod(_)) {
-        LodWalk::FIRST
-    } else {
-        lod
-    };
+    let span = matches!(node, Node::RangeLod(_));
+    let mut walk = if span { LodWalk::FIRST } else { lod };
     for child in graph.children_of(node).into_iter().flatten() {
+        let before = built.kept;
         children.push(build_node(
             graph,
             model,
@@ -962,7 +966,10 @@ fn build_node(
             .nodes
             .get(child)
             .map_or("", |stored| stored.node.class_name());
-        walk.next_tier(class_name);
+        // A tier contributes when it is the finest one of its span that really
+        // has geometry: a CAD file may leave LOD0 empty and store the shape in
+        // the next tier, and a consumer displays the part from there.
+        walk.next_tier(class_name, built.kept > before);
     }
     if let Some(target) = graph.instance_target(node) {
         children.push(build_node(
@@ -1003,7 +1010,9 @@ fn node_properties(graph: &SceneGraph, node: &Node) -> Option<serde_json::Value>
 /// its children from the finest to the coarsest one. The reference glTF
 /// writer numbers them while walking, starting at zero and moving on at every
 /// group of that subtree, and drops the shape of anything that is not tier
-/// zero. This mirrors that, so the same file exports the same mesh.
+/// zero. This mirrors that, with one refinement: a coarser tier is kept when
+/// no finer tier of the same span had geometry at all, because that is what a
+/// consumer displays for such a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LodWalk {
     /// Set below a range LOD, where the tier of a branch matters.
@@ -1012,6 +1021,14 @@ pub(crate) struct LodWalk {
     level: u32,
     /// Set while the children being walked are the tiers of a range span.
     tiers: bool,
+    /// `true` when the representations of this branch belong in the model.
+    ///
+    /// Tier zero always qualifies, and a coarser one does when no finer tier
+    /// of the same span had any geometry to offer. A CAD system may leave the
+    /// finest shape of a span empty — the CLA export writes a placeholder LOD0
+    /// and puts the tesselation into LOD1 — and a consumer still draws such a
+    /// part from its next tier, so dropping it would export nothing.
+    keep: bool,
 }
 
 impl LodWalk {
@@ -1020,6 +1037,7 @@ impl LodWalk {
         inside: false,
         level: 0,
         tiers: false,
+        keep: true,
     };
 
     /// The first child of a range LOD.
@@ -1027,12 +1045,13 @@ impl LodWalk {
         inside: true,
         level: 0,
         tiers: true,
+        keep: true,
     };
 
     /// `true` when the representations of this branch belong in the model.
     #[must_use]
     pub(crate) fn keeps_geometry(self) -> bool {
-        !self.inside || self.level == 0
+        self.keep
     }
 
     /// The tier to record on a mesh, if a range LOD defines one.
@@ -1059,8 +1078,18 @@ impl LodWalk {
 
     /// Move past a child of a range span. Only a group counts as a tier, and
     /// only a direct child of the span is one.
-    pub(crate) fn next_tier(&mut self, class_name: &str) {
-        if self.tiers && class_name == "Group" {
+    ///
+    /// `produced` says whether the tier that was just walked had geometry to
+    /// offer. The first tier that does decides for the rest of the span: the
+    /// coarser ones are dropped, while an empty tier leaves the next one in.
+    pub(crate) fn next_tier(&mut self, class_name: &str, produced: bool) {
+        if !self.tiers {
+            return;
+        }
+        if produced {
+            self.keep = false;
+        }
+        if class_name == "Group" {
             self.level += 1;
         }
     }
@@ -1230,7 +1259,8 @@ mod tests {
     use super::*;
     use crate::codec::ByteOrder;
     use crate::jt::object::{
-        Deferred, Group, MetaData, Part, Partition, ProxyMetaData, ShapeLodVertex,
+        Deferred, Group, Lod, MetaData, NodeBase, Part, Partition, ProxyMetaData, RangeLod,
+        ShapeLodVertex,
     };
 
     /// The filters of the fixture: `ALL` covers layer 1, `LAYCUR` only layer
@@ -1776,5 +1806,145 @@ mod tests {
         let plain = node_index(&model, "plain.part");
         assert!(model.nodes[plain].instances.is_empty());
         assert_eq!(model.nodes[plain].kind.as_deref(), Some("Part"));
+    }
+
+    /// A root that holds one range LOD with one group per tier, each holding a
+    /// part whose representation is `fine` and `coarse`.
+    fn span_fixture(fine: LodGeometry, coarse: LodGeometry) -> JtFile {
+        let mut graph = SceneGraph::default();
+
+        let root_kids = vec![Deferred { object_id: 1 }];
+        let root = Partition {
+            base: Group {
+                children: root_kids.clone(),
+                name: "root".to_owned(),
+                ..Group::default()
+            },
+            file_name: "span.jt".to_owned(),
+            up_axis: 0,
+            flags: 0,
+            bounds: [0.0; 6],
+            area: 0.0,
+            counts: [0; 6],
+            untransformed_bounds: None,
+            name: "root".to_owned(),
+            children: root_kids,
+        };
+        graph.nodes.push(StoredNode {
+            id: 0,
+            node: Node::Partition(root),
+        });
+        graph.objects.insert(0, ObjectRef::Node(0));
+
+        let span_kids = vec![Deferred { object_id: 2 }, Deferred { object_id: 4 }];
+        let span = RangeLod {
+            base: Lod {
+                base: Group {
+                    children: span_kids.clone(),
+                    name: "span".to_owned(),
+                    ..Group::default()
+                },
+                limits: vec![0.0, 100.0],
+                signal: 0.0,
+                name: "span".to_owned(),
+            },
+            limits: vec![0.0, 100.0],
+            center: [0.0; 3],
+            name: "span".to_owned(),
+        };
+        graph.nodes.push(StoredNode {
+            id: 1,
+            node: Node::RangeLod(span),
+        });
+        graph.objects.insert(1, ObjectRef::Node(1));
+
+        for (id, tier, geometry, property_id) in
+            [(2_i32, "fine", fine, 21_i32), (4, "coarse", coarse, 22)]
+        {
+            let shape = id + 1;
+            let kids = vec![Deferred { object_id: shape }];
+            let holder = Group {
+                base: NodeBase::default(),
+                children: kids,
+                name: tier.to_owned(),
+            };
+            graph.nodes.push(StoredNode {
+                id,
+                node: Node::Group(holder),
+            });
+            graph.objects.insert(id, ObjectRef::Node(id as usize));
+
+            let mut part = Part {
+                name: format!("{tier}.part"),
+                ..Part::default()
+            };
+            part.base.base.base.late_loads.push(LateLoad {
+                property_id,
+                guid: Guid::default(),
+                segment_type: 3,
+                object_id: 1,
+            });
+            register(
+                &mut graph,
+                property_id,
+                Element::ShapeLodVertex(ShapeLodVertex { geometry }),
+            );
+            graph.nodes.push(StoredNode {
+                id: shape,
+                node: Node::Part(part),
+            });
+            graph.objects.insert(shape, ObjectRef::Node(shape as usize));
+        }
+
+        graph.root = Some(0);
+        JtFile {
+            path: PathBuf::from("span.jt"),
+            header: FileHeader {
+                major: 9,
+                minor: 5,
+                order: ByteOrder::Little,
+                toc_offset: 0,
+                lsg_guid: Guid::default(),
+            },
+            toc: Vec::new(),
+            lsg: Some(graph),
+            offsets: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_span_keeps_the_finest_tier_that_has_geometry() {
+        // The usual case: the first tier carries the shape, the coarse ones are
+        // dropped, and the mesh records which tier it came from.
+        let file = span_fixture(geometry(), geometry());
+        let model = file.to_model();
+        assert_eq!(model.meshes.len(), 1);
+        assert_eq!(model.meshes[0].name.as_deref(), Some("fine.part"));
+        assert_eq!(model.meshes[0].lod_level, Some(0));
+        assert_eq!(file.to_model_with_all_lods().meshes.len(), 2);
+    }
+
+    #[test]
+    fn an_empty_finest_tier_falls_through_to_the_next_one() {
+        // A CAD export can leave the LOD0 shape of a span empty and store the
+        // tesselation in the next tier (the CLA export does this for hundreds of
+        // parts). Dropping every tier but the first would export nothing, while
+        // a consumer displays the part from the tier that actually has vertices.
+        let file = span_fixture(LodGeometry::default(), geometry());
+        let model = file.to_model();
+        assert_eq!(model.meshes.len(), 1);
+        assert_eq!(model.meshes[0].name.as_deref(), Some("coarse.part"));
+        assert_eq!(model.meshes[0].lod_level, Some(1));
+
+        // The nodes of both tiers are still there, empty or not.
+        for name in ["span", "fine", "coarse", "fine.part", "coarse.part"] {
+            assert!(
+                model
+                    .nodes
+                    .iter()
+                    .any(|node| node.name.as_deref() == Some(name)),
+                "the model lost the node {name:?}"
+            );
+        }
     }
 }
