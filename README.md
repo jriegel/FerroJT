@@ -472,6 +472,33 @@ the file matching the installer, and the sdist covers anything else. A single
 universal wheel is not possible for a native extension: the platform tag is part
 of the file name.
 
+To use a wheel locally instead of publishing it, install the file for your
+platform into the environment that should receive it:
+
+```sh
+pip install dist\ferrojt-0.1.0-cp311-abi3-win_amd64.whl                                  # Windows
+pip install dist\ferrojt-0.1.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl  # Linux
+python -c "import ferrojt; print(ferrojt.__version__)"                                   # 0.1.0
+```
+
+Invoke `pip` through the interpreter that should receive the package
+(`python -m pip install …`) so the wheel lands in that environment rather than in
+whichever `pip` happens to be first on `PATH`. `pip` refuses a wheel whose
+platform tag does not match its own interpreter with
+`… is not a supported wheel on this platform`, so pick the right file rather than
+the newest one — a wildcard is not expanded for an external command in PowerShell,
+which means naming the file rather than writing `dist\*.whl`. The sdist installs
+the same way, `pip install dist\ferrojt-0.1.0.tar.gz`, but it compiles the
+extension on the target machine and therefore needs a Rust toolchain and `maturin`
+there. A plain `pip install .` builds from the working tree rather than from
+`dist/`.
+
+A wheel installed this way **replaces** the editable install `maturin develop`
+sets up, and it goes stale as soon as the Rust sources change: uninstall it
+(`pip uninstall ferrojt`) and run `maturin develop` again to get back to a build
+that tracks the checkout, or install the wheel into a separate virtual
+environment to test a release without touching the development one.
+
 The Linux wheel is cross compiled on Windows with `zig` as the linker, so no
 Docker is needed. The script installs both prerequisites itself: `zig` comes from
 the `maturin[zig]` extra and the `x86_64-unknown-linux-gnu` standard library from
