@@ -12,6 +12,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 /tests/_visual_out/
+/tests/_jt2go_out/
+/tests/_jt2go_full/
 .mypy_cache/
 .ruff_cache/
 *.egg-info/
@@ -19,6 +21,12 @@ __pycache__/
 *.pyd
 *.pdb
 *.pyi.bak
+
+# Probe output of the scratch scripts under target/
+/out.jt
+
+# The original screenshot sample the harness in tests/jt2go_picture.py replaced
+/tests/Jt2Go_Pic.py
 
 # Editors / OS
 .vscode/

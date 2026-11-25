@@ -1,5 +1,5 @@
 # Python requirements for the scripts in tests/ (test_ferrojt.py, test_visual.py,
-# test_viewer.py). Install into the repo venv:
+# test_viewer.py, test_jt2go.py). Install into the repo venv:
 #
 #   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 #
@@ -21,6 +21,11 @@
 
 # --- test runner (tests/test_ferrojt.py, tests/test_visual.py) --------------
 pytest>=8
+
+# --- writing the picture of a failed JT2Go render (tests/jt2go_picture.py) ---
+# The harness itself is stdlib only; Pillow is needed to save the viewport grab
+# out when a file draws nothing, which is what makes the failure readable.
+Pillow>=11
 
 # --- rendering / geometry (tests/test_visual.py, tests/test_viewer.py) ------
 # open3d 0.20.0 is the newest release with wheels for Python 3.13; without it

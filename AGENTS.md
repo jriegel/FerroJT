@@ -9,13 +9,14 @@ file back out as JT. Read this before changing code; the design detail lives in
 
 | Path | What it is |
 | --- | --- |
-| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `import/` the glTF/GLB reader (`gltf.rs`), `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `jt/version.rs` the `JtVersion` a file is read or written at, `jt/encode.rs` the topological (dual vertex-face) encoder, `jt/write.rs` the JT writer, `jt/build.rs` the builder that creates a file from nothing, `jt/from_model.rs` (private) the writer that turns a neutral `Model` into a file, and `export/` glTF/GLB writer and the ASCII USD writer. |
+| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `import/` the glTF/GLB reader (`gltf.rs`), `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `jt/version.rs` the `JtVersion` a file is read or written at, `jt/encode.rs` the topological (dual vertex-face) encoder, `jt/hash.rs` the Jenkins lookup2 hashes a strict consumer verifies, `jt/write.rs` the JT writer, `jt/build.rs` the builder that creates a file from nothing, `jt/from_model.rs` (private) the writer that turns a neutral `Model` into a file, and `export/` glTF/GLB writer and the ASCII USD writer. |
 | `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `write`, `ls`. |
 | `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `lib.rs` is the export view (`Model`) plus `lsg.rs` the file view (`JtLsg`/`JtNode`/`JtMesh`/`JtArray`) and `build.rs` the builder (`JtBuilder`/`NodeHandle`/`MeshHandle`/`MeshData`/`MaterialData`); `pyproject.toml` + `python/ferrojt/` + `tests/`. |
 | `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `details.rs` key/value pane for the selected row, `backdrop.rs` viewport gradient, `camera.rs` `Camera3d` wrapper that places the backdrop, `picking.rs`, `trihedron.rs`. |
 | `python/ferrojt/` | Pure-Python package re-exporting `_ferrojt` (`__init__.py`, `_ferrojt.pyi`, `py.typed`). |
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
 | `data/Reference/` | Reference JSON dumps from the JT tooling **and** reference PNG pictures — **the oracle**. |
+| `tests/` | Python suite (`test_build.py`, `test_ferrojt.py`, `test_jt2go.py`, `test_visual.py`) plus the tools `jt2go_picture.py` (drives an installed Siemens JT2Go and counts the pixels it draws — the **strict** writer oracle, see below) and `test_viewer.py` (interactive Open3D viewer probe). Output dirs `_visual_out/`, `_jt2go_out/`, `_jt2go_full/` are gitignored. |
 | `example/` | GPL-2.0 C++ sources (TKJT, ToolsLib, JtDump, PyOpenJt). Behavioural reference only, never linked or copied; gitignored. |
 | `docs/` | `README.md` index, `architecture.md`, `jt-reader.md`, `gltf-reader.md`, `jt-writer.md`, `jt-builder.md`, `jt-from-model.md`, `dump.md`, `usd-writer.md` and `viewer.png` — the viewer picture shown at the top of the top-level `README.md` (Git LFS). |
 
@@ -81,10 +82,20 @@ without it):
 ```
 
 Interactive viewer (also needs `open3d`; it is a tool, not a test — nothing in it
-is named `test_*`, so pytest still collects 100 tests):
+is named `test_*`, so pytest still collects 106 tests):
 
 ```powershell
 .\.venv\Scripts\python.exe tests\test_viewer.py data\ExampleFiles\example_block_jt9.5.jt
+```
+
+External render check — open a file in Siemens JT2Go and count the pixels it
+actually draws (Windows only, needs a JT2Go install; the tool skips when none is
+found). This is the strict oracle for the writer, see below:
+
+```powershell
+.\.venv\Scripts\python.exe tests\jt2go_picture.py data\ExampleFiles\example_block_jt10.3.jt
+.\.venv\Scripts\python.exe tests\jt2go_picture.py target\out.jt --out tests\_jt2go_out
+.\.venv\Scripts\python.exe -m pytest tests\test_jt2go.py -q   # the same as a test
 ```
 
 Rust viewer (native window, no Python):
@@ -822,6 +833,108 @@ Upload with `python -m twine upload dist\*`.
   **356 011** (written at 9.5, all LODs, no layer filter), and a `TestBlock.glb`
   conversion **628 416**. One plate representation (a 152-triangle screw) alone
   measures 207 109 — that is the fixture the encoder bisection used.
+- **JT2Go is the STRICT oracle, and it is the only one that caught three writer
+  defects.** `tests/jt2go_picture.py` drives an installed Siemens JT2Go
+  (`C:\Users\<user>\JT2Go\Products\JT2Go\VisView_NG.exe`, **not** `visview.exe`)
+  through ctypes and counts the pixels it really draws. NOVO and `jtinfo`
+  accepted every one of the files that JT2Go drew blank, so "NOVO renders it"
+  proves nothing about a strict consumer. Three distinguishable outcomes, never
+  conflate them: **PASS** with a large ink count, **FAIL 352** (the file loads,
+  the shape is rejected — 352 px is the trihedron icon alone, nothing else), and
+  `JT2Go never loaded …` after `LOAD_TIMEOUT` 120 s (the file is structurally
+  refused, no MDI document ever appears). `DEFAULT_MIN_INK = 2000` separates
+  blank from drawn by three orders of magnitude.
+- **JT2Go window anatomy and capture.** The frame is created **off screen** at
+  negative coordinates — `ShowWindow(hwnd, SW_MAXIMIZE=3)` first. Frame title
+  prefix `JT2Go`, class is an unstable MFC string. Frame → `MDIClient` → MDI
+  document class `AfxFrameOrView140` **titled with the file name** (= load
+  complete, ~5 s) → drawing surface class **`DMUtils`** (913×879 maximized).
+  Grab `DMUtils`, not the frame, or the ribbon/outliner/status bar pollute the
+  ink count. Only `PrintWindow(hwnd, mem, PW_RENDERFULLCONTENT=2)` on a
+  `GetWindowDC` + `CreateCompatibleBitmap` + `GetDIBits` (top-down 32-bit,
+  `biHeight = -height`, stride `((w*4+3)//4)*4`) captures the OpenGL viewport.
+  Background = median of the four viewport corners (white); geometry when
+  `max|Δchannel| > INK_EPS (24)`. PNG byte size is a fast proxy: 18 762 B
+  renders, 4 896 B is blank. Set `SetProcessDpiAwarenessContext(-4)` and
+  `$env:PYTHONIOENCODING='utf-8'`. The script does **not** glob — expand the
+  file list in PowerShell.
+- **JT2Go ink baselines** (all through every writer path): `example_block` at
+  every revision and every path (rewrite 8.1→8.1, 9.5→9.5, 10.3→10.3,
+  glTF→8.1/9.5/10.3) → **387 467**, geometry 738×651.
+  `opening_protection_plate1` 9.5 rewrite / model path→10.3 / glTF→10.3 /
+  glTF→8.1 → **226 982**; the 8.0→8.1 rewrite **226 971**. Hand-built chain cube
+  and `out.jt` (`TestBlock.glb`→10.3) → **352 001**. `sweep_SampleJT_Server_9.5`
+  → **143 741**.
+- **JT2Go verifies the hashes.** It checks the topology **Composite Hash** *and*
+  each **vertex-data hash** independently and blanks the shape on any mismatch —
+  it does not merely tolerate them like the lenient readers here. The primitive
+  is **Bob Jenkins lookup2 (1996)**, published in the format spec itself
+  (`example\Documents\PSI14_1_V3_JTIAP_Format_Description_and_annexs.pdf`
+  Annex E, pages 231–234; and `Siemens JT V10.6 Format Description Rev A`
+  Annex C — text corpora `target\_pdfall.txt` 5 119 617 B and
+  `target\_jt106.txt` 1 165 506 B, extract with `target\pdftext.py`, stdlib
+  only). The spec prints `hash()` (byte key), `hash3()` (u16 key, = `jthash16`)
+  and the `mix` macro, but **never prints the body of `hash2()` (the u32 key,
+  = `hash32`)** — it is pinned by evidence instead: 3 words per `mix`, `c +=
+  number of words` added **after the main loop and before the tail switch**,
+  1-word remainder → `a`, 2-word remainder → `a` then `b`, final `mix`, return
+  `c`. That transcription lives in `target\compall.py` and must be **imported,
+  never retyped**. The Rust implementation is `jt/hash.rs` (`hash32`, `hash16`,
+  `composite_hash`, `TopologySymbols`) — the module is **crate-private**, so an
+  integration test cannot call it and must check the bytes instead.
+- **The composite hash is revision-dependent: 11 mask-region calls at 9.x, 10 at
+  10.x.** The chain (spec §7.1.4.1 Figure 95) is 8 degree arrays → valences →
+  groups → `hash16` flags → attr masks 0..6 → attr masks[7] low 32 → attr
+  masks[7] high 32 → (`mask8_30`) → (`mask8_4`, **9.x only**) → large masks →
+  split syms → split positions, and it **ends there** — the vertex records are
+  *not* part of it. Reproduced for 12 of 12 CAD shapes. The flag is
+  `MeshInput::auxiliary_pair = cursor.major() < 10`.
+- **The vertex-data hash granularity is revision-dependent too**: JT 9.x feeds
+  **one word per `hash32` call**, JT 10.x feeds **one whole component array per
+  call**. Component-major, record-minor, over the **unique** coordinates.
+  Verified 6/6 at 9.5 and 6/6 at 10.3. Implemented in
+  `encode.rs::attribute_hash(values, version)`. Granularity, not content, was
+  the whole difference.
+- **A JT 10.x tri-strip set wraps its coder input in a second, embedded logical
+  element** immediately after the first vertex binding:
+  `i32 length | guid ada530f8-4cbe-bc4f-9b5f-b9269278d2e1 | u8 base type 9 |
+  i32 object id 1 | u8 TopoMesh version 1 | u32 vertex-records id 0 | u8 flag 1`
+  = **31 bytes** (`TOPOLOGY_EMBEDDED_HEADER`), coder input 31 bytes later. At
+  9.x the same place holds those last three fields **loose** and unframed. The
+  embedded length stops **exactly one byte before the outer element closes** —
+  the caller appends the version byte that closes the outer element, so
+  `length = outer - 1 - (at + 4)`. Because the mis-framed header had the **same
+  total width**, everything downstream still parsed: this reader, NOVO and
+  `jtinfo` all accepted a file JT2Go drew blank. The guid appears in **no** spec
+  (search the spec's own `0xXXXXXXXX, 0xXXXX, …` notation, not the dashed form —
+  92 hits in `_jt106.txt`, none of them this one), in no file of `example/`, and
+  in no `guid::types` — it is taken from the sample bytes and now a named
+  constant in both `encode.rs` and `object.rs`, and `read_shape_lod_data`
+  **rejects** a different guid outright. Fixing the framing alone took
+  `hx103.jt` from 352 px to **387 467** while leaving the sparse attribute masks
+  and the all-bitlength2 codec mix in place — those two suspects are **not**
+  blockers, do not chase them.
+- **`write_topological_body` writes TWO version fields before the first vertex
+  binding, WORD-wide (2 B) at 9.x and BYTE-wide (1 B) at 10.x.** So the coder
+  input sits at body offset **18** at 9.x and **41** at 10.x. A test that
+  compares the two revisions must account for it.
+- **`maturin develop` after EVERY Rust writer change** before regenerating any
+  Python-driven fixture: a stale `_ferrojt` extension silently reproduces the old
+  framing while the CLI produces the new one — that cost a whole bisection round
+  when `chain_10.3.jt` still rendered 352 px after the source was fixed.
+- **`17 element bytes remained after reading, corrected` is benign** — it shows
+  up on `hx103.jt`, `chain_9.5.jt`, `chain_10.3.jt` and `w103to103.jt`, all of
+  which render perfectly. Always run a warning check against a known-good
+  control before chasing it.
+- **When a byte-level framing test fails, check the WRITER first** by running the
+  probe (`target\emb2.py <file> <control>`, `target\headhex.py`) on the exact
+  file the test builds. Here the writer was byte-identical to the CAD sample and
+  the bug was in the test's offset arithmetic. Keep **cursor-relative and
+  file-relative offsets strictly separate** inside one helper —
+  `embedded_elements()` in `tests/write.rs` mixes them at its peril: `at =
+  cursor.position() + shape.position()` (read *before* `read_len()`),
+  `outer = atom.body_offset + atom.body_len`, expected `outer - 1 - (at + 4)`.
+  `Cursor::read_len()` already returns `usize`.
 - **The revision a file is written at is `jt::JtVersion`** (`jt/version.rs`,
   re-exported, `Default = V10_3`). Consts `V8_0/V8_1/V9_5/V10_3`; the gates are
   methods — `offsets_are_32_bit()` (<10), `versions_are_bytes()` (≥10),
@@ -1068,8 +1181,8 @@ Upload with `python -m twine upload dist\*`.
   **is** a property (a different type), so the two do not mirror each other here.
 - **The pytest summary line never surfaces under redirection** (Open3D/Vulkan
   native output interleaves), so `Select-String 'passed|failed'` finds nothing.
-  Trust `$LASTEXITCODE` plus `pytest --co -q` per file: 23 build + 68 ferrojt +
-  11 visual = **102**.
+  Trust `$LASTEXITCODE` plus `pytest --co -q` per file: 23 build + 69 ferrojt +
+  3 jt2go + 11 visual = **106**.
 - **Parallel tests need pid *and* an atomic counter in the temp file name** — the
   pid alone collides across the worker processes of one run.
 - **Picture parity for a written file must be measured one process per picture**

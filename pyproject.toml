@@ -21,7 +21,8 @@ classifiers = [
 
 [project.optional-dependencies]
 # numpy is a test dependency because the mesh arrays are checked through it.
-test = ["pytest>=8", "numpy>=1.26"]
+# Pillow writes the viewport grab of a failed JT2Go render out as a PNG.
+test = ["pytest>=8", "numpy>=1.26", "Pillow>=11"]
 # Rendering the export for the visual regression tests (tests/test_visual.py).
 visual = ["open3d>=0.20", "numpy>=1.26"]
 
