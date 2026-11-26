@@ -697,7 +697,10 @@ Upload with `python -m twine upload dist\*`.
   is the sample where the tag sits on the part itself. A *named* filter is
   recorded via `Model::extras["layer_filter"]` → `ferrojt:layer_filter` /
   `int[] ferrojt:layers`.
-- **usd-core 26.11 Python API** (for `target\usd_*.py` probes): no
+- **usd-core 26.11 Python API** (for `target\usd_*.py` probes): keep the `Stage` in
+  a **local** before `GetRootLayer()` — the chained `Usd.Stage.Open(p).GetRootLayer()`
+  aborts with `0x80000003` (`STATUS_BREAKPOINT`), no traceback, no output at all.
+  No
   `Stage.GetCustomLayerData` — read `stage.GetRootLayer().customLayerData`; `Prim` has
   no `GetCompositionErrors` (only `Stage`); `Relationship::GetTargets()`, not
   `GetResolvedPath`; `prim.GetMetadata("references")` returns an `Sdf.ReferenceListOp`
@@ -1310,6 +1313,13 @@ pyo3 0.30 (`abi3-py310`). No USD crate — `export/usd.rs` writes `.usda` by han
 
 USD: `.usdc` (binary) and `.usdz` (packaged) output, and JT textures into the
 `UsdPreviewSurface` — `docs/usd-writer.md` holds the mapping and the open work.
+**A `.usdc` name is already accepted** (`Format::detect` maps `usd`/`usda`/`usdc`
+to `Format::Usd`, and `Format::extension()` says `usda`), so `convert -o x.usdc`
+silently writes ASCII that usd-core then refuses (`Sdf crate bootstrap section
+corrupt`) — name the output `.usda`. A cheap real binary path is **verified**: let
+an installed usd-core re-export the `.usda` (`layer.Export("x.usdc")` gives a
+3 213 B crate that reopens with the same 18 prims); the Rust side cannot link
+usd-core while `#![forbid(unsafe_code)]` stands.
 JT: keeping the source TOC position instead of always appending the table —
 `docs/jt-writer.md` holds the details. The builder (`jt/build.rs`) creates a file
 from nothing at JT 10.3 by default (8.x/9.x on request) — `docs/jt-builder.md`

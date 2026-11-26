@@ -4,7 +4,10 @@
 > `.usda` layer by hand — no USD dependency, no `unsafe`. `Format::Usd` is
 > writable, so `ferrojt convert file.jt -o file.usda -f usd` and
 > `model.save("file.usda")` both work. `.usdc` (binary) and `.usdz` (packaged)
-> are still open work.
+> are still open work — and note that a `.usdc` **name** is already accepted
+> (`Format::detect` maps `usd`, `usda` and `usdc` to `Format::Usd`) but the bytes
+> are ASCII, which usd-core then refuses to open (`Sdf crate bootstrap section
+> corrupt`). Name your output `.usda` until a real binary writer exists.
 
 ## Why hand-written ASCII
 
@@ -176,7 +179,15 @@ report `OK`. API facts worth remembering:
 
 ## Open work
 
-- `.usdc` (binary) and `.usdz` (packaged) output.
+- `.usdc` (binary) and `.usdz` (packaged) output. There is no USD dependency to
+  borrow either: the crate forbids `unsafe`, so no FFI to usd-core, and the crate
+  format is a paged/compressed container rather than something to `format!`. The
+  cheap way to get a binary layer today is to write `.usda` and let an installed
+  usd-core re-export it — verified: `layer.Export("x.usdc")` turns the block's
+  layer into a 3 213-byte crate that reopens with the same 18 prims. Keep the
+  `Stage` in a local while doing that; the chained
+  `Usd.Stage.Open(p).GetRootLayer()` aborts the process. `.usdz` packaging is not
+  covered by a FerroJT probe yet.
 - Textures: a JT texture is not carried into the shader yet.
 - Per-instance materials on a node that draws several meshes at once — the
   per-mesh bindings on the library already say everything there is to say, so no
