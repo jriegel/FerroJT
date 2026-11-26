@@ -107,7 +107,7 @@ pub struct ConvertArgs {
     pub jt_version: Option<JtVersion>,
 
     /// Named layer filter to apply. Defaults to the filter the file declares
-    /// as active, or to its first filter when the file leaves that unset. Only
+    /// as active, and to no filter at all when the file leaves that unset. Only
     /// a JT input declares layer filters.
     #[arg(long, value_name = "NAME", conflicts_with = "no_layer_filter")]
     pub layer_filter: Option<String>,
@@ -116,6 +116,14 @@ pub struct ConvertArgs {
     /// input declares layer filters.
     #[arg(long)]
     pub no_layer_filter: bool,
+
+    /// Merge everything into one mesh: the transforms of the scene graph are
+    /// baked into the coordinates and an instanced part is duplicated at every
+    /// placement, so the output holds a single mesh. The colours survive as one
+    /// group each; a JT output keeps the first of them, because a JT shape node
+    /// holds exactly one material.
+    #[arg(long)]
+    pub flatten: bool,
 
     /// Replace the output file if it exists.
     #[arg(short = 'y', long)]
@@ -147,7 +155,7 @@ pub struct WriteArgs {
     pub all_lods: bool,
 
     /// Named layer filter to apply. Defaults to the filter the file declares
-    /// as active, or to its first filter when the file leaves that unset.
+    /// as active, and to no filter at all when the file leaves that unset.
     #[arg(long, value_name = "NAME", conflicts_with = "no_layer_filter")]
     pub layer_filter: Option<String>,
 
@@ -169,6 +177,16 @@ pub struct WriteArgs {
     /// is available.
     #[arg(long, value_name = "VERSION", value_parser = parse_jt_version)]
     pub jt_version: Option<JtVersion>,
+
+    /// Merge everything into one mesh instead of rewriting the scene graph: the
+    /// transforms of the graph are baked into the coordinates and an instanced
+    /// part is duplicated at every placement, so the output holds a single
+    /// shape. That is the export writer rather than the rewriter, so the other
+    /// segments of the source (PMI, B-rep, meta data) are not carried over,
+    /// `--compress` and `--all-lods` do not apply, and only the colour of the
+    /// first group survives because a JT shape node holds one material.
+    #[arg(long, conflicts_with = "all_lods")]
+    pub flatten: bool,
 
     /// Replace the output file if it exists.
     #[arg(short = 'y', long)]
@@ -353,6 +371,14 @@ pub fn convert(args: &ConvertArgs) -> Result<()> {
         load(&args.input)?
     };
 
+    // Flattening is a transform of the model rather than an option of a writer:
+    // what follows is an ordinary scene graph with one node and one mesh.
+    let model = if args.flatten {
+        model.flattened()
+    } else {
+        model
+    };
+
     let bar = spinner(&format.to_string());
     if format == Format::Jt {
         ferrojt::jt::model_to_file(&model, &output, args.jt_version)
@@ -375,6 +401,15 @@ pub fn convert(args: &ConvertArgs) -> Result<()> {
             format.to_string()
         }
     );
+    if args.flatten {
+        println!(
+            "    merged into {} mesh with {} triangles and {} material{}",
+            model.meshes.len(),
+            model.triangle_count(),
+            model.materials.len(),
+            if model.materials.len() == 1 { "" } else { "s" }
+        );
+    }
     Ok(())
 }
 
@@ -402,9 +437,26 @@ pub fn write(args: &WriteArgs) -> Result<()> {
         version: args.jt_version,
     };
     let bar = spinner("JT");
-    ferrojt::jt::write_to_file(&file, &output, &options)
-        .map_err(|err| map_error(&args.input, err))
-        .with_context(|| format!("writing {}", output.display()))?;
+    if args.flatten {
+        // The merged mesh has no scene graph to re-serialise, so this is the
+        // export writer: the model of the file, merged, written from scratch.
+        let model = if let Some(name) = args.layer_filter.as_deref() {
+            file.to_model_with_filter(name)
+                .map_err(|err| map_error(&args.input, err))?
+        } else if args.no_layer_filter {
+            file.to_model_unfiltered()
+        } else {
+            file.to_model()
+        };
+        let model = model.flattened();
+        ferrojt::jt::model_to_file(&model, &output, args.jt_version)
+            .map_err(|err| map_error(&args.input, err))
+            .with_context(|| format!("writing {}", output.display()))?;
+    } else {
+        ferrojt::jt::write_to_file(&file, &output, &options)
+            .map_err(|err| map_error(&args.input, err))
+            .with_context(|| format!("writing {}", output.display()))?;
+    }
     finish(bar);
 
     let written = ferrojt::jt::JtFile::open(&output)
@@ -421,11 +473,17 @@ pub fn write(args: &WriteArgs) -> Result<()> {
         after.1,
         written.toc.len()
     );
-    if before != after {
+    if !args.flatten && before != after {
         println!(
             "  filtered: {} nodes and {} representations dropped",
             before.0.saturating_sub(after.0),
             before.1.saturating_sub(after.1)
+        );
+    }
+    if args.flatten {
+        println!(
+            "    merged into one shape from {} representations",
+            before.1
         );
     }
     Ok(())

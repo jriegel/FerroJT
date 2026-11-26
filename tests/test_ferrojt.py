@@ -1335,3 +1335,210 @@ def test_a_format_without_a_reader_is_refused(tmp_path) -> None:
     usd.write_text("#usda 1.0\n", encoding="utf-8")
     with pytest.raises(ValueError, match="cannot be read"):
         ferrojt.open(str(usd))
+
+
+# ---------------------------------------------------------------------------
+# flatten: the whole file as one merged mesh
+# ---------------------------------------------------------------------------
+
+#: What flattening a sample produces: vertex slots, triangles and material runs
+#: of the merged mesh. The triangle count counts every *placement*, so it is
+#: larger than ``triangle_count`` of the scene graph whenever a part of the file
+#: is instantiated more than once.
+FLATTENED = {
+    "example_block_jt8.1.jt": (24, 12, 1),
+    "example_block_jt9.5.jt": (24, 12, 1),
+    "example_block_jt10.3.jt": (24, 12, 1),
+    "opening_protection_plate1_jt8.0.jt": (1084, 1012, 2),
+    "opening_protection_plate1_jt9.5.jt": (923, 800, 2),
+    "SampleJT_Server.jt": (1_145_208, 1_193_657, 592),
+}
+
+
+def flattened_names() -> list[str]:
+    return [name for name in FLATTENED if (SAMPLES / name).is_file()]
+
+
+@needs_sample
+@pytest.mark.parametrize("name", flattened_names())
+def test_flatten_leaves_one_mesh_and_one_node(name: str) -> None:
+    """Every export path of a flattened file sees a single mesh."""
+    vertices, triangles, groups = FLATTENED[name]
+    whole = ferrojt.open(str(SAMPLES / name))
+    model = ferrojt.open(str(SAMPLES / name), flatten=True)
+
+    assert model.mesh_count == 1
+    assert model.node_count == 1
+    assert model.triangle_count == triangles
+    assert whole.triangle_count <= triangles
+
+    merged = model.merged_mesh()
+    assert merged.vertex_count == vertices
+    assert merged.triangle_count == triangles
+    assert merged.index_count == 3 * triangles
+    assert merged.group_count == groups
+    assert len(merged.groups()) == groups
+
+
+@needs_sample
+def test_flatten_copies_an_instanced_part_once_per_placement() -> None:
+    """The plate holds one screw and instantiates it twice; both copies land in
+    the merged mesh, which is why it holds more triangles than the graph."""
+    whole = ferrojt.open(str(PLATE_95))
+    model = ferrojt.open(str(PLATE_95), flatten=True)
+
+    assert whole.mesh_count == 2
+    assert whole.node_count == 21
+    assert whole.triangle_count == 486
+    assert model.mesh_count == 1
+    assert model.triangle_count == 800
+
+
+@needs_sample
+def test_read_mesh_and_merged_mesh_hand_out_the_same_arrays() -> None:
+    """The raw-buffer entry point and ``Model.merged_mesh`` agree exactly."""
+    numpy = pytest.importorskip("numpy")
+    direct = ferrojt.read_mesh(str(PLATE_95))
+    merged = ferrojt.open(str(PLATE_95)).merged_mesh()
+
+    assert direct.vertex_count == merged.vertex_count
+    assert direct.index_count == merged.index_count
+    assert direct.group_count == merged.group_count
+    for name in ("indices", "vertices", "normals"):
+        first = numpy.asarray(direct.array(name))
+        second = numpy.asarray(merged.array(name))
+        assert first.shape == second.shape
+        assert numpy.array_equal(first, second)
+
+    # A model that was already flattened merges to the same geometry.
+    again = ferrojt.open(str(PLATE_95), flatten=True).merged_mesh()
+    assert numpy.allclose(
+        numpy.asarray(again.array("vertices")), numpy.asarray(direct.array("vertices"))
+    )
+
+
+@needs_sample
+def test_a_merged_mesh_is_numpy_compatible_and_zero_copy() -> None:
+    numpy = pytest.importorskip("numpy")
+    mesh = ferrojt.read_mesh(str(PLATE_95))
+
+    vertices = numpy.asarray(mesh.array("vertices"))
+    indices = numpy.asarray(mesh.indices)
+    normals = numpy.asarray(mesh.normals)
+
+    assert vertices.shape == (mesh.vertex_count, 3)
+    assert vertices.dtype == numpy.float32
+    assert indices.shape == (mesh.index_count,)
+    assert indices.dtype == numpy.int32
+    assert normals.shape == (mesh.vertex_count, 3)
+    assert mesh.array("indices").format == mesh.indices.format == "i"
+    assert mesh.array("vertices").format == "f"
+    assert len(mesh.array("vertices")) == mesh.vertex_count
+
+    # Zero copy: NumPy borrows the merged arrays of the buffer.
+    assert vertices.flags.owndata is False
+    assert numpy.shares_memory(vertices, numpy.asarray(mesh.vertices))
+    assert numpy.shares_memory(vertices, numpy.asarray(memoryview(mesh.vertices)))
+
+    # The buffers are read-only, and the geometry is self-consistent.
+    with pytest.raises(ValueError):
+        numpy.asarray(mesh.vertices).flags.writeable = True
+    assert indices.max() < mesh.vertex_count
+    lengths = (normals ** 2).sum(axis=1)
+    assert 0.0 < lengths.min() and lengths.max() <= 1.0 + 1e-3
+
+    # The bounds of the merge are the bounds of its points.
+    assert mesh.bounds is not None
+    low, high = mesh.bounds[:3], mesh.bounds[3:]
+    assert [round(value, 6) for value in low] == [
+        round(value, 6) for value in vertices.min(axis=0)
+    ]
+    assert [round(value, 6) for value in high] == [
+        round(value, 6) for value in vertices.max(axis=0)
+    ]
+
+
+@needs_sample
+def test_a_merged_mesh_keeps_the_materials_of_the_file() -> None:
+    """The runs of the merge carry the colours of the parts they came from."""
+    mesh = ferrojt.read_mesh(str(PLATE_95))
+    groups = mesh.groups()
+
+    assert len(groups) == 2
+    assert set(groups[0]) == {
+        "material",
+        "color",
+        "metallic",
+        "roughness",
+        "emissive",
+        "vertices",
+        "triangles",
+    }
+    assert sum(group["triangles"] for group in groups) == mesh.triangle_count
+    assert sum(group["vertices"] for group in groups) == mesh.vertex_count
+    colours = sorted(tuple(group["color"]) for group in groups)
+    assert colours == [pytest.approx(colour) for colour in COLOURS["opening_protection_plate1_jt9.5.jt"]]
+
+
+@needs_sample
+def test_flatten_reaches_the_gltf_and_usd_export(tmp_path) -> None:
+    model = ferrojt.open(str(PLATE_95), flatten=True)
+
+    document = json.loads(model.to_bytes("gltf").decode("utf-8"))
+    assert len(document["meshes"]) == 1
+    assert len(document["nodes"]) == 1
+    assert len(document["meshes"][0]["primitives"]) == 2
+    assert document["accessors"][document["meshes"][0]["primitives"][0]["attributes"]["POSITION"]][
+        "count"
+    ] < model.vertex_count
+
+    text = model.to_bytes("usd").decode("utf-8")
+    assert text.count('def Xform "GEOMETRY_') == 1
+    assert text.count("point3f[] points") == 2
+    assert text.count('def Material "Material_') == 2
+    # The two runs of one mesh bind their material on the primitive.
+    assert text.count("rel material:binding = ") == 2
+
+    out = tmp_path / "flat.usda"
+    model.save(str(out), "usd")
+    assert out.read_text(encoding="utf-8") == text
+
+
+@needs_sample
+def test_a_flattened_file_can_be_written_back_as_jt(tmp_path) -> None:
+    jt = ferrojt.JtFile(str(BLOCK_95))
+    assert jt.open()
+
+    assert jt.write_gltf(str(tmp_path / "flat.glb"), flatten=True) is True
+    assert (tmp_path / "flat.glb").read_bytes()[:4] == b"glTF"
+
+    out = tmp_path / "flat.jt"
+    assert jt.write_jt(str(out), flatten=True, version="10.3") is True
+    again = ferrojt.open(str(out))
+    assert again.mesh_count == 1
+    assert again.triangle_count == 12
+
+    # The file still carries the wrapper chain a consumer walks, but only one
+    # shape: every mesh of the source ended up inside it.
+    written = ferrojt.JtFile(str(out))
+    assert written.open()
+    assert written.lsg.representation_count == 1
+
+
+@needs_sample
+def test_flatten_combines_with_the_layer_keywords() -> None:
+    """No sample marks a filter active, so the default and ``all_layers`` merge
+    the same geometry."""
+    default = ferrojt.read_mesh(str(PLATE_95))
+    every = ferrojt.read_mesh(str(PLATE_95), all_layers=True)
+    assert (every.vertex_count, every.triangle_count, every.group_count) == (
+        default.vertex_count,
+        default.triangle_count,
+        default.group_count,
+    )
+    assert ferrojt.open(str(PLATE_95), flatten=True, all_layers=True).triangle_count == (
+        default.triangle_count
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ferrojt.read_mesh(str(PLATE_95), layer_filter="ALL", all_layers=True)

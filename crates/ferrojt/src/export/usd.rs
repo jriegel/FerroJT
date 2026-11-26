@@ -628,6 +628,21 @@ impl Plan {
             let binding = self
                 .mesh_material(mesh)
                 .and_then(|material| self.material_path(material));
+            // A mesh whose primitives disagree on the material — a flattened
+            // model always has one run per colour — cannot be shaded by one
+            // binding on the group, so each primitive carries its own.
+            let per_primitive: Vec<Option<String>> = if binding.is_some() {
+                Vec::new()
+            } else {
+                mesh.primitives
+                    .iter()
+                    .map(|primitive| {
+                        primitive
+                            .material
+                            .and_then(|material| self.material_path(material))
+                    })
+                    .collect()
+            };
             out.push_str(&format!("\n    def Xform \"{}\"", mesh_group(index)));
             if binding.is_some() {
                 out.push_str(
@@ -639,7 +654,15 @@ impl Plan {
                 out.push_str(&format!("        rel material:binding = <{target}>\n"));
             }
             for (slot, primitive) in mesh.primitives.iter().enumerate() {
-                write_primitive(model, primitive, slot, mesh, 2, out)?;
+                write_primitive(
+                    model,
+                    primitive,
+                    slot,
+                    mesh,
+                    per_primitive.get(slot).and_then(Option::as_deref),
+                    2,
+                    out,
+                )?;
             }
             out.push_str("    }\n");
         }
@@ -650,11 +673,15 @@ impl Plan {
 
 /// Write one primitive: a `Mesh` for the triangle topologies, `BasisCurves`
 /// or `Points` for the rest.
+///
+/// `binding` is the material path this primitive has to carry itself, set only
+/// when the primitives of the mesh do not share one material.
 fn write_primitive(
     model: &Model,
     primitive: &Primitive,
     slot: usize,
     mesh: &Mesh,
+    binding: Option<&str>,
     depth: usize,
     out: &mut String,
 ) -> Result<()> {
@@ -741,9 +768,21 @@ fn write_primitive(
         primvars.push((name, ty, converted));
     }
 
+    let schema = match binding {
+        Some(_) => format!(
+            "{inner}instanceable = true\n{inner}prepend apiSchemas = [\"MaterialBindingAPI\"]\n"
+        ),
+        None => format!("{inner}instanceable = true\n"),
+    };
     out.push_str(&format!(
-        "\n{indent}def Mesh \"{}\"\n{indent}(\n{inner}instanceable = true\n{indent})\n{indent}{{\n{inner}uniform token subdivisionScheme = \"linear\"\n",
+        "\n{indent}def Mesh \"{}\"\n{indent}(\n{schema}{indent})\n{indent}{{\n",
         primitive_name(slot)
+    ));
+    if let Some(target) = binding {
+        out.push_str(&format!("{inner}rel material:binding = <{target}>\n"));
+    }
+    out.push_str(&format!(
+        "{inner}uniform token subdivisionScheme = \"linear\"\n"
     ));
     let double_sided = primitive
         .material

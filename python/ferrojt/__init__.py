@@ -17,6 +17,8 @@ from ._ferrojt import (
     JtMesh,
     JtNode,
     MaterialData,
+    MeshArray,
+    MeshBuffer,
     MeshData,
     MeshHandle,
     Model,
@@ -24,6 +26,7 @@ from ._ferrojt import (
     __version__,
     detect_format,
     open,
+    read_mesh,
 )
 
 __all__ = [
@@ -34,11 +37,14 @@ __all__ = [
     "JtMesh",
     "JtNode",
     "MaterialData",
+    "MeshArray",
+    "MeshBuffer",
     "MeshData",
     "MeshHandle",
     "Model",
     "NodeHandle",
     "open",
+    "read_mesh",
     "detect_format",
     "__version__",
     "formats",
@@ -57,7 +63,8 @@ def read(path: str, **kwargs: Any) -> Model:
 
     Accepts the same keywords: ``layer_filter="NAME"`` selects one of the
     layer filters the file declares, and ``all_layers=True`` exports every
-    part instead of applying the filter of the file. Both only apply to JT.
+    part instead of applying the filter of the file (both only apply to JT).
+    ``flatten=True`` merges everything that was read into a single mesh.
     """
     return open(path, **kwargs)
 

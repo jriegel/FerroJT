@@ -9,9 +9,9 @@ file back out as JT. Read this before changing code; the design detail lives in
 
 | Path | What it is |
 | --- | --- |
-| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `import/` the glTF/GLB reader (`gltf.rs`), `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `jt/version.rs` the `JtVersion` a file is read or written at, `jt/encode.rs` the topological (dual vertex-face) encoder, `jt/hash.rs` the Jenkins lookup2 hashes a strict consumer verifies, `jt/write.rs` the JT writer, `jt/build.rs` the builder that creates a file from nothing, `jt/from_model.rs` (private) the writer that turns a neutral `Model` into a file, and `export/` glTF/GLB writer and the ASCII USD writer. |
+| `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `import/` the glTF/GLB reader (`gltf.rs`), `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `jt/version.rs` the `JtVersion` a file is read or written at, `jt/encode.rs` the topological (dual vertex-face) encoder, `jt/hash.rs` the Jenkins lookup2 hashes a strict consumer verifies, `jt/write.rs` the JT writer, `jt/build.rs` the builder that creates a file from nothing, `jt/from_model.rs` (private) the writer that turns a neutral `Model` into a file, `model/flatten.rs` the merge of a whole file into one mesh, and `export/` glTF/GLB writer and the ASCII USD writer. |
 | `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `write`, `ls`. |
-| `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `lib.rs` is the export view (`Model`) plus `lsg.rs` the file view (`JtLsg`/`JtNode`/`JtMesh`/`JtArray`) and `build.rs` the builder (`JtBuilder`/`NodeHandle`/`MeshHandle`/`MeshData`/`MaterialData`); `pyproject.toml` + `python/ferrojt/` + `tests/`. |
+| `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `lib.rs` is the export view (`Model`) plus `lsg.rs` the file view (`JtLsg`/`JtNode`/`JtMesh`/`JtArray`) and `build.rs` the builder (`JtBuilder`/`NodeHandle`/`MeshHandle`/`MeshData`/`MaterialData`), `mesh.rs` the merged-mesh buffer of `Model::merged_mesh`/`ferrojt.read_mesh` and `array.rs` the buffer plumbing `JtArray` and that buffer share; `pyproject.toml` + `python/ferrojt/` + `tests/`. |
 | `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `details.rs` key/value pane for the selected row, `backdrop.rs` viewport gradient, `camera.rs` `Camera3d` wrapper that places the backdrop, `picking.rs`, `trihedron.rs`. |
 | `python/ferrojt/` | Pure-Python package re-exporting `_ferrojt` (`__init__.py`, `_ferrojt.pyi`, `py.typed`). |
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
@@ -59,6 +59,15 @@ cargo run -p ferrojt-cli -- convert target\block.glb -o target\block.jt --force
 cargo run -p ferrojt-cli -- info target\block.jt
 ```
 
+Merge a whole file into one mesh (`--flatten` exists on both `convert` and
+`write`; it conflicts with `--all-lods`, and a merged mesh of touching parts is
+no longer a closed two-manifold, so the JT writer falls back to 8.x by itself):
+
+```powershell
+cargo run -p ferrojt-cli -- convert data\ExampleFiles\opening_protection_plate1_jt9.5.jt -o target\plate.glb --force --flatten
+cargo run -p ferrojt-cli -- write data\ExampleFiles\opening_protection_plate1_jt9.5.jt -o target\plate.jt --force --flatten
+```
+
 `ferrojt-python` must be excluded from `cargo test`: its default features enable
 `pyo3/extension-module`, so a test binary cannot resolve the Python symbols.
 
@@ -82,7 +91,7 @@ without it):
 ```
 
 Interactive viewer (also needs `open3d`; it is a tool, not a test — nothing in it
-is named `test_*`, so pytest still collects 106 tests):
+is named `test_*`, so pytest still collects 127 tests):
 
 ```powershell
 .\.venv\Scripts\python.exe tests\test_viewer.py data\ExampleFiles\example_block_jt9.5.jt
@@ -695,11 +704,40 @@ Upload with `python -m twine upload dist\*`.
   which is **not iterable** — use `GetAppliedItems()`, because a `prepend` leaves
   `addedItems`/`explicitItems` empty; a reference's path is `.primPath`; `Sdf.Path` has
   no `startswith`; `UsdValidation.ValidationContext` takes validators, not a `Stage`.
+- **`flatten` is a transform of the neutral `Model`, not a writer**
+  (`model/flatten.rs`): `Model::flatten() -> Flattened` (merged
+  `vertices`/`normals`/`indices` plus the `groups` that keep the colours apart)
+  and `Model::flattened() -> Model` (one node, one mesh), so glTF, USD, JT and
+  the Python buffers all get it without a special code path. It composes the
+  transforms of the parents down onto the vertices (JT matrices are column major
+  `T·R·S`) and emits an instanced subtree **once per placement**; a node that
+  reaches itself is treated as a cycle and emitted where it closes. Only the
+  triangle lists are merged — an index naming a slot past the vertex array pads
+  zeros — and materials are **not** globally deduped: each contiguous
+  same-shading run is one group, which lets one glTF mesh carry one primitive
+  per colour. USD then has to bind **per primitive** (`export/usd.rs` passes the
+  binding into `write_primitive` only when the primitives of a mesh disagree),
+  so the flattened plate is 2 library `Mesh` prims with 800 triangles and
+  `target\usd_check.py` takes `2 800 2`. For JT two consequences are documented
+  rather than fixed: a `Shape` holds exactly one material, so a flattened file
+  keeps the colour of the first group only; and `jt/encode.rs` welds coincident
+  positions, so merging parts that touch (the plate and its screw) is **no
+  longer a closed two-manifold** — with no revision requested the writer falls
+  back to JT 8.1 on its own, with 9.x/10.x requested it refuses. Pinned by
+  `crates/ferrojt/tests/flatten.rs`,
+  `test_a_flattened_file_written_from_a_model_renders` (the strict JT2Go oracle)
+  and the flattened picture test, which compares against the **same**
+  `data/Reference/<stem>.png` as the unmerged one.
 - **`tests/test_visual.py` is flaky by 1–2 random samples per run** (similarity ≈0.13,
-  "100% of the pixels differ") from the documented Open3D blank-frame issue —
-  `shoot` retries `MAX_FRAMES` but still loses occasionally, and a re-run picks a
-  different sample. Re-run before investigating; `pytest tests\test_ferrojt.py` alone
-  is the stable check.
+  "100% of the pixels differ") from the documented Open3D blank-frame issue.
+  `shoot` now retries `MAX_FRAMES` (32, env `FERROJT_VISUAL_FRAMES`) and keeps the
+  first frame whose brightest channel passes `FRAME_MIN` (200 — a blank frame is
+  0, the lit background is 231), and when that still fails it spawns fresh
+  `--render` sub-processes (`render_glb_fresh`, `FRESH_ATTEMPTS` 3, env
+  `FERROJT_VISUAL_PROCESSES`) because a second renderer **in one process** aborts
+  the Vulkan engine. The merged server mesh of the flatten test (~1.19 M
+  triangles) can burn ~28 of those frames; the single-sample runs are stable.
+  `pytest tests\test_ferrojt.py` alone remains the fast stable check.
 - **JT writer: only the LSG is re-serialised** (`jt/write.rs`). There is **no JT
   writer anywhere in `example/`**, so the framing was read out of the sample
   bytes. Representation/meta data/PMI/B-rep segments are copied byte for byte
@@ -912,7 +950,12 @@ Upload with `python -m twine upload dist\*`.
   `opening_protection_plate1` 9.5 rewrite / model path→10.3 / glTF→10.3 /
   glTF→8.1 → **226 982**; the 8.0→8.1 rewrite **226 971**. Hand-built chain cube
   and `out.jt` (`TestBlock.glb`→10.3) → **352 001**. `sweep_SampleJT_Server_9.5`
-  → **143 741**.
+  → **143 741**. A **flattened** file draws too, and measures far above its own
+  baseline because one merged shape is framed much larger: block 9.5
+  `write --flatten --jt-version 10.3` → **1 691 354** (geometry 2301×1434),
+  plate 9.5 `write --flatten` (auto JT 8.1) → **986 849**. The pytest of
+  `test_a_flattened_file_written_from_a_model_renders` only requires it to clear
+  `DEFAULT_MIN_INK`, not to match a number.
 - **JT2Go verifies the hashes.** It checks the topology **Composite Hash** *and*
   each **vertex-data hash** independently and blanks the shape on any mismatch —
   it does not merely tolerate them like the lenient readers here. The primitive
@@ -1229,8 +1272,8 @@ Upload with `python -m twine upload dist\*`.
   **is** a property (a different type), so the two do not mirror each other here.
 - **The pytest summary line never surfaces under redirection** (Open3D/Vulkan
   native output interleaves), so `Select-String 'passed|failed'` finds nothing.
-  Trust `$LASTEXITCODE` plus `pytest --co -q` per file: 23 build + 69 ferrojt +
-  3 jt2go + 11 visual = **106**.
+  Trust `$LASTEXITCODE` plus `pytest --co -q` per file: 23 build + 83 ferrojt +
+  4 jt2go + 17 visual = **127**.
 - **Parallel tests need pid *and* an atomic counter in the temp file name** — the
   pid alone collides across the worker processes of one run.
 - **Picture parity for a written file must be measured one process per picture**

@@ -82,6 +82,7 @@ FerroJT is a Rust workspace with four parts:
 | JT writer (rebuild a read file, LOD and layer filtered) | done — a round trip re-reads to the same dump, structure and picture; `--jt-version` rewrites it as 8.x, 9.x or 10.x |
 | JT builder (create a file from nothing, meshes and instances) | done — JT 10.3 by default, `tests/test_build.py` builds a cube at each revision and reads it back |
 | JT writer from a neutral `Model` (glTF → JT) | done — `convert model.glb -o out.jt`, unit and up axis converted on the root, falling back to JT 8.x when a mesh is not a closed two-manifold |
+| Flatten (every mesh of a file as one merged mesh) | done — `--flatten`, `flatten=True`, `ferrojt.read_mesh`; the merged mesh is judged against the same reference picture as the scene graph |
 | CLI | done |
 | Python bindings | done (packaged with `maturin`) |
 | Visual regression (rendered export vs. reference picture) | done (`tests/test_visual.py`, Open3D) |
@@ -147,6 +148,7 @@ cargo run -p ferrojt-cli -- convert gear.jt -f glb -o gear.glb
 cargo run -p ferrojt-cli -- convert gear.jt -f usd -o gear.usda
 cargo run -p ferrojt-cli -- convert gear.jt --layer-filter LAYCUR -o gear.glb
 cargo run -p ferrojt-cli -- convert gear.jt --no-layer-filter -o gear.glb
+cargo run -p ferrojt-cli -- convert gear.jt --flatten -o gear.glb
 cargo run -p ferrojt-cli -- convert model.glb -o model.jt
 cargo run -p ferrojt-cli -- convert model.glb -o model.jt --jt-version 8.1
 cargo run -p ferrojt-cli -- write    gear.jt -o gear.out.jt
@@ -169,11 +171,43 @@ writes the model as OpenJT through the builder rather than the rewriter. The las
 line of output names the format, and for JT the revision the file actually landed
 on.
 
+`--flatten` merges the export into **one single mesh**: the transform of every
+node is applied to the coordinates, an instantiated part is repeated once per
+placement, and the result is one node holding one mesh. The selection an export
+applies by default does not change — the active layer filter and the finest LOD
+tier that has geometry — so `--layer-filter` and `--no-layer-filter` work exactly
+as they do without `--flatten`. Materials survive as one group per contiguous run
+of same-shaded geometry, and a mesh keeps its normals when the file has them and
+gets flat ones where it does not. Because the merge is a transform of the neutral
+model rather than a special writer, it works for every output format:
+
+```sh
+cargo run -p ferrojt-cli -- convert plate.jt --flatten -f glb -o plate.glb
+cargo run -p ferrojt-cli -- convert plate.jt --flatten -f usd -o plate.usda
+cargo run -p ferrojt-cli -- convert plate.jt --flatten -o plate.jt
+```
+
+A flattened JT output carries one shape, and a JT shape holds one material, so
+only the colour of the first group survives; a flattened glTF keeps every colour
+as one primitive each. The triangle count of a flattened file is larger than the
+count `info` reports, because `info` counts a mesh that is instanced once while
+the merge counts it once per placement. Merging also joins parts that touch, and
+the JT encoder welds coincident positions, so the merged shape of a plate with a
+screw sitting on it is no longer a closed two-manifold: such a file lands on the
+JT 8.x representation on its own, and naming a 9.x or 10.x revision instead asks
+for the impossible and is refused.
+
 `write` rebuilds the file as JT. It applies the same selection an export
 applies — the finest tier below a range LOD and the active layer filter —
 unless `--all-lods` or `--no-layer-filter` says otherwise, and it copies every
 segment but the scene graph out of the source unchanged. The result is re-read
 and reported, so the second line of output says what the filters cost.
+
+`write --flatten` merges instead of rebuilding: the model of the file becomes one
+shape, written by the export writer rather than the rewriter. The segments the
+source carries (PMI, B-rep, meta data) are then not copied, `--compress` and
+`--all-lods` do not apply, and the 8.x fallback described above is what makes the
+plate land on JT 8.1.
 
 `--jt-version 9.5` writes the result at another revision instead of the one of
 the source. JT stores its triangles in one of two families — 8.x in the
@@ -362,6 +396,61 @@ mesh.arrays()                                   # all three as a dict
 
 Requires Python 3.11 or newer.
 
+### Flatten: one merged mesh
+
+`flatten=True` turns a file into a single mesh on export: the transform of every
+node is applied to the coordinates, a part that is instantiated several times is
+copied once per placement, and the result is one node with one mesh. The
+selection is the one every export applies by default — the active layer filter
+and the finest LOD tier that has geometry — and the same keywords choose
+otherwise.
+
+```python
+model = ferrojt.open("plate.jt", flatten=True)
+print(model)                    # Model(nodes=1, meshes=1, ...)
+model.save("plate.glb")         # one mesh, one primitive per material group
+model.save("plate.usda")        # one geometry prim, bound per primitive
+model.to_bytes("jt", flatten=True)
+
+jt = ferrojt.JtFile("plate.jt")
+jt.open()
+jt.write_gltf("plate", flatten=True)
+jt.write_jt("plate.flat.jt", flatten=True)  # one shape: a JT shape holds one material
+merged = jt.model(flatten=True) # the same as ferrojt.open(..., flatten=True)
+```
+
+The merge keeps the colour of each run of same-shaded geometry as its own group,
+and normals when the file has them; a vertex that had none gets a flat one. It
+carries no node names, no key/value properties and no textures — a merged mesh is
+geometry and colour. The count `print(model)` reports is smaller than the count
+of the flattened model, because an instantiated part is counted once in the graph
+and once per placement in the merge.
+
+For a raw buffer rather than a model, `read_mesh` skips the `Model` entirely. The
+arrays it hands out are the same zero-copy buffers as the scene-graph view: NumPy
+wraps them without a copy, straight at the decoded data of the file.
+
+```python
+import numpy as np
+
+buffer = ferrojt.read_mesh("plate.jt")        # or ferrojt.open(...).merged_mesh()
+print(buffer.vertex_count, buffer.triangle_count, buffer.group_count)
+
+vertices = np.asarray(buffer.array("vertices"))   # float32, (n, 3), read-only
+normals = np.asarray(buffer.array("normals"))     # float32, (n, 3)
+indices = np.asarray(buffer.array("indices"))     # int32, (m,)
+assert vertices.flags.owndata is False            # borrowed, not copied
+
+buffer.bounds                                     # [min_x, min_y, min_z, max_x, max_y, max_z]
+buffer.material_names                             # one name per group
+for group in buffer.groups():
+    print(group["material"], group["color"], group["vertices"], group["triangles"])
+```
+
+`read_mesh` takes the layer keywords (`layer_filter="NAME"`, `all_layers=True`)
+like every other entry point, and `Model.merged_mesh()` returns the merged
+arrays of a model that was read without `flatten`.
+
 ### Building a file
 
 `JtBuilder` is the way in: it starts as an empty file holding only its root
@@ -420,11 +509,22 @@ than `8` (`FERROJT_VISUAL_EPS`). A failure writes a three panel picture — rend
 reference, amplified difference — to `tests/_visual_out/`.
 
 Six samples are covered: the three `example_block` versions, the two
-`opening_protection_plate1` ones and `SampleJT_Server.jt`. Two Open3D offscreen
-quirks are worked around in the test: a frame can come back blank, so the render is
-retried until it contains the background, and screen-space ambient occlusion makes
-the colour pass return an all-zero frame for the ~1M-triangle server mesh, so it is
-switched off — invisibly, measured on the smaller samples.
+`opening_protection_plate1` ones and `SampleJT_Server.jt`. Each is judged twice —
+once as the scene graph and once as one flattened merged mesh — against the very
+same reference picture, which is the point: folding every transform into the
+coordinates and copying an instantiated part once per placement has to draw the
+same pixels. Three Open3D offscreen quirks are worked around in the test: a
+frame can come back blank, so the render is retried until it contains the
+background, and screen-space ambient occlusion makes the colour pass return an
+all-zero frame for the ~1M-triangle server mesh, so it is switched off —
+invisibly, measured on the smaller samples. That mesh — and the merged mesh of
+the same file, which is ~1.2M triangles because the instances are expanded —
+also makes the colour pass return empty frames for a good part of the frames,
+flipping within one process with no engine error reported, so the test asks for
+many frames and, when the picture is still empty, renders it again in processes
+that never drew a big mesh. All of that is a quirk of the renderer: the depth
+pass holds the geometry the whole time, and the merged mesh draws the same
+pixels.
 
 ### Interactive viewer
 
@@ -537,6 +637,12 @@ matrix instead.
   geometry of a part whose layers the active filter does not accept, but keeps
   every node of the scene graph. A file without layer information exports all of
   its parts, and a dump always shows everything.
+* **Flatten is a transform of the model, not a writer.** [`Model::flattened()`](crates/ferrojt/src/model/flatten.rs)
+  walks the graph once, composes the transforms down to the geometry, expands an
+  instanced subtree once per placement and returns one node with one mesh; every
+  writer then does what it always did. That is why the merged mesh is available
+  for glTF, USD and JT at once, and why it takes the layer filter and the LOD
+  tier the reader already settled on rather than a rule of its own.
 * **USD references, it does not copy.** Every mesh is authored once in an
   invisible geometry library and `prepend references` by each consumer, and a
   node reached from several parents is referenced rather than duplicated; the

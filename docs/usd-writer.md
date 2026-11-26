@@ -88,8 +88,11 @@ identical are the same material; two that differ only in **opacity** are not.
 The binding is authored on the library group, so a consumer can override it
 without touching the geometry. A node whose `Instance::material` differs from
 the material its mesh carries gets its own `rel material:binding` as an
-override. Textures are not exported yet; a textured channel falls back to its
-factor.
+override. A mesh whose **primitives** disagree about their material — a flattened
+model is always this case, because merging puts the whole file into one mesh —
+gets the API and the binding on each `def Mesh` instead of on the group, so no
+colour of the file is lost. Textures are not exported yet; a textured channel
+falls back to its factor.
 
 `SampleJT_Server.jt` carries 23 model materials and all 23 survive: grouping the
 authored shaders by shading values finds 23 distinct values in 23 prims, so

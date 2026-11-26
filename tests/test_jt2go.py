@@ -138,6 +138,27 @@ def test_a_file_written_from_a_model_renders(viewer: str, tmp_path: Path) -> Non
     draw(viewer, target)
 
 
+def test_a_flattened_file_written_from_a_model_renders(viewer: str, tmp_path: Path) -> None:
+    """The single merged mesh of a file with instances still draws.
+
+    The plate stores one screw and places it twice, so flattening has to bake
+    both placements into the coordinates and hand the strict consumer one shape
+    instead of a scene graph. The chain down to that shape is the same as ever,
+    which is what this checks: a merged mesh is only useful if a consumer still
+    finds it.
+
+    No revision is asked for. The screw of the plate sits on the plate, so the
+    welded positions of the merged mesh are not a closed two-manifold and the
+    merged shape can only be held by the JT 8.x representation — which is what
+    the fallback of the writer picks on its own.
+    """
+
+    model = ferrojt.open(str(SAMPLES / "opening_protection_plate1_jt9.5.jt"))
+    target = tmp_path / "plateflattened.jt"
+    model.save(str(target), "jt", flatten=True)
+    draw(viewer, target)
+
+
 def test_a_hand_built_file_renders(viewer: str, tmp_path: Path) -> None:
     """A file built from nothing still draws.
 

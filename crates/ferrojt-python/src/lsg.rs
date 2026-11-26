@@ -22,14 +22,14 @@
 //! instantiates it.
 
 use std::collections::HashSet;
-use std::ffi::CString;
-use std::ffi::{c_int, c_void};
-use std::ptr;
+use std::ffi::c_int;
 
-use pyo3::exceptions::{PyBufferError, PyIndexError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+
+use crate::array::{self, Channel};
 
 use ferrojt::jt::{
     Attribute, JtFile as RawFile, LodGeometry, Node, SceneGraph, decompose_transform,
@@ -883,46 +883,6 @@ impl JtMesh {
     }
 }
 
-/// The array channels of a representation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Channel {
-    Indices,
-    Vertices,
-    Normals,
-}
-
-impl Channel {
-    fn parse(name: &str) -> Option<Self> {
-        match name {
-            "indices" | "index" => Some(Channel::Indices),
-            "vertices" | "positions" | "vertex" => Some(Channel::Vertices),
-            "normals" | "normal" => Some(Channel::Normals),
-            _ => None,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Channel::Indices => "indices",
-            Channel::Vertices => "vertices",
-            Channel::Normals => "normals",
-        }
-    }
-
-    /// `struct` format code of one element.
-    fn format(self) -> &'static str {
-        match self {
-            Channel::Indices => "i",
-            Channel::Vertices | Channel::Normals => "f",
-        }
-    }
-
-    /// Bytes per element of a channel: all three are 32 bit.
-    fn itemsize(self) -> usize {
-        4
-    }
-}
-
 /// One array of a representation, exposed through the Python buffer protocol.
 ///
 /// `memoryview` and `numpy.asarray` wrap it **without a copy**: the view
@@ -933,15 +893,6 @@ impl Channel {
 pub struct JtArray {
     mesh: Py<JtMesh>,
     channel: Channel,
-}
-
-/// A resolved array: where the bytes are and how they are laid out.
-struct Layout {
-    data: *const u8,
-    bytes: usize,
-    itemsize: usize,
-    format: &'static str,
-    dims: Vec<usize>,
 }
 
 #[pymethods]
@@ -1012,40 +963,21 @@ impl JtArray {
         view: *mut ffi::Py_buffer,
         flags: c_int,
     ) -> PyResult<()> {
-        if view.is_null() {
-            return Err(PyBufferError::new_err("the buffer view is null"));
-        }
-        if flags & ffi::PyBUF_WRITABLE == ffi::PyBUF_WRITABLE {
-            return Err(PyBufferError::new_err(
+        let layout = slf.get().layout();
+        unsafe {
+            array::get_buffer(
+                slf,
+                view,
+                flags,
+                layout,
                 "the arrays of a JT file are read-only",
-            ));
+            )
         }
-        let Some(layout) = slf.get().layout() else {
-            return Err(PyBufferError::new_err("the representation has no geometry"));
-        };
-        let owner = slf.into_ptr();
-        // SAFETY: `view` is a valid `Py_buffer` (checked above); `layout` only
-        // carries `Copy` values describing bytes that outlive the view,
-        // because `owner` is the owned reference transferred into it and the
-        // decoded geometry is never moved once it has been read.
-        unsafe { fill_view(view, flags, &layout, owner) };
-        Ok(())
     }
 
     /// Release what [`JtArray::__getbuffer__`] allocated for a view.
     unsafe fn __releasebuffer__(&self, view: *mut ffi::Py_buffer) {
-        // SAFETY: `view` was filled by `__getbuffer__`, which stores a leaked
-        // `CString` in `format` and a leaked shape/stride block in `internal`.
-        unsafe {
-            if !(*view).format.is_null() {
-                drop(CString::from_raw((*view).format));
-                (*view).format = ptr::null_mut();
-            }
-            if !(*view).internal.is_null() {
-                drop(Box::from_raw((*view).internal as *mut [ffi::Py_ssize_t; 4]));
-                (*view).internal = ptr::null_mut();
-            }
-        }
+        unsafe { array::release_view(view) };
     }
 }
 
@@ -1057,8 +989,8 @@ impl JtArray {
         };
         match self.channel {
             Channel::Indices => vec![geometry.indices.len()],
-            Channel::Vertices => shaped(geometry.vertices.len()),
-            Channel::Normals => shaped(geometry.normals.len()),
+            Channel::Vertices => array::shaped(geometry.vertices.len()),
+            Channel::Normals => array::shaped(geometry.normals.len()),
         }
     }
 
@@ -1069,116 +1001,12 @@ impl JtArray {
     /// an empty array of the right dtype instead of failing the buffer
     /// protocol, which would make NumPy fall back to a zero-dimensional object
     /// array.
-    fn layout(&self) -> Option<Layout> {
+    fn layout(&self) -> Option<array::Layout> {
         let geometry = self.mesh.get().geometry()?;
-        let (values, count) = match self.channel {
-            Channel::Indices => (
-                geometry.indices.as_ptr() as *const u8,
-                geometry.indices.len(),
-            ),
-            Channel::Vertices => (
-                geometry.vertices.as_ptr() as *const u8,
-                geometry.vertices.len(),
-            ),
-            Channel::Normals => (
-                geometry.normals.as_ptr() as *const u8,
-                geometry.normals.len(),
-            ),
-        };
-        // An empty `Vec` has a null pointer; a buffer must always point at
-        // something, even with a length of zero.
-        let data = if count == 0 {
-            &EMPTY as *const [u8; 4] as *const u8
-        } else {
-            values
-        };
-        Some(Layout {
-            data,
-            bytes: count * self.channel.itemsize(),
-            itemsize: self.channel.itemsize(),
-            format: self.channel.format(),
-            dims: match self.channel {
-                Channel::Indices => vec![count],
-                Channel::Vertices | Channel::Normals => shaped(count),
-            },
-        })
-    }
-}
-
-/// Stand-in address for a zero-length buffer.
-static EMPTY: [u8; 4] = [0; 4];
-
-/// A flat channel of `3 * n` floats as `(n, 3)`, flat when the count is not a
-/// multiple of three.
-fn shaped(count: usize) -> Vec<usize> {
-    if count % 3 != 0 {
-        return vec![count];
-    }
-    vec![count / 3, 3]
-}
-
-/// Fill a `Py_buffer` from a resolved layout.
-///
-/// # Safety
-///
-/// `view` must be a valid, non-null `Py_buffer`. `owner` must be an owned
-/// reference that this call transfers into the view, and the bytes `layout`
-/// points at must outlive the view.
-unsafe fn fill_view(
-    view: *mut ffi::Py_buffer,
-    flags: c_int,
-    layout: &Layout,
-    owner: *mut ffi::PyObject,
-) {
-    let want_nd = flags & ffi::PyBUF_ND == ffi::PyBUF_ND;
-    let want_strides = flags & ffi::PyBUF_STRIDES == ffi::PyBUF_STRIDES;
-    let want_format = flags & ffi::PyBUF_FORMAT == ffi::PyBUF_FORMAT;
-
-    // The shape and the strides have to stay alive for the whole life of the
-    // view, so they go into one block this exporter owns and gives back in
-    // `__releasebuffer__`. Layout: `[rows, cols, row stride, item size]`; the
-    // shape is read from the first entry and the strides from the third, so a
-    // one dimensional channel keeps `cols` at one and its row stride equals
-    // the item size.
-    let rows = layout.dims.first().copied().unwrap_or(0);
-    let cols = layout.dims.get(1).copied().unwrap_or(1);
-    let block = Box::into_raw(Box::new([
-        rows as ffi::Py_ssize_t,
-        cols as ffi::Py_ssize_t,
-        (layout.itemsize * cols) as ffi::Py_ssize_t,
-        layout.itemsize as ffi::Py_ssize_t,
-    ]));
-    let sizes = block as *mut ffi::Py_ssize_t;
-
-    // SAFETY: `view` is valid, `sizes` points inside the leaked block above,
-    // and `owner` is the reference this call is required to transfer.
-    unsafe {
-        (*view).buf = layout.data as *mut c_void;
-        (*view).obj = owner;
-        (*view).len = layout.bytes as ffi::Py_ssize_t;
-        (*view).itemsize = layout.itemsize as ffi::Py_ssize_t;
-        (*view).readonly = 1;
-        (*view).ndim = if want_nd {
-            layout.dims.len() as c_int
-        } else {
-            1
-        };
-        (*view).format = if want_format {
-            CString::new(layout.format)
-                .unwrap_or_else(|_| CString::new("").expect("the empty string has no NUL"))
-                .into_raw()
-        } else {
-            ptr::null_mut()
-        };
-        (*view).shape = if want_nd { sizes } else { ptr::null_mut() };
-        // Only the first entry of a strides array is read for a C ordered
-        // array, which is what the channels are, so the row stride goes first.
-        (*view).strides = if want_strides {
-            sizes.add(2)
-        } else {
-            ptr::null_mut()
-        };
-        (*view).suboffsets = ptr::null_mut();
-        (*view).internal = block as *mut c_void;
+        match self.channel {
+            Channel::Indices => Some(array::Layout::of(&geometry.indices, self.channel)),
+            Channel::Vertices => Some(array::Layout::of(&geometry.vertices, self.channel)),
+            Channel::Normals => Some(array::Layout::of(&geometry.normals, self.channel)),
+        }
     }
 }

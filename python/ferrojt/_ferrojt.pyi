@@ -26,15 +26,29 @@ class Model:
     def up_axis(self) -> str | None: ...
 
     def node_names(self) -> list[str]: ...
-    def to_bytes(self, format: str, *, version: str | None = ...) -> bytes: ...
+    def to_bytes(
+        self,
+        format: str,
+        *,
+        version: str | None = ...,
+        flatten: bool = ...,
+    ) -> bytes: ...
     def save(
         self,
         path: str,
         format: str | None = None,
         *,
         version: str | None = ...,
+        flatten: bool = ...,
     ) -> None: ...
     def to_json(self) -> str: ...
+    def merged_mesh(self) -> MeshBuffer:
+        """The whole scene as one merged :class:`MeshBuffer`.
+
+        Every node transform is baked into the coordinates and an instanced
+        part appears once per placement, so the result is a single triangle
+        soup that shows the same picture as the scene graph.
+        """
 
 
 def open(
@@ -42,6 +56,7 @@ def open(
     *,
     layer_filter: str | None = ...,
     all_layers: bool = ...,
+    flatten: bool = ...,
 ) -> Model:
     """Read a CAD file into a :class:`Model`.
 
@@ -53,6 +68,26 @@ def open(
     meshes of every part that is not on one of its layers. *all_layers* keeps
     every part and ignores the filters of the file. Both keywords only apply to
     JT files.
+
+    *flatten* collapses what was read into a single mesh: the transforms of the
+    scene graph are baked into the coordinates and an instantiated part is
+    copied once per placement, so every later export writes one big mesh.
+    """
+
+
+def read_mesh(
+    path: str,
+    *,
+    layer_filter: str | None = ...,
+    all_layers: bool = ...,
+) -> MeshBuffer:
+    """Read a CAD file and return its single merged mesh as raw buffers.
+
+    This is the flattened form of :func:`open` without the scene graph: the
+    vertex, normal and index arrays of the merge, which ``numpy.asarray`` wraps
+    without a copy. The level of detail and layer selection is the default one —
+    the finest tier and the active layer filter — unless *layer_filter* or
+    *all_layers* say otherwise.
     """
 
 
@@ -88,6 +123,7 @@ class JtFile:
         *,
         layer_filter: str | None = ...,
         all_layers: bool = ...,
+        flatten: bool = ...,
     ) -> bool: ...
     def write_gltf(
         self,
@@ -95,6 +131,7 @@ class JtFile:
         *,
         layer_filter: str | None = ...,
         all_layers: bool = ...,
+        flatten: bool = ...,
     ) -> bool: ...
     def write_jt(
         self,
@@ -105,9 +142,14 @@ class JtFile:
         all_lods: bool = ...,
         compress: bool = ...,
         version: str | None = ...,
+        flatten: bool = ...,
     ) -> bool: ...
     def model(
-        self, *, layer_filter: str | None = ..., all_layers: bool = ...
+        self,
+        *,
+        layer_filter: str | None = ...,
+        all_layers: bool = ...,
+        flatten: bool = ...,
     ) -> Model: ...
     def layer_filters(self) -> list[str]: ...
     def active_layer_filter(self) -> str | None: ...
@@ -265,6 +307,81 @@ class JtArray:
     def name(self) -> str: ...
     @property
     def mesh_id(self) -> int: ...
+    @property
+    def ndim(self) -> int: ...
+    @property
+    def shape(self) -> list[int]: ...
+    @property
+    def itemsize(self) -> int: ...
+    @property
+    def format(self) -> str: ...
+
+    def __len__(self) -> int:
+        """Number of rows: indices for the index channel, points for the others."""
+
+
+class MeshBuffer:
+    """The single mesh a whole file merges into, as raw arrays.
+
+    Built by :func:`read_mesh`, :meth:`Model.merged_mesh` or any ``flatten=True``
+    export. The transforms of the scene graph are already baked into the
+    coordinates, so an instantiated part sits at each of its placements. The
+    channels are handed out as :class:`MeshArray` objects, which ``numpy`` wraps
+    without a copy.
+    """
+
+    @property
+    def vertex_count(self) -> int: ...
+    @property
+    def index_count(self) -> int: ...
+    @property
+    def triangle_count(self) -> int: ...
+    @property
+    def has_normals(self) -> bool: ...
+    @property
+    def group_count(self) -> int: ...
+    @property
+    def material_names(self) -> list[str | None]: ...
+    @property
+    def bounds(self) -> tuple[float, ...] | None: ...
+    @property
+    def vertices(self) -> MeshArray:
+        """``(n, 3)`` ``float32`` world-space positions."""
+
+    @property
+    def normals(self) -> MeshArray:
+        """``(n, 3)`` ``float32`` unit normals; empty when the file had none."""
+
+    @property
+    def indices(self) -> MeshArray:
+        """``(m,)`` ``int32`` triangle corners, three per triangle."""
+
+    def groups(self) -> list[dict[str, object]]:
+        """The material runs of the merge, in order.
+
+        Each dict carries ``"material"`` (a name or ``None``), ``"color"``
+        (an RGBA tuple), ``"metallic"``, ``"roughness"``, ``"emissive"`` (an
+        RGB tuple), ``"vertices"`` and ``"triangles"``. Consecutive placements
+        that share a colour are one run, and the runs add up to the whole mesh.
+        """
+
+    def array(self, name: str) -> MeshArray:
+        """One channel: ``"indices"``, ``"vertices"`` or ``"normals"``."""
+
+    def arrays(self) -> dict[str, MeshArray]:
+        """All three channels, keyed by name."""
+
+
+class MeshArray:
+    """One channel of a merged mesh, exposed through the buffer protocol.
+
+    ``memoryview`` and ``numpy.asarray`` wrap it **without a copy**: the view
+    points straight at the merged arrays and keeps the :class:`MeshBuffer` that
+    owns them alive. The view is read-only.
+    """
+
+    @property
+    def name(self) -> str: ...
     @property
     def ndim(self) -> int: ...
     @property

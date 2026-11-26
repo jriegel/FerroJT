@@ -48,6 +48,7 @@ is how a glTF file becomes a `.jt` one. See [jt-writer.md](jt-writer.md),
 | `Accessors` | `model/geometry.rs` | The two tables above plus `push_buffer` / `push_attribute` / `attribute` / `attribute_bytes`. |
 | `Material` / `Channel` / `Texture` | `model/material.rs` | A small metallic/roughness model that maps cleanly onto both glTF and USD. |
 | `Aabb` | `model/bounds.rs` | Axis aligned bounds. |
+| `Flattened` / `FlatGroup` | `model/flatten.rs` | The whole model as one merged mesh: `Model::flattened()` for a model the writers can consume, `Model::flatten()` for the arrays themselves. |
 
 Design rules:
 
@@ -58,6 +59,43 @@ Design rules:
   `BufferBlock` and describes them with an `Attribute`; exporters reinterpret or
   widen on demand.
 * `crates/ferrojt` is `#![forbid(unsafe_code)]` and has no `unsafe` blocks.
+
+### Flatten
+
+`model/flatten.rs` is the one place that merges geometry, and it is a transform
+of the model rather than a writer — which is why the merged mesh is available on
+every export path at once:
+
+* `Model::flattened() -> Model` — one node holding one mesh, in the same frame
+  and units as the model it came from.
+* `Model::flatten() -> Flattened` — the merged `vertices`, `normals` and
+  `indices` plus `groups`, the runs of same-shaded triangles with their vertex
+  and triangle counts. `Flattened::to_model` is what `flattened()` builds on.
+
+The walk composes the transform of every node down to the geometry, so a JT
+matrix (column major, `T·R·S`) reaches the coordinates exactly as it does in the
+viewer. An instanced subtree is emitted once per placement: the plate samples
+store one screw and place it twice, so a flattened plate holds two screws. A node
+reached through itself is a cycle and stops the walk, while a node reached from
+two parents is emitted twice — that second case is the duplication an instance
+needs. Only triangle lists are merged, and a slot the index list names past the
+coordinate array pads zeros, as the reader already does, so the triangle count of
+the file survives.
+
+A vertex keeps the normal of the file; a primitive without normals gets flat ones
+computed from its triangles, because one merged mesh cannot mix a mesh with
+normals and a mesh without. Materials are not deduplicated globally — each
+contiguous run of one shading is a group, which is what lets a single glTF mesh
+carry the colours of a file as several primitives, and what lets USD bind a
+material per primitive instead of per mesh.
+
+Two consequences of writing the merged mesh as **JT** are worth knowing. A JT
+shape node carries exactly one material, so a flattened JT file keeps the colour
+of the first group only — glTF and USD keep them all. And the encoder welds
+coincident positions, so two parts that touch (the screw of the plate sits on the
+plate) stop being a closed two-manifold once they are one mesh; the writer then
+falls back to the JT 8.x representation on its own, unless a 9.x/10.x revision was
+asked for, which is refused with an explicit error.
 
 ## Codecs
 
@@ -125,7 +163,9 @@ says what can be read. The CLI and the Python bindings call only those.
   length is the **padded** length, not the payload length.
 * `export/usd.rs` writes an ASCII `.usda` layer by hand: every mesh is authored
   once in an invisible geometry library and referenced by its consumers, and
-  materials are collapsed by shading value. See [usd-writer.md](usd-writer.md).
+  materials are collapsed by shading value. A mesh whose primitives disagree about
+  their material — always the case for a flattened model — binds the material per
+  `def Mesh` instead of per library group. See [usd-writer.md](usd-writer.md).
 * `Format::Jt` is writable but deliberately bypasses the `Exporter` trait: the
   trait has no place for the revision to write at, so `to_format` special-cases
   it into `jt::model_to_bytes`. See [jt-from-model.md](jt-from-model.md).

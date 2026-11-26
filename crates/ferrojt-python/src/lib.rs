@@ -14,11 +14,14 @@ use pyo3::exceptions::{PyNotImplementedError, PyOSError, PyRuntimeError, PyValue
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+mod array;
 mod build;
 mod lsg;
+mod mesh;
 
 use build::Builder;
 use lsg::Lsg;
+use mesh::{MeshArray, MeshBuffer};
 
 /// Convert a FerroJT error into a Python exception.
 ///
@@ -48,29 +51,65 @@ pub(crate) fn py_err(err: ferrojt::Error) -> PyErr {
 /// to JT, where `layer_filter` selects one of the named layer filters the file
 /// declares and leaving it out applies the filter the file marks as active;
 /// `all_layers` exports every part and ignores the filters of the file.
+///
+/// `flatten` merges every mesh of the file into one: the transforms of the
+/// scene graph are baked into the vertex coordinates and an instantiated part
+/// is repeated once per placement, so the result is a single mesh with one
+/// material group per colour. See [`Model::merged_mesh`] for the raw arrays.
 #[pyfunction]
-#[pyo3(signature = (path, *, layer_filter = None, all_layers = false))]
-fn open(path: &str, layer_filter: Option<&str>, all_layers: bool) -> PyResult<Model> {
+#[pyo3(signature = (path, *, layer_filter = None, all_layers = false, flatten = false))]
+fn open(
+    path: &str,
+    layer_filter: Option<&str>,
+    all_layers: bool,
+    flatten: bool,
+) -> PyResult<Model> {
     let format = ferrojt::Format::detect(path);
     if !format.is_readable() {
         return Err(PyValueError::new_err(format!(
             "{format} files cannot be read by ferrojt"
         )));
     }
-    if format != ferrojt::Format::Jt {
+    let inner = if format != ferrojt::Format::Jt {
         if layer_filter.is_some() || all_layers {
             return Err(PyValueError::new_err(
                 "layer_filter and all_layers only apply to JT files",
             ));
         }
-        return Ok(Model {
-            inner: ferrojt::open_format(format, path).map_err(py_err)?,
-        });
-    }
-    let file = ferrojt::jt::JtFile::open(path).map_err(py_err)?;
+        ferrojt::open_format(format, path).map_err(py_err)?
+    } else {
+        let file = ferrojt::jt::JtFile::open(path).map_err(py_err)?;
+        build_model(&file, layer_filter, all_layers)?
+    };
     Ok(Model {
-        inner: build_model(&file, layer_filter, all_layers)?,
+        inner: if flatten { inner.flattened() } else { inner },
     })
+}
+
+/// Open a CAD file and return its geometry as one merged mesh of raw arrays.
+///
+/// The whole file becomes a single mesh: every placement of every shape is
+/// baked into the coordinates, so an instanced part appears once per
+/// placement. The arrays are handed to NumPy without a copy, which is what
+/// makes a merged server assembly usable straight from Python:
+///
+/// ```python
+/// import ferrojt, numpy
+///
+/// mesh = ferrojt.read_mesh("gear.jt")
+/// numpy.asarray(mesh.vertices)   # (n, 3) float32 in world space
+/// numpy.asarray(mesh.indices)    # (m,) int32, three per triangle
+/// ```
+///
+/// The layer keywords follow [`open`].
+#[pyfunction]
+#[pyo3(signature = (path, *, layer_filter = None, all_layers = false))]
+fn read_mesh(path: &str, layer_filter: Option<&str>, all_layers: bool) -> PyResult<MeshBuffer> {
+    let model = open(path, layer_filter, all_layers, false)?;
+    Ok(MeshBuffer::new(
+        model.inner.flatten(),
+        &model.inner.materials,
+    ))
 }
 
 /// Return the container format detected for `path`.
@@ -92,6 +131,17 @@ fn jt_version(text: Option<&str>) -> PyResult<Option<ferrojt::jt::JtVersion>> {
             .map(Some)
             .map_err(py_err),
     }
+}
+
+/// The model to export: itself, or the merged single mesh `flatten` asked for.
+///
+/// The merged model is owned by the caller for the length of the call, so this
+/// only picks which of the two to hand to the writers — nothing is copied.
+fn model_or<'a>(
+    model: &'a ferrojt::Model,
+    merged: Option<&'a ferrojt::Model>,
+) -> &'a ferrojt::Model {
+    merged.unwrap_or(model)
 }
 
 /// Serialize `model` to `format`, honouring the JT revision `version`.
@@ -184,24 +234,43 @@ impl Model {
     /// a closed two-manifold, in which case the file falls back to JT 8.1 — the
     /// only revision that can hold such a shape. Naming a revision suppresses
     /// that fallback and raises `ValueError` instead.
-    #[pyo3(signature = (format, *, version = None))]
-    fn to_bytes(&self, format: &str, version: Option<&str>) -> PyResult<Py<PyBytes>> {
+    ///
+    /// `flatten` exports the model as its single merged mesh instead of its
+    /// scene graph; see [`Model::merged_mesh`] for what that means and note
+    /// that a JT shape node carries exactly one material, so a flattened JT
+    /// file keeps the colour of the first material group only.
+    #[pyo3(signature = (format, *, version = None, flatten = false))]
+    fn to_bytes(
+        &self,
+        format: &str,
+        version: Option<&str>,
+        flatten: bool,
+    ) -> PyResult<Py<PyBytes>> {
         let format = format.parse::<ferrojt::Format>().map_err(py_err)?;
-        let bytes = jt_bytes(format, &self.inner, version)?;
+        let merged = flatten.then(|| self.inner.flattened());
+        let bytes = jt_bytes(format, model_or(&self.inner, merged.as_ref()), version)?;
         Python::attach(|py| Ok(PyBytes::new(py, &bytes).unbind()))
     }
 
     /// Serialize the model to `format` and write it to `path`.
     ///
     /// When `format` is omitted it is taken from the extension of `path`.
-    /// `version` is the JT revision to write at, see [`Model::to_bytes`].
+    /// `version` is the JT revision to write at, see [`Model::to_bytes`];
+    /// `flatten` writes the single merged mesh of the model, see
+    /// [`Model::merged_mesh`].
     ///
     /// A JT file names its root partition after `path`; a consumer that builds
     /// its own scene graph keys the root node on that name, so it is not
     /// decoration. [`Model::to_bytes`] cannot know a destination and names the
     /// root after the file the model was read from instead.
-    #[pyo3(signature = (path, format = None, *, version = None))]
-    fn save(&self, path: &str, format: Option<&str>, version: Option<&str>) -> PyResult<()> {
+    #[pyo3(signature = (path, format = None, *, version = None, flatten = false))]
+    fn save(
+        &self,
+        path: &str,
+        format: Option<&str>,
+        version: Option<&str>,
+        flatten: bool,
+    ) -> PyResult<()> {
         let format = match format {
             Some(f) => f.parse::<ferrojt::Format>().map_err(py_err)?,
             None => ferrojt::Format::detect(path),
@@ -211,14 +280,27 @@ impl Model {
                 "version only applies to the JT format",
             ));
         }
+        let merged = flatten.then(|| self.inner.flattened());
+        let model = model_or(&self.inner, merged.as_ref());
         if format == ferrojt::Format::Jt {
-            return ferrojt::jt::model_to_file(&self.inner, Path::new(path), jt_version(version)?)
+            return ferrojt::jt::model_to_file(model, Path::new(path), jt_version(version)?)
                 .map_err(py_err);
         }
-        let bytes = ferrojt::export::to_format(format, &self.inner).map_err(py_err)?;
+        let bytes = ferrojt::export::to_format(format, model).map_err(py_err)?;
         std::fs::write(path, bytes)
             .map_err(ferrojt::Error::from)
             .map_err(py_err)
+    }
+
+    /// The whole model as one merged mesh of raw arrays.
+    ///
+    /// Every mesh of the model is copied into one coordinate array with the
+    /// transforms of the scene graph already applied, so a part the file
+    /// instantiates twice appears twice. The colours survive as one material
+    /// group per run of the merge. The arrays are the very buffers of the
+    /// result: `numpy.asarray` wraps them without a copy and keeps them alive.
+    fn merged_mesh(&self) -> MeshBuffer {
+        MeshBuffer::new(self.inner.flatten(), &self.inner.materials)
     }
 
     /// A JSON summary of the model, useful for debugging.
@@ -396,36 +478,44 @@ impl JtFile {
     /// Like the C++ extension, `path` is a name without an extension: `.gltf`
     /// is appended unless the name already ends in `.gltf` or `.glb`.
     ///
-    /// `layer_filter` and `all_layers` follow [`JtFile::model`].
-    #[pyo3(name = "writeGlTf", signature = (path, *, layer_filter = None, all_layers = false))]
+    /// `layer_filter` and `all_layers` follow [`JtFile::model`]; `flatten`
+    /// writes the single merged mesh of the file instead of its scene graph,
+    /// so the colours of the file become one material group each.
+    #[pyo3(name = "writeGlTf", signature = (path, *, layer_filter = None, all_layers = false,
+                                           flatten = false))]
     fn write_gl_tf(
         &self,
         py: Python<'_>,
         path: &str,
         layer_filter: Option<&str>,
         all_layers: bool,
+        flatten: bool,
     ) -> PyResult<bool> {
         let Some(file) = self.parsed() else {
             return Ok(false);
         };
         let target = gltf_target(path);
-        let model = build_model(file, layer_filter, all_layers)?;
+        let inner = build_model(file, layer_filter, all_layers)?;
+        let merged = flatten.then(|| inner.flattened());
+        let model = model_or(&inner, merged.as_ref());
         let format = ferrojt::Format::detect(&target);
-        py.detach(|| ferrojt::export::write_to_file(format, &model, &target))
+        py.detach(|| ferrojt::export::write_to_file(format, model, &target))
             .map_err(py_err)?;
         Ok(true)
     }
 
     /// Snake case alias of [`JtFile::write_gl_tf`].
-    #[pyo3(name = "write_gltf", signature = (path, *, layer_filter = None, all_layers = false))]
+    #[pyo3(name = "write_gltf", signature = (path, *, layer_filter = None, all_layers = false,
+                                            flatten = false))]
     fn write_gltf(
         &self,
         py: Python<'_>,
         path: &str,
         layer_filter: Option<&str>,
         all_layers: bool,
+        flatten: bool,
     ) -> PyResult<bool> {
-        self.write_gl_tf(py, path, layer_filter, all_layers)
+        self.write_gl_tf(py, path, layer_filter, all_layers, flatten)
     }
 
     /// Write the file back out as JT and return `True`, or `False` while the
@@ -445,8 +535,16 @@ impl JtFile {
     /// revision change re-encodes every shape, which a mesh that is not a closed
     /// two-manifold does not survive. Such a rewrite raises `ValueError` rather
     /// than writing a file whose shapes come back empty.
+    ///
+    /// `flatten` writes the file as its single merged mesh instead of rewriting
+    /// it. That is a different writer: the result is built from the merged model,
+    /// so the segments the source carries (PMI, B-rep, meta data) are not copied,
+    /// `compress` does not apply, and only the colour of the first material
+    /// group survives, because a JT shape node holds exactly one material. The
+    /// merge itself keeps the finest level of detail the layer filter leaves.
     #[pyo3(signature = (path, *, layer_filter = None, all_layers = false, all_lods = false,
-                        compress = true, version = None))]
+                        compress = true, version = None, flatten = false))]
+    #[allow(clippy::too_many_arguments)]
     fn write_jt(
         &self,
         path: &str,
@@ -455,6 +553,7 @@ impl JtFile {
         all_lods: bool,
         compress: bool,
         version: Option<&str>,
+        flatten: bool,
     ) -> PyResult<bool> {
         let Some(file) = self.parsed() else {
             return Ok(false);
@@ -464,20 +563,21 @@ impl JtFile {
                 "layer_filter and all_layers cannot be combined",
             ));
         }
+        let target = Path::new(path);
+        let revision = jt_version(version)?;
+        if flatten {
+            let model = build_model(file, layer_filter, all_layers)?.flattened();
+            Python::attach(|py| py.detach(|| ferrojt::jt::model_to_file(&model, target, revision)))
+                .map_err(py_err)?;
+            return Ok(true);
+        }
         let options = ferrojt::jt::WriteOptions {
             all_lods,
             no_layer_filter: all_layers,
             layer_filter: layer_filter.map(str::to_string),
             compress,
-            version: match version {
-                Some(text) => Some(
-                    text.parse::<ferrojt::jt::JtVersion>()
-                        .map_err(|err| PyValueError::new_err(err.to_string()))?,
-                ),
-                None => None,
-            },
+            version: revision,
         };
-        let target = Path::new(path);
         Python::attach(|py| py.detach(|| ferrojt::jt::write_to_file(file, target, &options)))
             .map_err(py_err)?;
         Ok(true)
@@ -491,17 +591,27 @@ impl JtFile {
     /// [`JtFile::layer_filters`]. Leaving it out applies the filter the file
     /// marks as active, and `all_layers=True` keeps every part.
     ///
+    /// `flatten` merges every mesh of the file into one, baking the transforms
+    /// of the scene graph into the coordinates and repeating an instantiated
+    /// part once per placement; see [`Model::merged_mesh`].
+    ///
     /// Raises `RuntimeError` while the file is closed.
-    #[pyo3(signature = (*, layer_filter = None, all_layers = false))]
-    fn model(&self, layer_filter: Option<&str>, all_layers: bool) -> PyResult<Model> {
+    #[pyo3(signature = (*, layer_filter = None, all_layers = false, flatten = false))]
+    fn model(
+        &self,
+        layer_filter: Option<&str>,
+        all_layers: bool,
+        flatten: bool,
+    ) -> PyResult<Model> {
         let Some(file) = self.parsed() else {
             return Err(PyRuntimeError::new_err(format!(
                 "{} is not open",
                 self.file_name
             )));
         };
+        let inner = build_model(file, layer_filter, all_layers)?;
         Ok(Model {
-            inner: build_model(file, layer_filter, all_layers)?,
+            inner: if flatten { inner.flattened() } else { inner },
         })
     }
 
@@ -581,9 +691,12 @@ fn build_model(
 #[pymodule]
 fn _ferrojt(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(pyo3::wrap_pyfunction!(open, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(read_mesh, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(detect_format, module)?)?;
     module.add_class::<Model>()?;
     module.add_class::<JtFile>()?;
+    module.add_class::<MeshBuffer>()?;
+    module.add_class::<MeshArray>()?;
     module.add_class::<Lsg>()?;
     module.add_class::<lsg::JtNode>()?;
     module.add_class::<lsg::JtMesh>()?;

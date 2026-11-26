@@ -216,6 +216,12 @@ so a written file carries as many material attributes as it has shapes while
 sample's 23 source materials collapse to 20 because the source repeats three
 colour sets across its 106 shapes.
 
+A **flattened** model is the other end of that: one merged shape holds the whole
+file as one JT shape, and a JT shape carries one material attribute, so the shape
+takes the material of the first primitive of the merged mesh and the other colour
+groups of the file are not written. Use glTF or USD when a flattened export has
+to keep every colour.
+
 ## Entry points
 
 | Layer | Call | Root partition named after |

@@ -40,6 +40,13 @@ banner is reused verbatim and the segments are copied from there.
 | `jt::JtVersion` | The revision to write: `8.0`, `8.1`, `9.5`, `10.3`; parses from `"9"` or `"10.3"`. |
 | `ferrojt write in.jt -o out.jt` | The CLI: writes, re-reads the result and reports both counts. `--jt-version 10.3` picks the revision. |
 
+`ferrojt write --flatten` is **not** this writer. A merged mesh has no scene
+graph left to re-serialise and no source segments to copy, so it goes through
+[`jt::model_to_file`](jt-from-model.md) — the export writer — with the model of
+the file merged by [`Model::flattened()`](architecture.md). That is why
+`--compress` and `--all-lods` do not apply to it and why its shapes can end up on
+JT 8.x through the two-manifold fallback.
+
 ## Choosing the revision
 
 `version` is `None` by default, which keeps the revision of the source — that is
