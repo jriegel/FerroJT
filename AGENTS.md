@@ -12,7 +12,7 @@ file back out as JT. Read this before changing code; the design detail lives in
 | `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `import/` the glTF/GLB reader (`gltf.rs`), `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `jt/version.rs` the `JtVersion` a file is read or written at, `jt/encode.rs` the topological (dual vertex-face) encoder, `jt/hash.rs` the Jenkins lookup2 hashes a strict consumer verifies, `jt/write.rs` the JT writer, `jt/build.rs` the builder that creates a file from nothing, `jt/from_model.rs` (private) the writer that turns a neutral `Model` into a file, `model/flatten.rs` the merge of a whole file into one mesh, and `export/` glTF/GLB writer and the ASCII USD writer. |
 | `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `write`, `ls`. |
 | `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `lib.rs` is the export view (`Model`) plus `lsg.rs` the file view (`JtLsg`/`JtNode`/`JtMesh`/`JtArray`) and `build.rs` the builder (`JtBuilder`/`NodeHandle`/`MeshHandle`/`MeshData`/`MaterialData`), `mesh.rs` the merged-mesh buffer of `Model::merged_mesh`/`ferrojt.read_mesh` and `array.rs` the buffer plumbing `JtArray` and that buffer share; `pyproject.toml` + `python/ferrojt/` + `tests/`. |
-| `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `details.rs` key/value pane for the selected row, `backdrop.rs` viewport gradient, `lighting.rs` camera-relative lamp rig, `camera.rs` `Camera3d` wrapper that places the backdrop and turns the lamps, `picking.rs`, `trihedron.rs`. |
+| `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `details.rs` key/value pane for the selected row, `backdrop.rs` viewport gradient, `lighting.rs` camera-relative lamp rig, `camera.rs` `Camera3d` wrapper that places the backdrop and turns the lamps plus `CameraPose`, the textual form of a view, `cli.rs` the command line (`--camera`), `picking.rs`, `trihedron.rs`. |
 | `python/ferrojt/` | Pure-Python package re-exporting `_ferrojt` (`__init__.py`, `_ferrojt.pyi`, `py.typed`). |
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
 | `data/Reference/` | Reference JSON dumps from the JT tooling **and** reference PNG pictures — **the oracle**. |
@@ -111,7 +111,11 @@ Rust viewer (native window, no Python):
 
 ```powershell
 cargo run -p ferrojt-viewer -- data\ExampleFiles\example_block_jt9.5.jt
+# the same, opened on a particular view (the text the toolbar shows):
+cargo run -p ferrojt-viewer -- data\ExampleFiles\example_block_jt9.5.jt --camera "eye 180.00,-120.00,150.00 at 50.00,40.00,30.00"
 ```
+
+`C` in the viewer prints the current view to the terminal in that same form.
 
 Wheels for PyPI: `build-wheel.bat [windows|linux|sdist]` (default all) → `dist/`.
 Upload with `python -m twine upload dist\*`.
@@ -585,6 +589,40 @@ Upload with `python -m twine upload dist\*`.
   collapse. `fps_text` prints `-- fps` until the first window closes. Reserve
   `FPS_RESERVE` (58 pt) in the toolbar's right-to-left strip next to
   `ABOUT_RESERVE`.
+- **The view on screen is text the viewer also accepts (`camera.rs::CameraPose`,
+  `cli.rs`).** The form is `eye 180.00,-120.00,150.00 at 50.00,40.00,30.00` — the
+  two points that fix an orbit camera, in model units, because `look_at(eye, at)`
+  re-derives `yaw`/`pitch`/`dist` exactly and no internal angle has to survive a
+  round trip. `{:.2}` (0.01 mm on a millimetre file) and `-0.00` normalised to
+  `0.00`, so the string a view prints is byte-stable. The parser is forgiving:
+  keys in either order, `=` or `:` instead of a space, and a triple typed with
+  spaces arrives as several whitespace tokens — keep consuming words until **two
+  commas** are in hand, trimming both edges of each token. The option is
+  `-c`/`--camera VALUE` (also `--camera=VALUE`); a bad value is
+  `ferrojt-viewer: --camera: "…" is not a coordinate triple of numbers` plus the
+  usage, exit 2. Apply the pose **after** `app.load(...)`, which ends by calling
+  `fit`, and `fit` replaces the camera outright — so `F`, `View All` and an
+  outliner-width change deliberately override it. `set_up_axis` re-runs
+  `look_at`, so the file's up axis must be set first (which `load()` does).
+  `Key::C` prints the same string to **stdout**, not the clipboard: kiss3d 0.47
+  pulls in no `egui-winit` and never executes egui's `FullOutput.commands`, so a
+  `CopyText` action would silently do nothing (same reason About uses
+  `webbrowser::open`). The loop refreshes the text through
+  `camera_readout(model_open, camera.inner())` **after** `render_3d`, which has
+  already run this frame's `Camera3d::update`, so during a drag the text follows
+  the pointer; it is empty while no file is open. The readout gets **its own
+  toolbar row**: `TOOLBAR` (34) + `CAMERA_ROW` (19) = `BAR`, and `outliner_rect`
+  and `Viewport::of` must both use `BAR`. On one row a reserved slot truncated
+  the 40 characters anyway (a small monospace glyph measures ~5.8 pt here, so
+  the pose needs ~232 pt) *and* starved the level-of-detail and file labels.
+  Proof, deterministic: `target\cla_viewer_shot.py --viewer-args '--camera "…"'
+  --tag X` on the same pose twice gives **0 px changed**, 183 577 px against the
+  fitted view and 125 191 px against a different pose. Do **not** try to prove a
+  live drag by OS input injection: `SetForegroundWindow` from this shell's process
+  is refused and `SendInput` (which needs `sizeof(INPUT) == 40` on x64) lands on
+  the wrong desktop — the tracking is pinned in tests instead
+  (`camera.rs::the_readout_follows_a_move_of_the_camera`,
+  `main.rs::the_camera_line_tracks_the_camera_once_a_file_is_open`).
 - **A newly opened file opens only the top levels of the outliner**
   (`TREE_OPEN_LEVEL = 1` → `ViewerScene::collapse_below`). A server assembly has
   thousands of rows and twenty levels, so expanding everything shows nothing but a

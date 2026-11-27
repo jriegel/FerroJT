@@ -13,6 +13,7 @@
 
 mod backdrop;
 mod camera;
+mod cli;
 mod details;
 mod lighting;
 mod lod;
@@ -40,8 +41,20 @@ use kiss3d::window::Window;
 use crate::camera::ViewerCamera;
 use crate::scene::ViewerScene;
 
-/// Height of the toolbar strip, in logical points.
+/// Height of the toolbar's button row, in logical points.
 const TOOLBAR: f32 = 34.0;
+
+/// Height of the toolbar's second row, which carries the camera readout.
+///
+/// The pose of the view is forty characters wide, and the bar is only so wide:
+/// squeezed onto the button row it competes with the buttons, the level-of-detail
+/// readout and the file summary, and one of them is truncated away — usually the
+/// numbers, which are the only part that can be handed back to the viewer. On a
+/// row of its own the whole string always fits.
+const CAMERA_ROW: f32 = 19.0;
+
+/// Total height of the toolbar strip: the button row and the camera row.
+const BAR: f32 = TOOLBAR + CAMERA_ROW;
 
 /// Gap left around the floating toolbar, in logical points.
 ///
@@ -165,6 +178,10 @@ struct App {
     /// Level-of-detail summary shown next to the toggle: what is on screen and
     /// what the file would allow.
     lod_status: String,
+    /// The view on screen in [`camera::CameraPose`] text form, recomputed every
+    /// frame and shown in the toolbar, so a view someone is looking at can be
+    /// read off the bar and reopened with `--camera`.
+    camera_text: String,
     /// `true` while the toolbar shows the level-of-detail toggle. A file with a
     /// single tier per part has nothing to switch, so the control is left out.
     show_lod: bool,
@@ -192,13 +209,14 @@ impl Default for App {
             up: Vec3::Z,
             status: String::from("Drag and drop a .jt file, or press Open."),
             lod_status: String::new(),
+            camera_text: String::new(),
             show_lod: false,
             tree_width: tree::DEFAULT_WIDTH,
             details_height: details::DEFAULT_HEIGHT,
             fps: FpsMeter::default(),
             viewport: Viewport {
                 left: tree::DEFAULT_WIDTH,
-                top: TOOLBAR + MARGIN,
+                top: BAR + MARGIN,
                 width: 480.0,
                 height: 566.0,
                 win_w: 800.0,
@@ -488,9 +506,9 @@ impl Viewport {
         let win_h = size.y as f32 / ppp;
         Self {
             left: tree_width,
-            top: TOOLBAR + MARGIN,
+            top: BAR + MARGIN,
             width: (win_w - tree_width).max(1.0),
-            height: (win_h - TOOLBAR - MARGIN).max(1.0),
+            height: (win_h - BAR - MARGIN).max(1.0),
             win_w,
             win_h,
         }
@@ -502,6 +520,20 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    // Read the command line before any window exists, so `--help` and a bad
+    // camera string never open one.
+    let options = match cli::parse(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("ferrojt-viewer: {error}\n\n{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    };
+    if options.help {
+        println!("{}", cli::USAGE);
+        return;
+    }
 
     let mut window = Window::new("FerroJT Viewer").await;
     window.set_background_color(Color::new(0.13, 0.14, 0.16, 1.0));
@@ -533,8 +565,21 @@ async fn main() {
         viewport: Viewport::of(&window, tree::DEFAULT_WIDTH),
         ..App::default()
     };
-    if let Some(arg) = std::env::args().nth(1) {
-        app.load(Path::new(&arg), &mut camera);
+    if let Some(path) = &options.path {
+        app.load(path, &mut camera);
+        if let Some(pose) = options.camera {
+            // `load` ends by fitting the model into the frame; a view asked for
+            // on the command line wins over that framing. The up axis is
+            // already the file's, which `look_at` resolves its angles against.
+            pose.apply(camera.inner_mut());
+            app.camera_text = pose.text();
+        }
+    } else if let Some(pose) = options.camera {
+        eprintln!(
+            "ferrojt-viewer: --camera {} ignored, no file was given\n\n{}",
+            pose.text(),
+            cli::USAGE
+        );
     }
 
     while window.render_3d(app.viewer.root_mut(), &mut camera).await {
@@ -543,6 +588,7 @@ async fn main() {
 
         // --- input events -------------------------------------------------
         let mut fit_requested = false;
+        let mut print_camera = false;
         let mut click: Option<Vec2> = None;
         {
             let mut events = window.events();
@@ -562,6 +608,15 @@ async fn main() {
                         if !window.is_egui_capturing_keyboard() =>
                     {
                         fit_requested = true;
+                    }
+                    // The pose of the view on screen goes to stdout, where it
+                    // can be selected and copied: kiss3d 0.47 never executes
+                    // egui's `CopyText` command, so a clipboard action from a
+                    // widget would silently do nothing.
+                    WindowEvent::Key(Key::C, EventAction::Press, _)
+                        if !window.is_egui_capturing_keyboard() =>
+                    {
+                        print_camera = true;
                     }
                     _ => {}
                 }
@@ -590,6 +645,10 @@ async fn main() {
             Vec2::new(size.x as f32, size.y as f32),
         );
         app.refresh_lod_status();
+        // The toolbar shows the view that was just rendered: `render_3d` has
+        // already run this frame's `Camera3d::update`, so during an orbit drag
+        // the text follows the pointer.
+        app.camera_text = camera_readout(app.model.is_some(), camera.inner());
 
         // --- egui: toolbar, outliner, trihedron ---------------------------
         let mut commands = Commands::default();
@@ -599,7 +658,7 @@ async fn main() {
             egui::Window::new("ferrojt.toolbar")
                 .title_bar(false)
                 .fixed_pos(Pos2::new(screen.min.x + MARGIN, screen.min.y + MARGIN))
-                .fixed_size(vec2((screen.width() - 2.0 * MARGIN).max(1.0), TOOLBAR))
+                .fixed_size(vec2((screen.width() - 2.0 * MARGIN).max(1.0), BAR))
                 .movable(false)
                 .resizable(false)
                 .collapsible(false)
@@ -673,6 +732,25 @@ async fn main() {
                                 .on_hover_text("Frames rendered per second by the viewer");
                         });
                     });
+                    // The second row is the camera of the view you are looking
+                    // at, in exactly the text the `--camera` option takes: what
+                    // the bar shows can be handed back to the viewer verbatim,
+                    // and `C` prints the same string to the terminal.
+                    if !app.camera_text.is_empty() {
+                        let pose = app.camera_text.clone();
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                Label::new(RichText::new(&pose).weak().monospace().small())
+                                    .truncate(),
+                            )
+                            .on_hover_text(format!(
+                                "The camera of the view you are looking at.\n\n\
+                                 Press C to print this to the terminal, or start\n\
+                                 the viewer with\n\n  --camera \"{pose}\"\n\n\
+                                 to reopen the view. Keys: C print, F view all."
+                            ));
+                        });
+                    }
                 });
 
             let outliner = outliner_rect(screen, app.tree_width);
@@ -709,6 +787,10 @@ async fn main() {
         });
 
         // --- window actions, now that `draw_ui` has released the window ----
+        if print_camera {
+            // To stdout, so the terminal can select and copy it.
+            println!("{}", app.camera_text);
+        }
         if commands.fit || fit_requested {
             let up = app.up;
             // `fit` replaces the camera outright, so it needs the orbit camera
@@ -744,11 +826,22 @@ fn open_project_page(status: &mut String) {
     }
 }
 
+/// The camera line of the toolbar: the pose of the view while a file is open,
+/// nothing while the window is empty — an orbit camera exists before the first
+/// file does, but its default pose describes no model.
+fn camera_readout(model_open: bool, camera: &OrbitCamera3d) -> String {
+    if model_open {
+        camera::CameraPose::of(camera).text()
+    } else {
+        String::new()
+    }
+}
+
 /// The outliner column: the left edge of the window to the divider, below the
 /// toolbar and its margin, down to the bottom edge.
 fn outliner_rect(screen: Rect, width: f32) -> Rect {
     Rect::from_min_max(
-        Pos2::new(screen.min.x, screen.min.y + TOOLBAR + MARGIN),
+        Pos2::new(screen.min.x, screen.min.y + BAR + MARGIN),
         Pos2::new(screen.min.x + width, screen.max.y),
     )
 }
@@ -907,10 +1000,29 @@ mod tests {
         Rect::from_min_max(Pos2::ZERO, Pos2::new(1000.0, 700.0))
     }
 
+    /// The camera line of the toolbar describes the camera of the frame that was
+    /// just drawn, and there is no line at all before a file was opened: the
+    /// default orbit camera exists then too, but it describes no model.
+    #[test]
+    fn the_camera_line_tracks_the_camera_once_a_file_is_open() {
+        let mut camera = OrbitCamera3d::new_with_frustum(
+            std::f32::consts::FRAC_PI_4,
+            0.25,
+            250.0,
+            Vec3::new(180.0, -120.0, 150.0),
+            Vec3::new(50.0, 40.0, 30.0),
+        );
+        assert!(camera_readout(false, &camera).is_empty());
+        let opened = camera_readout(true, &camera);
+        assert!(opened.starts_with("eye "), "readout: {opened}");
+        camera.set_dist(camera.dist() * 0.5);
+        assert_ne!(camera_readout(true, &camera), opened);
+    }
+
     #[test]
     fn the_outliner_column_starts_below_the_toolbar() {
         let rect = outliner_rect(screen(), 320.0);
-        assert_eq!(rect.min, Pos2::new(0.0, TOOLBAR + MARGIN));
+        assert_eq!(rect.min, Pos2::new(0.0, BAR + MARGIN));
         assert_eq!(rect.max.x, 320.0);
         assert_eq!(rect.max.y, 700.0);
     }

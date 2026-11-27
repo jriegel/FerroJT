@@ -74,10 +74,155 @@ impl ViewerCamera {
         &mut self.orbit
     }
 
+    /// The wrapped camera, read-only: [`CameraPose::of`] reads the view that is
+    /// on screen, which is what the toolbar shows.
+    pub fn inner(&self) -> &OrbitCamera3d {
+        &self.orbit
+    }
+
     /// Point the pan at the middle mouse button, see [`rebind_pan`].
     pub fn rebind_pan(&mut self) {
         rebind_pan(&mut self.orbit);
     }
+}
+
+/// The camera pose in a form a person can read, copy and hand back.
+///
+/// An orbit camera is fully described by where its eye is and what it looks at:
+/// distance, yaw and pitch all follow from the pair, and
+/// [`OrbitCamera3d::look_at`] restores them. The text form is what the toolbar
+/// shows and what the `--camera` command-line option takes, so a view someone
+/// is looking at can be reopened somewhere else exactly:
+///
+/// ```text
+/// eye 12.34,-56.78,90.12 at 1.23,4.56,7.89
+/// ```
+///
+/// Coordinates are model units (JT is millimetres) printed with two decimals,
+/// so a restored pose is within hundredths of a millimetre of the original. The
+/// **up axis is not part of the pose**: it comes from the loaded file, so the
+/// same text means the same view for the same file.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraPose {
+    /// Where the eye is.
+    pub eye: Vec3,
+    /// The point it looks at.
+    pub at: Vec3,
+}
+
+impl CameraPose {
+    /// The pose `camera` holds right now.
+    pub fn of(camera: &OrbitCamera3d) -> Self {
+        Self {
+            eye: camera.eye(),
+            at: camera.at(),
+        }
+    }
+
+    /// The one-line text form, which [`str::parse`] reads back.
+    pub fn text(&self) -> String {
+        format!("eye {} at {}", triple(self.eye), triple(self.at))
+    }
+
+    /// Restore the pose on `camera`.
+    ///
+    /// The up axis has to be the one of the file this pose came from — set it
+    /// first ([`OrbitCamera3d::set_up_axis`]), because `look_at` resolves yaw
+    /// and pitch against it. Kiss3d also clamps the distance into the camera's
+    /// zoom range, which [`crate::fit`] fits to the model, so a pose from the
+    /// same file is never clamped.
+    pub fn apply(&self, camera: &mut OrbitCamera3d) {
+        camera.look_at(self.eye, self.at);
+    }
+}
+
+/// `x,y,z` with two decimals, and a plain `0.00` for a value that rounds to
+/// zero so the text never reads `-0.00`.
+fn triple(v: Vec3) -> String {
+    let part = |a: f32| {
+        if (a * 100.0).round() == 0.0 { 0.0 } else { a }
+    };
+    format!("{:.2},{:.2},{:.2}", part(v.x), part(v.y), part(v.z))
+}
+
+impl std::str::FromStr for CameraPose {
+    type Err = String;
+
+    /// Reads [`Self::text`]: `eye x,y,z at x,y,z`, in either order, with an
+    /// optional `=` or `:` after a key. Keys are case-insensitive.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mut eye: Option<Vec3> = None;
+        let mut at: Option<Vec3> = None;
+        let mut words = text.split_whitespace();
+        while let Some(word) = words.next() {
+            // `eye=1,2,3` and `eye: 1,2,3` both spell the same field.
+            let (key, inline) = match word.split_once(['=', ':']) {
+                Some((key, value)) => (key, Some(value)),
+                None => (word, None),
+            };
+            let slot = match key.to_ascii_lowercase().as_str() {
+                "eye" => &mut eye,
+                "at" => &mut at,
+                other => {
+                    return Err(format!(
+                        "unknown camera field {other:?}; expected \"eye x,y,z at x,y,z\""
+                    ));
+                }
+            };
+            let value = match inline
+                .filter(|value| !value.is_empty())
+                .or_else(|| words.next())
+            {
+                Some(value) => value,
+                None => return Err(format!("camera field {key:?} has no value")),
+            };
+            // A triple typed with spaces after the commas arrives as several
+            // words, so keep taking words until the commas add up to a triple.
+            let mut value = value.to_string();
+            while value.matches(',').count() < 2 {
+                match words.next() {
+                    Some(next) => {
+                        let next = next.trim_matches(',');
+                        if !value.ends_with(',') {
+                            value.push(',');
+                        }
+                        value.push_str(next);
+                    }
+                    None => break,
+                }
+            }
+            *slot = Some(triple_of(&value)?);
+        }
+        let (Some(eye), Some(at)) = (eye, at) else {
+            return Err(format!(
+                "expected an eye and an at: \"eye x,y,z at x,y,z\", not {text:?}"
+            ));
+        };
+        if eye == at {
+            return Err("the eye and the point it looks at are the same".to_string());
+        }
+        Ok(Self { eye, at })
+    }
+}
+
+/// Three comma-separated finite numbers.
+fn triple_of(text: &str) -> Result<Vec3, String> {
+    let parts: Vec<f32> = text
+        .split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<f32>()
+                .map_err(|_| format!("{text:?} is not a coordinate triple of numbers"))
+        })
+        .collect::<Result<_, _>>()?;
+    let [x, y, z] = parts.as_slice() else {
+        return Err(format!("{text:?} is not a coordinate triple of numbers"));
+    };
+    let v = Vec3::new(*x, *y, *z);
+    if !v.is_finite() {
+        return Err(format!("{text:?} is not a finite coordinate triple"));
+    }
+    Ok(v)
 }
 
 /// Move the built-in pan from the right to the **middle** mouse button.
@@ -248,5 +393,106 @@ mod tests {
         camera.rebind_pan();
         assert_eq!(camera.drag_button(), Some(MouseButton::Button3));
         assert_eq!(camera.rotate_button(), Some(MouseButton::Button1));
+    }
+
+    /// The text in the toolbar is the whole point of [`CameraPose`]: it has to
+    /// say exactly what the camera is doing, and the same text has to put the
+    /// camera back there.
+    #[test]
+    fn the_pose_text_describes_the_camera_it_came_from() {
+        let camera = orbit();
+        let pose = CameraPose::of(&camera);
+        assert_eq!(pose.eye, Vec3::new(3.0, -4.0, 5.0));
+        assert_eq!(pose.at, Vec3::new(1.0, 1.0, 2.0));
+        assert_eq!(pose.text(), "eye 3.00,-4.00,5.00 at 1.00,1.00,2.00");
+        assert_eq!(pose.text().parse::<CameraPose>().expect("reads back"), pose);
+    }
+
+    /// A quoted view is only useful if applying it to another camera of the same
+    /// file gives the same view — distance, yaw and pitch included.
+    #[test]
+    fn a_quoted_view_reopens_the_same_view() {
+        let source = orbit();
+        let text = CameraPose::of(&source).text();
+        let mut other = OrbitCamera3d::new_with_frustum(
+            std::f32::consts::FRAC_PI_4,
+            0.25,
+            250.0,
+            Vec3::new(-7.0, 2.0, -9.0),
+            Vec3::new(20.0, 20.0, 20.0),
+        );
+        text.parse::<CameraPose>()
+            .expect("parsed")
+            .apply(&mut other);
+        assert_eq!(other.eye(), source.eye());
+        assert_eq!(other.at(), source.at());
+        assert_eq!(other.dist(), source.dist());
+        assert_eq!(other.yaw(), source.yaw());
+        assert_eq!(other.pitch(), source.pitch());
+    }
+
+    /// Someone reads the text off a screen and types it back, so the parser has
+    /// to take what a person plausibly writes — and refuse what is not a view.
+    #[test]
+    fn the_parser_takes_what_a_person_writes() {
+        for text in [
+            "eye 1,2,3 at 4,5,6",
+            "  EYE 1, 2, 3 AT 4,5,6 ",
+            "at 4,5,6 eye 1,2,3",
+            "eye=1,2,3 at:4,5,6",
+        ] {
+            let pose = text.parse::<CameraPose>().expect(text);
+            assert_eq!(pose.eye, Vec3::new(1.0, 2.0, 3.0), "{text}");
+            assert_eq!(pose.at, Vec3::new(4.0, 5.0, 6.0), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_text_that_is_not_a_view_is_refused() {
+        for text in [
+            "",
+            "eye 1,2,3",
+            "1,2,3 4,5,6",
+            "eye 1,2 at 4,5,6",
+            "eye 1,2,3 at 1,2,3",
+            "eye 1,2,3 nose 4,5,6",
+            "eye x,y,z at 1,2,3",
+        ] {
+            assert!(text.parse::<CameraPose>().is_err(), "{text:?} parsed");
+        }
+    }
+
+    /// A pose read from one camera, printed and read back, must not drift: the
+    /// toolbar text is what gets quoted, and rounding it twice would walk away
+    /// from the view it describes.
+    #[test]
+    fn printing_a_pose_does_not_move_it() {
+        let mut camera = orbit();
+        let first = CameraPose::of(&camera);
+        let text = first.text();
+        text.parse::<CameraPose>()
+            .expect("parsed")
+            .apply(&mut camera);
+        assert_eq!(CameraPose::of(&camera).text(), text);
+    }
+
+    /// The bar is recomputed from the camera every frame, so what it says has to
+    /// describe the camera after a manual orbit, not the pose the file opened on.
+    #[test]
+    fn the_readout_follows_a_move_of_the_camera() {
+        let mut camera = orbit();
+        let before = CameraPose::of(&camera).text();
+        camera.set_yaw(camera.yaw() + 0.6);
+        camera.set_dist(camera.dist() * 0.5);
+        let after = CameraPose::of(&camera).text();
+        assert_ne!(before, after, "the text must change with the camera");
+        // And the new text still describes the camera it came from, so what is
+        // on screen can be handed back to the viewer verbatim.
+        let mut reopened = orbit();
+        after
+            .parse::<CameraPose>()
+            .expect("the readout of a moved camera parses")
+            .apply(&mut reopened);
+        assert_eq!(CameraPose::of(&reopened).text(), after);
     }
 }
