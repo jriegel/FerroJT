@@ -14,6 +14,7 @@
 mod backdrop;
 mod camera;
 mod details;
+mod lighting;
 mod lod;
 mod meshes;
 mod picking;
@@ -33,7 +34,6 @@ use ferrojt::jt::JtFile;
 use kiss3d::camera::{Camera3d, OrbitCamera3d};
 use kiss3d::color::Color;
 use kiss3d::event::{Action as EventAction, Key, MouseButton, WindowEvent};
-use kiss3d::light::Light;
 use kiss3d::prelude::{Vec2, Vec3};
 use kiss3d::window::Window;
 
@@ -299,11 +299,11 @@ impl App {
         let meshes = model.meshes.len();
 
         let mut viewer = ViewerScene::new(&model, &decoded);
-        // One directional light plus the window's ambient term is enough to read
-        // the shape; the materials carry the colours the file declares.
-        viewer
-            .root_mut()
-            .add_light(Light::directional(Vec3::new(0.35, 0.5, -1.0).normalize()));
+        // Three camera-relative lamps — key, fill, top — instead of one fixed
+        // directional light: a single light leaves the far side of the part in
+        // the flat ambient and gives no specular response at all, which is what
+        // makes a glossy CAD shell read as plaster. See [`crate::lighting`].
+        let rig = lighting::LightRig::attach(viewer.root_mut());
         // The gradient is an ordinary scene node, so unlike a skybox it stays out
         // of the outliner, the picker, the LOD stacks and the scene bounds. It
         // lives on the camera, which is what moves it — see [`ViewerCamera`].
@@ -328,6 +328,7 @@ impl App {
         self.lod_status = lod_summary(&self.viewer, self.viewer.total_triangle_count());
 
         camera.set_backdrop(Some(backdrop));
+        camera.set_light_rig(Some(rig));
         fit(camera.inner_mut(), &self.viewer, self.viewport, self.up);
     }
 
@@ -504,7 +505,13 @@ async fn main() {
 
     let mut window = Window::new("FerroJT Viewer").await;
     window.set_background_color(Color::new(0.13, 0.14, 0.16, 1.0));
-    window.set_ambient(0.35);
+    // The lamps in [`crate::lighting`] do the modelling, so the flat ambient
+    // term only has to keep the unlit side from going black. It used to be
+    // 0.35, which is what washed the colour out of every part.
+    window.set_ambient(0.2);
+    // Nothing casts a shadow here (see [`crate::lighting`]), and a directional
+    // light shadowing a dense shell against itself is depth acne, not detail.
+    window.set_shadows_enabled(false);
 
     // Placeholder frustum: `fit` rebuilds the camera with planes sized to the
     // model as soon as a file is loaded. The wrapper is what keeps the gradient

@@ -25,9 +25,10 @@ use kiss3d::prelude::{Pose3, Vec3};
 use kiss3d::window::Canvas;
 
 use crate::backdrop::Backdrop;
+use crate::lighting::LightRig;
 
 /// The viewport camera: an [`OrbitCamera3d`] that also keeps the gradient
-/// pinned to the frustum.
+/// pinned to the frustum and the lamps locked to the view.
 ///
 /// Everything else passes straight through — the viewer keeps calling
 /// `set_at`, `set_dist`, `fov` and the rest on the wrapped camera through
@@ -36,6 +37,8 @@ pub struct ViewerCamera {
     orbit: OrbitCamera3d,
     /// The gradient to re-place each frame, `None` while no file is loaded.
     backdrop: Option<Backdrop>,
+    /// The lamps to turn with the eye, `None` while no file is loaded.
+    rig: Option<LightRig>,
 }
 
 impl ViewerCamera {
@@ -44,6 +47,7 @@ impl ViewerCamera {
         Self {
             orbit,
             backdrop: None,
+            rig: None,
         }
     }
 
@@ -53,6 +57,14 @@ impl ViewerCamera {
     /// once per load; the previous one goes with the scene it was built for.
     pub fn set_backdrop(&mut self, backdrop: Option<Backdrop>) {
         self.backdrop = backdrop;
+    }
+
+    /// The lamps that get turned with the eye, or `None` for none.
+    ///
+    /// Like [`Self::set_backdrop`] this belongs to the scene of one loaded file
+    /// and is called once per load.
+    pub fn set_light_rig(&mut self, rig: Option<LightRig>) {
+        self.rig = rig;
     }
 
     /// The wrapped camera, mutably — [`fit`](crate::fit) replaces it wholesale
@@ -141,6 +153,12 @@ impl Camera3d for ViewerCamera {
             let aspect = width as f32 / (height.max(1)) as f32;
             backdrop.place(&self.orbit, aspect);
         }
+        // The lamps travel with the eye for the same reason the gradient does:
+        // `prepare` reads their world rotation into the light uniforms later in
+        // this very frame.
+        if let Some(rig) = self.rig.as_mut() {
+            rig.place(&self.orbit);
+        }
     }
 
     fn view_transform_pair(&self, pass: usize) -> (Pose3, Mat4) {
@@ -206,6 +224,7 @@ mod tests {
         ));
         // No file is loaded, so nothing is placed — and nothing panics either.
         camera.set_backdrop(None);
+        camera.set_light_rig(None);
         *camera.inner_mut() = orbit();
         let fresh = orbit();
         assert_eq!(camera.eye(), fresh.eye());

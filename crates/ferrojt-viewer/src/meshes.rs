@@ -72,24 +72,25 @@ fn decode(model: &Model, primitive: &Primitive) -> Option<Decoded> {
 
     // Only use the file's normals when they line up with the vertices;
     // otherwise kiss3d derives them from the faces.
-    let normals = attribute_floats(model, primitive, "NORMAL").and_then(|values| {
-        if values.len() != coords.len() * 3 {
-            return None;
-        }
-        Some(
-            values
-                .chunks_exact(3)
-                .map(|c| {
-                    let n = Vec3::new(c[0], c[1], c[2]);
-                    if n.length_squared() > 0.0 {
-                        n.normalize()
-                    } else {
-                        n
-                    }
-                })
-                .collect(),
-        )
-    });
+    let normals: Option<Vec<Vec3>> =
+        attribute_floats(model, primitive, "NORMAL").and_then(|values| {
+            if values.len() != coords.len() * 3 {
+                return None;
+            }
+            Some(
+                values
+                    .chunks_exact(3)
+                    .map(|c| {
+                        let n = Vec3::new(c[0], c[1], c[2]);
+                        if n.length_squared() > 0.0 {
+                            n.normalize()
+                        } else {
+                            n
+                        }
+                    })
+                    .collect(),
+            )
+        });
 
     let mesh = GpuMesh3d::new(coords, faces, normals, None, false);
     Some(Decoded {

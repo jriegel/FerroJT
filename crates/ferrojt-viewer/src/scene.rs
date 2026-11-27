@@ -600,6 +600,76 @@ impl ViewerScene {
     }
 }
 
+/// Dullest surface the viewer derives from a file's shininess.
+///
+/// The library keeps the glTF convention of a fixed roughness of 0.8 and parks
+/// the shininess exponent in [`extras`](Material::extras) because a viewer has
+/// no way to know what its own lighting can carry — the reference notes the
+/// samples' exponent of 128 as a roughness blows the colour out to white. The
+/// viewer does know its lighting, so it maps the exponent here (see
+/// [`gloss_of`]) and clamps the result: 0.25 is glossy but never a mirror.
+const GLOSS_FLOOR: f32 = 0.25;
+
+/// Duller bound of the same mapping, which is also what the library declares.
+const GLOSS_CEILING: f32 = 0.8;
+
+/// Weakest Fresnel strength a declared specular colour can ask for.
+///
+/// Kiss3d's shader derives `F0 = 0.16 · reflectance² · specular_tint`, so the
+/// default reflectance of 0.5 is the ordinary dielectric 0.04. Anything a CAD
+/// file marks as specular should read brighter than plastic, hence the floor.
+const MIN_REFLECTANCE: f32 = 0.4;
+
+/// How glossy a material is, in the terms kiss3d shades with.
+///
+/// A JT file stores a fixed-function colour set: a specular colour and a
+/// Blinn-Phong exponent. The neutral model carries them in `extras` next to the
+/// fixed glTF metal-free look, so the viewer recovers the response the file
+/// actually declares:
+///
+/// * the exponent becomes a GGX roughness through the standard
+///   `alpha = sqrt(2 / (n + 2))`, clamped into [`GLOSS_FLOOR`]..=[`GLOSS_CEILING`];
+/// * the specular colour becomes the shader's specular tint, and its average
+///   strength the Fresnel reflectance — a file with a white specular colour
+///   gets a visible highlight, one with black gets almost none.
+///
+/// A model without those keys (a glTF file, say) keeps the roughness it
+/// declares and the renderer's default Fresnel behaviour.
+fn gloss_of(material: &Material) -> (f32, Option<(Color, f32)>) {
+    let extras = material.extras.as_ref();
+    let declared = |key: &str| extras?.get(key).and_then(serde_json::Value::as_f64);
+
+    let roughness = match declared("shininess") {
+        Some(exponent) if exponent.is_finite() => {
+            let alpha = (2.0f32 / (exponent as f32 + 2.0)).sqrt();
+            alpha.clamp(GLOSS_FLOOR, GLOSS_CEILING)
+        }
+        _ => material.roughness.factor[0],
+    };
+
+    let specular = extras
+        .and_then(|extras| extras.get("specular"))
+        .and_then(|value| value.as_array())
+        .and_then(|values| {
+            let channels: Vec<f32> = values
+                .iter()
+                .take(3)
+                .filter_map(|value| value.as_f64())
+                .map(|value| (value as f32).clamp(0.0, 1.0))
+                .collect();
+            if channels.len() < 3 {
+                return None;
+            }
+            let strength = (channels[0] + channels[1] + channels[2]) / 3.0;
+            Some((
+                Color::new(channels[0], channels[1], channels[2], 1.0),
+                strength.max(MIN_REFLECTANCE),
+            ))
+        });
+
+    (roughness, specular)
+}
+
 /// Colour the geometry ends up with, so the highlight can be undone.
 fn apply_material(node: &mut SceneNode3d, material: Option<&Material>) -> Color {
     let fallback = Color::new(0.8, 0.8, 0.8, 1.0);
@@ -610,7 +680,12 @@ fn apply_material(node: &mut SceneNode3d, material: Option<&Material>) -> Color 
     let color = Color::new(base[0], base[1], base[2], base[3]);
     node.set_color(color);
     node.set_metallic(material.metallic.factor[0]);
-    node.set_roughness(material.roughness.factor[0]);
+    let (roughness, specular) = gloss_of(material);
+    node.set_roughness(roughness);
+    if let Some((tint, reflectance)) = specular {
+        node.set_specular_tint(tint);
+        node.set_reflectance(reflectance);
+    }
     let emissive = material.emissive.factor;
     node.set_emissive(Color::new(emissive[0], emissive[1], emissive[2], 1.0));
     // JT faces are double sided, so never cull.
@@ -849,7 +924,69 @@ pub(crate) fn box_corners(min: Vec3, max: Vec3) -> [Vec3; 8] {
 
 #[cfg(test)]
 mod tests {
+    use ferrojt::model::Channel;
+
     use super::*;
+
+    /// A material with the extras a JT file carries, at a given shininess and
+    /// specular colour.
+    fn jt_material(shininess: f64, specular: [f64; 4]) -> Material {
+        Material {
+            metallic: Channel::constant([0.2; 4]),
+            roughness: Channel::constant([0.8; 4]),
+            extras: Some(serde_json::json!({
+                "ambient": [0.2, 0.2, 0.2, 1.0],
+                "specular": specular,
+                "shininess": shininess,
+                "reflectivity": 0.0,
+            })),
+            ..Material::default()
+        }
+    }
+
+    /// A JT shininess exponent is a Blinn-Phong power, not a roughness: the
+    /// exponent of the exported parts (15) has to become a broad glossy sheen,
+    /// and the samples' 128 must stay short of a mirror.
+    #[test]
+    fn a_shininess_exponent_becomes_a_ggx_roughness() {
+        let (rough, _) = gloss_of(&jt_material(15.0, [0.75; 4]));
+        assert!((rough - (2.0f32 / 17.0).sqrt()).abs() < 1.0e-6, "{rough}");
+        assert!(rough > 0.3 && rough < 0.4, "{rough}");
+
+        // The samples all carry 128; the ceiling is what keeps them readable.
+        let (mirror, _) = gloss_of(&jt_material(128.0, [0.75; 4]));
+        assert_eq!(mirror, GLOSS_FLOOR);
+        let (matte, _) = gloss_of(&jt_material(0.0, [0.75; 4]));
+        assert_eq!(matte, GLOSS_CEILING);
+    }
+
+    /// A file that declares a specular colour gets a specular response; the
+    /// strength follows the colour, so black means (almost) none.
+    #[test]
+    fn a_declared_specular_colour_drives_tint_and_fresnel() {
+        let (rough, specular) = gloss_of(&jt_material(15.0, [0.75, 0.75, 0.75, 1.0]));
+        let _ = rough;
+        let (tint, reflectance) = specular.expect("the file declares a specular colour");
+        assert_eq!((tint.r, tint.g, tint.b), (0.75, 0.75, 0.75));
+        assert!(reflectance > 0.5, "plastic-default Fresnel: {reflectance}");
+
+        let (_, black) = gloss_of(&jt_material(15.0, [0.0, 0.0, 0.0, 1.0]));
+        let (_, reflectance) = black.expect("black is still a declared colour");
+        assert_eq!(reflectance, MIN_REFLECTANCE);
+    }
+
+    /// A glTF model declares metallic-roughness directly and has no JT extras,
+    /// so nothing may be re-derived from it.
+    #[test]
+    fn a_model_without_jt_extras_keeps_what_it_declares() {
+        let material = Material {
+            roughness: Channel::constant([0.05; 4]),
+            ..Material::default()
+        };
+        let (rough, specular) = gloss_of(&material);
+        assert_eq!(rough, 0.05);
+        assert!(specular.is_none());
+    }
 
     /// A row tree of one `RangeLOD` with `tiers` `Group` children, each holding
     /// one shape. The finest tier carries the most triangles and the smallest

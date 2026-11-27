@@ -12,7 +12,7 @@ file back out as JT. Read this before changing code; the design detail lives in
 | `crates/ferrojt` | The library: `model/` neutral scene graph, `codec/` binary helpers, `import/` the glTF/GLB reader (`gltf.rs`), `jt/` OpenJT reader (segment/TOC, element objects, decode codecs, `dump.rs` JSON writer), `jt/version.rs` the `JtVersion` a file is read or written at, `jt/encode.rs` the topological (dual vertex-face) encoder, `jt/hash.rs` the Jenkins lookup2 hashes a strict consumer verifies, `jt/write.rs` the JT writer, `jt/build.rs` the builder that creates a file from nothing, `jt/from_model.rs` (private) the writer that turns a neutral `Model` into a file, `model/flatten.rs` the merge of a whole file into one mesh, and `export/` glTF/GLB writer and the ASCII USD writer. |
 | `crates/ferrojt-cli` | The `ferrojt` binary (clap): `info`, `inspect`, `dump`, `convert`, `write`, `ls`. |
 | `crates/ferrojt-python` | `pyo3` cdylib `_ferrojt`; `lib.rs` is the export view (`Model`) plus `lsg.rs` the file view (`JtLsg`/`JtNode`/`JtMesh`/`JtArray`) and `build.rs` the builder (`JtBuilder`/`NodeHandle`/`MeshHandle`/`MeshData`/`MaterialData`), `mesh.rs` the merged-mesh buffer of `Model::merged_mesh`/`ferrojt.read_mesh` and `array.rs` the buffer plumbing `JtArray` and that buffer share; `pyproject.toml` + `python/ferrojt/` + `tests/`. |
-| `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `details.rs` key/value pane for the selected row, `backdrop.rs` viewport gradient, `camera.rs` `Camera3d` wrapper that places the backdrop, `picking.rs`, `trihedron.rs`. |
+| `crates/ferrojt-viewer` | `ferrojt-viewer` binary: egui outliner + kiss3d viewport. `meshes.rs` JT→GPU meshes, `scene.rs` row tree/transforms/LOD stacks, `lod.rs` screen-area tier selection, `tree.rs` outliner, `details.rs` key/value pane for the selected row, `backdrop.rs` viewport gradient, `lighting.rs` camera-relative lamp rig, `camera.rs` `Camera3d` wrapper that places the backdrop and turns the lamps, `picking.rs`, `trihedron.rs`. |
 | `python/ferrojt/` | Pure-Python package re-exporting `_ferrojt` (`__init__.py`, `_ferrojt.pyi`, `py.typed`). |
 | `data/ExampleFiles/` | Sample JT files: JT 8.0, 8.1, 9.5, 10.3. |
 | `data/Reference/` | Reference JSON dumps from the JT tooling **and** reference PNG pictures — **the oracle**. |
@@ -606,6 +606,60 @@ Upload with `python -m twine upload dist\*`.
   tone map darkens sRGB bytes by ~20 levels, so `TOP [132,138,150]` renders as
   ~(114,121,134). Being a plain scene node it is not an outliner row, not picked,
   not an LOD candidate and not in `world_bounds_all`.
+- **A "the normals are missing / the part looks flat and mottled" report is the
+  lighting, not the decode.** A user compared the viewer with JT2Go on an
+  exported shell (`C:\Data\CLA_EXPORT_JR\fmsr_21a…----.jt`, 94 MB, 897 788 tris)
+  and read the difference as missing interpolated normals. The file's normals
+  decode, upload and shade: 193 279 normal/vertex pairs on its one shape, only 64
+  zero-length of 1 058 628 components (the documented past-the-end padding),
+  17/17 glTF primitives carry `NORMAL`, 1 mismatched edge in 848 133, 90–100 % of
+  triangles align with their corner normals, and negating them in the viewer
+  changes 36 213 px of the capture. `jt/decode/mesh.rs::vertex_face_attr` matches
+  TKJT's `setFaceAttr`/`_iFaceAttrCtr` rule for rule — **do not "fix" it**. The
+  actual cause was four viewer settings: one fixed `Light::directional`, the flat
+  ambient of 0.35 with no IBL, `shininess`/`specular` never reaching the shader,
+  and shadow mapping (kiss3d's `Light::default()` **casts**, the window enables
+  shadows, 2048 atlas, `depth_bias 0.0012`) → depth acne over a dense shell.
+- **The lamps are a camera-relative rig (`lighting.rs`), attached like the
+  backdrop.** Three `Light::directional`s (key upper-right 1.9, cool fill low-left
+  0.8, near-vertical top 0.8 — `travel` is the direction the light travels **in
+  view space**) added to the loaded file's root with `SceneNode3d::add_light` and
+  turned inside `Camera3d::update` by
+  `Pose3::from_parts(Vec3::ZERO, camera.view_transform().rotation.inverse())`, so
+  `prepare` reads their world rotation in the same frame (the same reason the
+  gradient lives there; `world_direction = world_rotation * local_direction` at
+  `scene_node3d.rs:150-172` is what makes it work at all). `fit` replaces the
+  camera, so the rig sits on `ViewerCamera` via `set_light_rig`, once per load.
+  Every lamp is `with_casts_shadows(false)` **and** the window has
+  `set_shadows_enabled(false)`; the ambient went 0.35 → 0.2 — contrast, not
+  brightness. kiss3d's light budget is `MAX_LIGHTS = 8`, so the rig has room but
+  is not open-ended. Proving a shading change needs the **release** exe and
+  `--settle 20` (4 s measures ink=0 on that file):
+  `.\.venv\Scripts\python.exe target\cla_viewer_shot.py --files … --settle 20 --keep`,
+  then `target\imgcmp.py` for the pixel diff (97 860 px changed against the old
+  single light) and `target\lightcmp.py` for the statistics — near-white
+  desaturated part pixels went **6.5 % → 0 %**, and `SampleJT_Server.jt`,
+  `example_block` and `opening_protection_plate1` all still capture fine
+  (ink 0.26–0.27).
+- **A JT `shininess` becomes a *viewer* roughness, never a library one.**
+  `crates/ferrojt` keeps the glTF convention (metallic 0.2 / roughness 0.8) and
+  parks `ambient`/`specular`/`shininess`/`reflectivity` in `Material::extras`;
+  only `scene.rs::gloss_of` maps them: `alpha = sqrt(2 / (n + 2))` clamped into
+  `GLOSS_FLOOR 0.25`..`GLOSS_CEILING 0.8` (the exported shell carries 15 → 0.34,
+  the six reference samples all carry 128 → 0.25, which is what honours the
+  warning above), and a declared `specular` rgb becomes `set_specular_tint` with
+  its mean as `set_reflectance` (floor `MIN_REFLECTANCE 0.4`; the shader uses
+  `F0 = 0.16 · reflectance² · tint`, so the default reflectance 0.5 is ordinary
+  dielectric 0.04). JT `reflectivity` is deliberately **not** the Fresnel driver
+  (the exports carry 0) and `ambient` has no per-material exit in kiss3d. A model
+  without those keys (a glTF file) keeps what it declares. Pinned by three tests
+  in `scene.rs`; `lighting.rs` pins the rig with four (`world_directions` is the
+  `#[cfg(test)]` half of `place`, because a light node needs a live window).
+- **kiss3d 0.47 `default.wgsl` never flips the normal on a back face**, so with
+  `enable_backface_culling(false)` — required, JT faces are double sided — back
+  faces are lit with the unflipped normal and read darker. Not fixable without a
+  custom shader; it is a second-order difference against a CAD viewer, worth
+  knowing before re-opening a shading report.
 - **egui's `OpenUrl` output is never read by kiss3d 0.47**, so the About button
   calls `webbrowser::open` **after** `draw_ui` returns. `ABOUT_RESERVE` exists
   because egui 0.36 has no text-measurement API — the status row has to leave the
