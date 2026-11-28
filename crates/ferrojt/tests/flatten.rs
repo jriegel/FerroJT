@@ -73,7 +73,13 @@ const EXPECTED: &[(&str, Expectation)] = &[
     (
         "SampleJT_Server.jt",
         Expectation {
-            vertices: 1_145_199,
+            // 1_145_199 before the 9.x attribute mask was cut at 30 bits: two of
+            // this file's faces (33 and 35 corners) carry their third mask bit in
+            // the *auxiliary* word, and only the 30-bit cut puts it on a corner
+            // that exists. The nine extra merged vertices are the corners that
+            // then own a normal of their own instead of borrowing their
+            // neighbour's. See `decode::mesh::next_attr_mask`.
+            vertices: 1_145_208,
             triangles: 1_193_657,
             groups: 592,
         },

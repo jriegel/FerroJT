@@ -95,17 +95,15 @@ struct Streams {
     groups: Vec<i32>,
     face_flags: Vec<i32>,
     attr_masks: [Vec<i32>; 8],
-    /// The auxiliary high-bit stream of context 7: one value per mask symbol
-    /// written into [`Streams::attr_masks`]`[7]`.
+    /// The whole attribute mask of every face whose degree selects context 7, in
+    /// the order the coders emit them.
     ///
-    /// The reader folds the first of these into a context-7 mask as its 32 MSBs
-    /// and reads the second for framing only, so a mask that needs no bit above
-    /// 31 still needs one value (zero) per mask symbol in each
-    /// array. A consumer that renders a shape from its topological
-    /// representation refuses a *context-7 face whose auxiliary streams are
-    /// empty*, which is why the count must track the mask count rather than the
-    /// mask value.
-    attr_masks_high: Vec<i32>,
+    /// A context-7 mask is one bit vector that a file *fragments* across two or
+    /// three streams, and where the fragments are cut belongs to the revision —
+    /// see [`attr_mask_shift`] for the measurement that fixes it. Keeping the
+    /// mask whole here means the coders produce the same topology at any revision
+    /// and only [`write_mesh_input`] decides how it is stored.
+    masks7: Vec<u64>,
     attr_masks_large: Vec<u32>,
     split_faces: Vec<i32>,
     split_positions: Vec<i32>,
@@ -357,6 +355,58 @@ fn mask_context(degree: i32) -> usize {
     (degree - 2).clamp(0, 7) as usize
 }
 
+/// The mask word with its low `bits` bits set, saturating outside `0..=32`.
+///
+/// A mask word is unsigned, so bit 31 is a value bit rather than a sign; doing
+/// this in `i32` would overflow exactly where a 32-corner face needs it.
+fn low_bits(bits: i32) -> u32 {
+    match bits {
+        b if b <= 0 => 0,
+        b if b >= 32 => u32::MAX,
+        b => (1u32 << b) - 1,
+    }
+}
+
+/// The whole mask of a face of `degree` corners, before it is fragmented into
+/// the streams of a revision. Only faces of at most 64 corners arrive here — a
+/// wider one uses the plain array of [`Streams::attr_masks_large`].
+fn mask_of_degree(degree: i32) -> u64 {
+    if degree >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << degree) - 1
+    }
+}
+
+/// The bit position at which the auxiliary context-7 mask streams begin, which
+/// is where the base word stops.
+///
+/// A JT 10.x file cuts the mask in half — base word bits 0..31, one auxiliary
+/// stream bits 32..63, and no third stream. That is the layout the format
+/// description spells out ("Face Attribute Masks (32 LSBs)" written eight
+/// times, then "Face Attribute Mask 8 (32 MSBs)"). A JT 8.x/9.x file cuts it in
+/// **thirty-bit** pieces: base word bits 0..29, first auxiliary bits 30..59,
+/// second auxiliary bits 60..63. The reference reader names its streams for
+/// those shifts (`JtDecode_MeshCoderDriver.cxx:1202`, `_faceAttributeMask8_30`
+/// and `_faceAttributeMask8_4`), and the narrower cut is forced by a strict
+/// consumer: it reads the base word **signed** below JT 10.x, so a base word
+/// with bit 31 set arrives as a negative mask that counts 64 attributes for a
+/// face of 32 corners. The walk then takes that face for a split, desynchronises
+/// over the rest of the shape, and JT2Go draws nothing but its trihedron (352
+/// ink pixels) — measured on a bipyramid of apex degree 32, 33 and 40 written at
+/// 9.5, each of which renders fine at 10.3 with the same mask. Real 9.5 files
+/// agree with the rule: the 106 topological shapes of
+/// `SampleJT_Server.jt` all keep their context-7 base word below 2³⁰, and the
+/// two shapes whose mask reaches past bit 29 carry it in the auxiliary stream
+/// (word `4`, i.e. mask bit 32) where their face ring still reaches it.
+///
+/// The 30-bit cut keeps bit 31 clear and still spans 30 + 30 + 4 = 64 corners,
+/// exactly the inline limit above which a face uses the plain array of
+/// [`Streams::attr_masks_large`].
+fn attr_mask_shift(version: JtVersion) -> u32 {
+    if version.major >= 10 { 32 } else { 30 }
+}
+
 /// One vertex of the mirror mesh: its valence and its incident-face slots.
 #[derive(Clone, Debug)]
 struct MirrorVertex {
@@ -516,50 +566,40 @@ impl<'a> Walk<'a> {
 
     /// Emits the all-set attribute mask of a face of `degree`.
     ///
-    /// The reader takes its mask from the inline stream up to a degree of 64,
-    /// and one inline symbol is a 32-bit word widened to 64 bits with its sign.
-    /// A word without the sign bit reaches at most 31 set bits, and a word with
-    /// it sets the whole upper half as well, so only degrees up to 31 can be
-    /// described that way. A degree above 64 goes through the wide bit array,
-    /// which the reader consults for exactly that case. A degree between the
-    /// two has no encoding at all: any mask the reader could build there would
-    /// count more attributes than the face has slots, which the reader treats
-    /// as a split rather than a face.
+    /// An attribute mask is an **unsigned bit vector**, one bit per corner of
+    /// the face, and every bit a face has a slot for is set — each corner carries
+    /// its own normal attribute, and a face that named more attributes than it
+    /// has slots reads as a split rather than a face. Contexts 0 to 6 hold such a
+    /// mask in one word of their own array; a context-7 mask is kept whole in
+    /// [`Streams::masks7`] and only split when the block is written, so that the
+    /// cut can follow the revision (see [`attr_mask_shift`]).
+    ///
+    /// A degree above 64 cannot be inline; it goes through the wide bit array,
+    /// which the reader consults for exactly that case. There the mask carries
+    /// exactly `degree` set bits in `ceil(degree / 32)` words — a full last word
+    /// would name attributes the face has no slot for — and the number of words
+    /// has to be the one a consumer computes for that degree.
     fn emit_attr_mask(&mut self, context: usize, degree: i32) -> Result<()> {
         if degree > 64 {
-            for _ in 0..(degree as usize).div_ceil(32) {
-                self.streams.attr_masks_large.push(u32::MAX);
+            let words = (degree as usize).div_ceil(32);
+            for word in 0..words {
+                // The last word stops at `degree`; a full word would name more
+                // attributes than the face has slots.
+                let bits = degree - 32 * (word as i32);
+                self.streams.attr_masks_large.push(low_bits(bits));
             }
             return Ok(());
         }
-        if degree > 31 {
-            return Err(Error::invalid(
-                0,
-                format!(
-                    "a vertex of the mesh has {degree} faces, which the JT 9.x/10.x attribute \
-                     mask cannot describe"
-                ),
-            ));
-        }
-        self.streams.attr_masks[context].push((1 << degree) - 1);
-        // A context-7 mask is widened with two auxiliary streams, and the reader
-        // indexes them with the *same* read position as the mask itself. Every
-        // mask symbol therefore needs a value in each, even when — as here, with
-        // a degree of at most 31 — no bit above 29 is ever set. A consumer that
-        // renders from the topological representation rejects a context-7 face
-        // whose auxiliary streams are empty.
         if context == 7 {
-            self.streams.attr_masks_high.push(0);
+            self.streams.masks7.push(mask_of_degree(degree));
+        } else {
+            // Computed in `u32`: the 32nd bit of an `i32` is its sign, so a
+            // `1 << 31` would panic. Contexts 0 to 6 never reach that wide.
+            self.streams.attr_masks[context].push(low_bits(degree) as i32);
         }
         Ok(())
     }
 
-    /// Creates or splits the coder face that coder vertex `cv` wants at slot
-    /// `slot`.
-    ///
-    /// A face that already exists is reached through a split symbol, which
-    /// points back a measured number of entries in the active list and names
-    /// the slot the vertex belongs at.
     fn read_face(&mut self, cv: i32, slot: i32) -> Result<FaceChoice> {
         let welded = self.wanted_welded(cv, slot);
         let tri = self.tri_of_cv[cv as usize];
@@ -1092,22 +1132,44 @@ fn write_mesh_input(streams: &Streams, version: JtVersion, out: &mut Vec<u8>) {
     package2(&streams.valences, version, out);
     package2(&streams.groups, version, out);
     package2(&lag1_residuals(&streams.face_flags), version, out);
-    for context in 0..8 {
+
+    // The context-7 masks are one bit vector fragmented across the streams a
+    // file of this revision stores: two at JT 10.x, three below it. Every mask
+    // owns one value in each of them, because the reader indexes all of them
+    // with the same position as the mask itself, and the composite hash makes
+    // one call per stream the file stores — hence the third array is framed and
+    // hashed only where it exists.
+    let shift = attr_mask_shift(version);
+    let field = (1u64 << shift) - 1;
+    let mask_low: Vec<i32> = streams.masks7.iter().map(|m| (*m & field) as i32).collect();
+    let mask_high: Vec<i32> = streams
+        .masks7
+        .iter()
+        .map(|m| ((*m >> shift) & field) as i32)
+        .collect();
+    let mask_extra: Vec<i32> = if shift == 32 {
+        Vec::new()
+    } else {
+        streams
+            .masks7
+            .iter()
+            .map(|m| ((*m >> (2 * shift)) & field) as i32)
+            .collect()
+    };
+    let auxiliary_pair = version.major < 10;
+    for context in 0..7 {
         package2(&streams.attr_masks[context], version, out);
     }
-    // The two auxiliary mask arrays of context 7. JT 10.x folds them into one
-    // stream and never reads the second. Both hold one value per context-7 mask
-    // symbol; the mask here never needs a bit above 31, so both are zero. The
-    // composite hash below makes one call per stream the file stores, so the
-    // pair has to be hashed only where the pair is written.
-    package2(&streams.attr_masks_high, version, out);
-    let auxiliary_pair = version.major < 10;
+    package2(&mask_low, version, out);
+    package2(&mask_high, version, out);
     if auxiliary_pair {
-        package2(&streams.attr_masks_high, version, out);
+        package2(&mask_extra, version, out);
     }
     write_u32_array(&streams.attr_masks_large, out);
     package2(&lag1_residuals(&streams.split_faces), version, out);
     package2(&streams.split_positions, version, out);
+    let mut attr_masks = slices(&streams.attr_masks);
+    attr_masks[7] = &mask_low;
     write_u32(
         out,
         composite_hash(
@@ -1116,9 +1178,9 @@ fn write_mesh_input(streams: &Streams, version: JtVersion, out: &mut Vec<u8>) {
                 valences: &streams.valences,
                 groups: &streams.groups,
                 face_flags: &streams.face_flags,
-                attr_masks: slices(&streams.attr_masks),
-                attr_masks_high: &streams.attr_masks_high,
-                attr_masks_aux: &streams.attr_masks_high,
+                attr_masks,
+                attr_masks_high: &mask_high,
+                attr_masks_aux: &mask_extra,
                 attr_masks_large: &streams.attr_masks_large,
                 split_faces: &streams.split_faces,
                 split_positions: &streams.split_positions,
@@ -1538,82 +1600,62 @@ mod tests {
     }
 
     #[test]
-    fn a_context_seven_face_carries_both_auxiliary_mask_streams() {
+    fn a_context_seven_face_carries_every_auxiliary_mask_stream() {
         // A coder face of degree nine reads its attribute mask from context 7,
-        // and the reader widens that mask by ORing two auxiliary arrays into it
-        // **at the same read position as the mask itself**. So every context-7
-        // mask symbol needs a value in each auxiliary stream even when, as here,
-        // no bit above 29 is ever set — and a consumer that renders a shape from
-        // its topological representation refuses a context-7 face whose
-        // auxiliary streams are empty, which blanks the whole shape.
+        // and the consumer widens that mask by ORing the auxiliary arrays into
+        // it **at the same read position as the mask itself**. So every
+        // context-7 mask symbol needs a value in each auxiliary stream even
+        // when, as here, no bit above 29 is ever set — and a consumer that
+        // renders a shape from its topological representation refuses a
+        // context-7 face whose auxiliary streams are empty, which blanks the
+        // whole shape.
         //
         // The cube (degrees 4 and 6) and the octahedron (degree 4) never reach
         // context 7, which is why a block always rendered and only a file with a
         // high-valence vertex — the plate's screws — came out empty.
         let mesh = enneagon_bipyramid();
         let encoded = encode(&mesh).expect("a bipyramid is a closed two-manifold");
-        let masks = encoded.streams.attr_masks[7].len();
+        let masks = encoded.streams.masks7.len();
         assert!(
             masks > 0,
             "the fixture must produce a coder face of degree nine"
-        );
-        assert_eq!(
-            masks,
-            encoded.streams.attr_masks_high.len(),
-            "every context-7 mask symbol needs one auxiliary value"
         );
 
         for version in [JtVersion::V9_5, JtVersion::V10_3] {
             let mut body = Vec::new();
             write_topological_body(&mesh, version, &mut body).expect("the mesh can be encoded");
-            let auxiliary = auxiliary_masks(&body, version);
-            // JT 10.x folds the pair into one stream and never reads the second.
+            let streams = mask_streams(&body, version);
+            // The base word plus one auxiliary stream at JT 10.x, two below it.
             assert_eq!(
-                auxiliary.len(),
-                if version.major >= 10 { 1 } else { 2 },
-                "{version} stores one auxiliary mask stream, not two"
+                streams.len(),
+                if version.major >= 10 { 2 } else { 3 },
+                "{version} frames the wrong number of context-7 mask streams"
             );
-            for (at, package) in auxiliary.iter().enumerate() {
-                assert!(
-                    package.out_val_count() > 0,
-                    "{version} left auxiliary mask stream {at} empty"
-                );
+            for (index, package) in streams.iter().enumerate() {
                 assert_eq!(
                     package.out_val_count(),
                     masks,
-                    "auxiliary mask stream {at} of {version} does not track the \
-                     context-7 masks"
+                    "context-7 mask stream {index} of {version} does not track \
+                     the masks"
+                );
+            }
+            // No bit above 29 is set, so every auxiliary stream is zeros.
+            for (index, package) in streams.iter().skip(1).enumerate() {
+                let mut package = package.clone();
+                assert_eq!(
+                    package
+                        .decode(ByteOrder::Little, Unpack::Null)
+                        .expect("the auxiliary stream decodes"),
+                    vec![0; masks],
+                    "{version} filled auxiliary mask stream {index}"
                 );
             }
         }
     }
 
-    /// A closed bipyramid over a nine-gon: two apices of nine triangles each and
-    /// nine equator corners of four. The apices are coder faces of **degree
-    /// nine**, the first degree whose attribute mask is read from context 7.
-    fn enneagon_bipyramid() -> MeshData {
-        let mut vertices = vec![0.0, 0.0, 1.0, 0.0, 0.0, -1.0];
-        for step in 0..9i32 {
-            let angle = std::f32::consts::TAU * step as f32 / 9.0;
-            vertices.extend_from_slice(&[angle.cos(), angle.sin(), 0.0]);
-        }
-        let mut indices = Vec::new();
-        for step in 0..9i32 {
-            let next = (step + 1) % 9;
-            // Both cones wound outward, so the mesh is consistently oriented.
-            indices.extend_from_slice(&[0, 2 + step, 2 + next]);
-            indices.extend_from_slice(&[1, 2 + next, 2 + step]);
-        }
-        MeshData::new(vertices, indices).expect("a bipyramid is a valid mesh")
-    }
-
-    /// A closed bipyramid over a seventy-gon: its two apices are coder faces of
-    /// **degree seventy**. That is the first degree whose attribute mask no
-    /// longer fits the eight inline streams — the reader takes
-    /// `ceil(70 / 32) = 3` words per apex from the high-degree array, which the
-    /// format stores as a plain array rather than a codec package.
-    fn heptegintagon_bipyramid() -> MeshData {
-        let base = 70i32;
+    /// A closed bipyramid over a `base`-gon: its two apices are coder faces of
+    /// degree `base`, the rest of the ring corners degree four.
+    fn n_gon_bipyramid(base: i32) -> MeshData {
         let mut vertices = vec![0.0, 0.0, 1.0, 0.0, 0.0, -1.0];
         for step in 0..base {
             let angle = std::f32::consts::TAU * step as f32 / base as f32;
@@ -1622,10 +1664,88 @@ mod tests {
         let mut indices = Vec::new();
         for step in 0..base {
             let next = (step + 1) % base;
+            // Both cones wound outward, so the mesh is consistently oriented.
             indices.extend_from_slice(&[0, 2 + step, 2 + next]);
             indices.extend_from_slice(&[1, 2 + next, 2 + step]);
         }
         MeshData::new(vertices, indices).expect("a bipyramid is a valid mesh")
+    }
+
+    #[test]
+    fn an_attribute_mask_word_is_unsigned() {
+        // The bit a face of 32 corners needs is bit 31, which in an `i32` is the
+        // sign: `(1 << 31) - 1` panics with "attempt to subtract with overflow".
+        assert_eq!(low_bits(31), 0x7fff_ffff);
+        assert_eq!(low_bits(32), u32::MAX);
+        assert_eq!(low_bits(64), u32::MAX);
+        assert_eq!(low_bits(0), 0);
+        assert_eq!(low_bits(-1), 0);
+    }
+
+    #[test]
+    fn a_face_of_up_to_64_corners_stays_in_the_context_seven_streams() {
+        // Real CAD exports put vertices of 32 to 64 incident faces in the
+        // inline streams; the writer used to refuse the whole range 32..=64 as
+        // "no encoding", and a degree-31 vertex crashed a debug build on the
+        // signed shift. The mask reaches 64 corners through the context-7 base
+        // word and its auxiliary streams, at either revision, without the wide
+        // high-degree array.
+        for degree in [30, 31, 32, 33, 40, 64] {
+            let mesh = n_gon_bipyramid(degree);
+            let encoded =
+                encode(&mesh).expect("a bipyramid is a closed two-manifold at any apex degree");
+            // The two apices are the only coder faces of that degree; the ring
+            // corners are degree four and land in context 2.
+            assert_eq!(
+                encoded.streams.masks7,
+                [mask_of_degree(degree); 2],
+                "the context-7 masks of a {degree}-corner face"
+            );
+            assert!(
+                encoded.streams.attr_masks_large.is_empty(),
+                "a face of {degree} corners still fits the inline streams"
+            );
+            for version in [JtVersion::V9_5, JtVersion::V10_3] {
+                let mut body = Vec::new();
+                write_topological_body(&mesh, version, &mut body).expect("the mesh can be encoded");
+                assert_eq!(
+                    composed_masks(&body, version),
+                    [mask_of_degree(degree); 2],
+                    "{version} does not spell out a {degree}-corner attribute mask"
+                );
+                if version.major < 10 {
+                    // The base word is read as a *signed* int, so a set bit 31
+                    // would make the whole mask negative and the face would be
+                    // taken for a split. Every bit above 29 belongs to an
+                    // auxiliary stream.
+                    let mut base = mask_streams(&body, version).remove(0);
+                    for word in base
+                        .decode(ByteOrder::Little, Unpack::Null)
+                        .expect("the base word stream decodes")
+                    {
+                        assert!(word >= 0, "{version} set the sign bit of a mask");
+                    }
+                }
+                // 2 * `degree` triangles of three corners each.
+                round_trip(&mesh, 6 * degree as usize);
+            }
+        }
+    }
+
+    /// A closed bipyramid over a nine-gon: two apices of nine triangles each and
+    /// nine equator corners of four. The apices are coder faces of **degree
+    /// nine**, the first degree whose attribute mask is read from context 7.
+    fn enneagon_bipyramid() -> MeshData {
+        n_gon_bipyramid(9)
+    }
+
+    /// A closed bipyramid over a seventy-gon: its two apices are coder faces of
+    /// **degree seventy**. That is the first degree whose attribute mask no
+    /// longer fits the eight inline streams — the reader takes
+    /// `ceil(70 / 32) = 3` words per apex from the high-degree array, which the
+    /// format stores as a plain array rather than a codec package.
+    fn heptegintagon_bipyramid() -> MeshData {
+        n_gon_bipyramid(70)
     }
 
     /// The high-degree attribute masks must be framed exactly as the format
@@ -1642,15 +1762,31 @@ mod tests {
             "the fixture never reached the high-degree attribute masks, so it \
              proves nothing"
         );
+        // A wide mask names one attribute per corner **exactly**: the array
+        // carries `ceil(degree / 32)` words whose last word stops at `degree`.
+        // Filling it with ones would hand a consumer 96 attributes for a
+        // seventy-corner face, which over-counts the face and loses the shape.
+        assert_eq!(
+            encoded.streams.attr_masks_large,
+            [
+                u32::MAX,
+                u32::MAX,
+                low_bits(70 - 64),
+                u32::MAX,
+                u32::MAX,
+                low_bits(70 - 64)
+            ],
+            "the wide masks of the two apices"
+        );
         // 140 triangles of three corners each.
         round_trip(&mesh, 420);
     }
 
-    /// The two auxiliary attribute-mask streams of a body, read in the order
-    /// [`write_mesh_input`] writes them. Walking the framing that precedes them
-    /// is part of the check: a stream written out of order is a stream no
-    /// reader finds.
-    fn auxiliary_masks(body: &[u8], version: JtVersion) -> Vec<Package> {
+    /// The context-7 attribute-mask streams of a body — the base word and the
+    /// auxiliary streams — read in the order [`write_mesh_input`] writes them.
+    /// Walking the framing that precedes them is part of the check: a stream
+    /// written out of order is a stream no reader finds.
+    fn mask_streams(body: &[u8], version: JtVersion) -> Vec<Package> {
         let mut cursor = Cursor::new(body, ByteOrder::Little, version.major);
         let next = |cursor: &mut Cursor<'_>| {
             Package::load2(cursor).expect("a symbol package of the walk must read back")
@@ -1669,21 +1805,52 @@ mod tests {
         } else {
             cursor.skip(2 + 4 + 2).expect("the representation version");
         }
-        // The symbol streams up to the pair in question.
+        // The symbol streams up to the mask of context 7.
         for _ in 0..8 {
             next(&mut cursor);
         }
         next(&mut cursor); // valences
         next(&mut cursor); // groups
         next(&mut cursor); // face flags
-        for _ in 0..8 {
+        for _ in 0..7 {
             next(&mut cursor);
         }
         let mut out = vec![next(&mut cursor)];
-        if version.major < 10 {
+        if version.major >= 10 {
+            out.push(next(&mut cursor));
+        } else {
+            out.push(next(&mut cursor));
             out.push(next(&mut cursor));
         }
         out
+    }
+
+    /// The context-7 masks of a body as a consumer composes them: the base word
+    /// widened by the auxiliary streams at [`attr_mask_shift`].
+    fn composed_masks(body: &[u8], version: JtVersion) -> Vec<u64> {
+        let shift = attr_mask_shift(version);
+        let field = (1u64 << shift) - 1;
+        let mut streams = mask_streams(body, version);
+        let words: Vec<Vec<i32>> = streams
+            .iter_mut()
+            .map(|package| {
+                package
+                    .decode(ByteOrder::Little, Unpack::Null)
+                    .expect("a context-7 mask stream must decode")
+            })
+            .collect();
+        words[0]
+            .iter()
+            .enumerate()
+            .map(|(index, &base)| {
+                let mut mask = u64::from(base as u32) & field;
+                for (level, stream) in words.iter().enumerate().skip(1) {
+                    let word = stream.get(index).copied().unwrap_or(0);
+                    mask |= (u64::from(word as u32) & field) << (shift * level as u32);
+                }
+                mask
+            })
+            .collect()
     }
 
     /// Encodes `mesh` for both revisions that carry a topological representation

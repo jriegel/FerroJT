@@ -1351,10 +1351,13 @@ FLATTENED = {
     "example_block_jt10.3.jt": (24, 12, 1),
     "opening_protection_plate1_jt8.0.jt": (1084, 1012, 2),
     "opening_protection_plate1_jt9.5.jt": (923, 800, 2),
-    # Nine of this file's vertices stop welding together now that a context-7
-    # face reads its wide attribute bits at their real position, which hands the
-    # face's attributes to the right corners (see AGENTS.md). Triangles unchanged.
-    "SampleJT_Server.jt": (1_145_199, 1_193_657, 592),
+    # Nine of this file's vertices stop welding together now that the attribute
+    # mask of a context-7 face is cut at 30 bits, the way a JT 9.5 file frames it:
+    # two of its faces (33 and 35 corners) carry their third mask bit in the
+    # *auxiliary* word, and only that cut puts it on a corner that exists, so the
+    # face's normal lands where the file meant it (see AGENTS.md). Triangles
+    # unchanged; it was 1_145_199 when the mask was cut at 32 bits.
+    "SampleJT_Server.jt": (1_145_208, 1_193_657, 592),
 }
 
 

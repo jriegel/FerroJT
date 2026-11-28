@@ -229,23 +229,76 @@ Read out of the samples, since no reference writer exists:
   carry the per-normal **flag package** after the normals. The OpenJT reader
   ignores that section, a rendering consumer stops on the missing field and
   draws nothing.
-* A **context-7 attribute mask** is widened by **auxiliary streams**, and each
-  needs one value per mask symbol even when no bit above 31 is ever set.
+* A **context-7 attribute mask** is widened by **auxiliary mask streams**, and
+  each of them needs one value per mask symbol.
   `mask_context(degree) = (degree − 2).clamp(0, 7)`, so context 7 means a coder
   vertex of degree ≥ 9; the decoder indexes the auxiliary streams with the *same*
-  read position as the mask itself, and the value of the first one supplies the 32
-  **most significant** bits of that mask (`(msbs << 32) | lsbs`, both unsigned —
-  see `decode/mesh.rs::next_attr_mask`). `encode.rs` keeps them in
-  `Streams::attr_masks_high`, pushes a `0` for every context-7 symbol, and emits
-  them after the eight degree packages — two packages at 9.x, one at 10.x, where
-  the second is never read.
-  A consumer that renders refuses a context-7 face whose auxiliary streams are
-  empty, so the whole shape comes out blank. A cube (degrees 4 and 6) and an
-  octahedron (degree 4) can never reach context 7, and the screws of
+  read position as the mask itself. A cube (degrees 4 and 6) and an octahedron
+  (degree 4) can never reach context 7, and the screws of
   `opening_protection_plate1` are the only degree-9 coder vertices in the
   samples — which is why every block rewrite rendered and only the plate did
-  not. `a_context_seven_face_carries_both_auxiliary_mask_streams` pins it on a
-  nine-gon bipyramid, whose two apices have degree 9.
+  not. A consumer that renders refuses a context-7 face whose auxiliary streams
+  are empty, so the whole shape comes out blank;
+  `a_context_seven_face_carries_every_auxiliary_mask_stream` pins all three
+  streams on a nine-gon bipyramid, whose two apices have degree 9.
+* The mask of a context-7 face is a **64-bit unsigned bit vector**, and *where
+  the auxiliary words continue it depends on the revision*:
+  `encode::attr_mask_shift` is 30 below JT 10.x and 32 at 10.x.
+  * **JT 10.x** has one auxiliary stream holding bits 32..63 — the
+    `Face Attribute Mask 8 (32 MSBs)` of the spec figure — so a face reaches
+    up to 64 corners.
+  * **JT 8.x / 9.x** has two, of 30 and 4 bits: TKJT names them
+    `_faceAttributeMask8_30` and `_faceAttributeMask8_4`, so the base word owns
+    bits 0..29 and the pair supplies 30..63. That split is the only one that
+    adds up to the 64 bits an inline mask may describe.
+
+  Bits of a mask are not counts, they are **slots on the face's ring of
+  corners** (`Mesh::vertex_face_attr` tests bit *k* while walking corner *k*),
+  so a wrong cut keeps the number of attributes, the vertex counts and every
+  hash identical while handing the attributes — usually the normals — to
+  corners that do not exist. The two cut points come from the bytes:
+  `SampleJT_Server.jt` (9.5) has a 33-corner face with `base 0x0000_0009` and
+  first auxiliary `0x0000_0004`, whose only possible third attribute sits at
+  corner 32 — inside a 30-bit window, outside a 32-bit one — while the CAD
+  export `fmsr_21a5163e4fa711f1b65c6045bd172ff5----.jt` (10.5) has base words
+  with bits 30/31 set (`0xa000_0000` on a 35-corner face, `0xd000_0000` on a
+  39-corner one) and an auxiliary `0x48`, that is attributes at corners 35 and
+  38, which proves the 32-bit field at 10.x and rules a third array out there.
+  `a_nine_x_mask_is_cut_at_thirty_bits` and
+  `a_mask_bit_of_a_real_face_stays_on_one_of_its_corners` pin the reading in
+  `decode/mesh.rs`.
+  The writer inherited the opposite, *signed* pair from TKJT and refused the
+  whole range with *"a vertex of the mesh has 32 faces, which the JT 9.x/10.x
+  attribute mask cannot describe"* — a real CAD export puts coder vertices of
+  degree 32, 33 and 40 exactly there, so such a mesh could not be written at
+  9.x/10.x at all; computing the mask as `(1 << 31) - 1` also panicked in a
+  debug build (*"attempt to subtract with overflow"*), which is what a Python
+  caller saw. `encode.rs` now keeps the whole mask of a context-7 symbol in
+  `Streams::masks7` (`mask_of_degree` builds it in `u64`, `low_bits` cuts one
+  `u32` field of `shift` bits) and fragments it into base / first auxiliary /
+  second auxiliary by `attr_mask_shift` when writing; those same three arrays
+  are what the composite hash consumes.
+  `a_face_of_up_to_64_corners_stays_in_the_context_seven_streams` pins degrees
+  30, 31, 32, 33, 40 and 64 — including that a 9.x base word never holds a bit
+  at 2³⁰ or above — through the round trip at both revisions, and
+  `an_attribute_mask_word_is_unsigned` pins the word itself.
+
+  The sweep proof is `target\degree_probe.py`, which writes a bipyramid whose
+  apex has 30…70 incident faces through the full `MetaData → Instance → Part →
+  RangeLOD → Group → Shape` chain at 9.5 and 10.3, and `tests\jt2go_picture.py`,
+  which opens each file in Siemens JT2Go and counts the pixels it really draws.
+  The first attempt — one unified 32-bit field at *every* revision — left a
+  blank shape at 9.5 for degrees 32, 33 and 40 (352 px, the trihedron alone)
+  while 10.3 was fine; with the per-revision cut every degree draws at both
+  revisions and the ink at 9.5 is identical to the ink at 10.3 — in a maximized
+  3280×1839 viewport: 30 → 883 232, 31 → 882 652, 32 → 880 830, 33 → 883 076,
+  40 → 882 847, 64 → 885 080, 65 → 885 636, 70 → 885 882 px. (The absolute count
+  tracks the window size; the equality between the two revisions does not.)
+* A pre-10.x file frames a **third** mask array after the other two, and JT 10.x
+  has none. It is not decoration: the composite hash counts it as a mask region
+  of its own at 9.x and not at all at 10.x (11 regions vs 10), so the writer
+  frames it with a value for every context-7 symbol — `0` unless the face has a
+  corner at 60 or above — instead of omitting it.
 * The **high-degree face attribute masks** are **not** a codec package: the
   stream between the split stream masks and *Split Face Syms* is an `i32` count
   followed by that many raw `u32` words. `encode.rs` writes it with
@@ -289,16 +342,20 @@ the stored value of every shape of every sample.
 
 * The **Composite Hash** of the topology is a chain of `hash16` calls over the
   symbol arrays, and the chain is **revision dependent**: eight degree arrays,
-  valences, groups, the flag array, attribute masks 0..6, the low and high 32
-  bits of mask 7, the large masks, the split symbols and the split positions —
-  eleven calls at 9.x and **ten** at 10.x, where the second auxiliary region
-  (`masks_extra`) is not hashed. The vertex records are not part of it. The flag
-  is `MeshInput::auxiliary_pair = cursor.major() < 10`, and the reader verifies
-  the same chain it reports. Reproduced for all twelve CAD shapes of the samples.
+  valences, groups, the flag array, attribute masks 0..6, the base word of mask 7
+  (`Streams::attr_masks[7]`), its first auxiliary (`attr_masks_high`) and — at
+  9.x only — its second (`attr_masks_aux`), the large masks, the split symbols
+  and the split positions: eleven calls at 9.x and **ten** at 10.x, where the
+  second auxiliary region does not exist. The vertex records are not part of it.
+  The flag is `MeshInput::auxiliary_pair = cursor.major() < 10`, and the reader
+  verifies the same chain it reports. Reproduced for all twelve CAD shapes of the
+  samples.
   The chain hashes the stored **arrays**, so it cannot discriminate how a value is
   interpreted afterwards: a shape can hash perfectly and still fail its walk (see
   `docs/jt-reader.md` on reading the mask words), which is why "hash OK" is never
-  evidence that a decode is right.
+  evidence that a decode is right. Nor can it tell a mask *shift* from a correct
+  one: cutting the same bytes at 30 instead of 32 bits leaves every region, every
+  count and the hash itself untouched.
 * The **vertex-data hashes** of the coordinates and normals are revision
   dependent in their **granularity**, not their content: JT 9.x feeds one word
   per `hash32` call and chains the seed through, JT 10.x feeds one whole

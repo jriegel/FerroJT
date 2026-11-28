@@ -126,12 +126,15 @@ geometry:
   the next package header reads as garbage (commonly `codec 255`) and the whole
   shape is lost. An empty array frames identically under both readings, which is
   why no sample in `data/ExampleFiles` exposes it.
-* **An attribute mask word is an unsigned bit vector.** The eight *Face Attribute
-  Masks* streams are compression *contexts* — a face of degree *d* uses context
-  `(d − 2).clamp(0, 7)`, not a bit range — and the mask of a context-7 face is
-  widened by the auxiliary stream that carries its high half:
-  `mask = (msbs << 32) | lsbs`, both halves unsigned, and the raw high-degree
-  words above that for a face wider than 64 bits. Reading the words as **signed**
+* **An attribute mask word is an unsigned bit vector, cut per revision.** The
+  eight *Face Attribute Masks* streams are compression *contexts* — a face of
+  degree *d* uses context `(d − 2).clamp(0, 7)`, not a bit range — and the mask
+  of a context-7 face is widened by the auxiliary streams that follow it:
+  **JT 10.x** appends one word holding bits 32..63, **JT 8.x and 9.x** append
+  two, of 30 and 4 bits, so there the base word owns bits 0..29
+  (`jt/encode.rs::attr_mask_shift` is 30 below 10.x and 32 at 10.x). Every field
+  is unsigned, and a face wider than 64 corners continues in the raw high-degree
+  words. Reading the words as **signed**
   values, or shifting both auxiliary arrays by 30 the way TKJT's
   `_nextAttrMaskSymbol` does, turns `0xFFFFFFFF` into 64 set bits and moves a
   genuine high bit from 34 to 32. A face then appears to name more attributes than
@@ -140,7 +143,17 @@ geometry:
   faces: the walk dies and the whole shape — LOD0 included — is dropped in favour
   of a coarse tier. Where the bit *counts* happen to agree the damage is subtler:
   the attribute records of every later face sit a few slots off, so the file's own
-  normals land on the wrong corners. The decisive check is the attribute count the
+  normals land on the wrong corners — and the cut of the field decides that too,
+  because a mask bit is a **slot on the ring of corners** of its face. Two real
+  files settle both revisions: `SampleJT_Server.jt` (9.5) has a 33-corner face
+  with `base 0x0000_0009` and first auxiliary `0x0000_0004`, which can only mean
+  the corner at 32 — inside a 30-bit field, past a 32-bit one — while the 10.5
+  export `fmsr_21a5163e4fa711f1b65c6045bd172ff5----.jt` has base words that do
+  use bits 30/31 (`0xa000_0000` on a 35-ring, `0xd000_0000` on a 39-ring) and an
+  auxiliary `0x48`, naming corners 35 and 38 of the latter. The 9.x rule is
+  pinned by `a_nine_x_mask_is_cut_at_thirty_bits` and
+  `a_mask_bit_of_a_real_face_stays_on_one_of_its_corners`.
+  The decisive check for the unsigned reading is the attribute count the
   shape header declares — in one Teamcenter export a shape declares 32 638 of them
   and only the unsigned reading reaches that number.
 

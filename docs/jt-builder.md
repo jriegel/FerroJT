@@ -166,8 +166,9 @@ At JT 9.x and 10.x the shape segment holds a **tri-strip set** instead, and the
 layout is the coder's: the vertex and face streams are built by
 `jt/encode.rs`, which welds the positions, walks the dual graph and emits the
 per-vertex attribute masks. A mask of **context 7** — a coder vertex of degree
-9 or more — is widened by two auxiliary streams that carry one value per mask
-symbol, and they must not be left empty; see
+9 or more — is widened by auxiliary streams that carry one value per mask
+symbol: two of them at JT 10.x (bits 0..31 and 32..63), three at 8.x/9.x
+(bits 0..29, 30..59 and 60..63). None of them may be left empty; see
 [framing facts the writer depends on](jt-writer.md#framing-facts-the-writer-depends-on).
 The strip offsets go through the null codec (byte 0)
 as before, the payload through DEFLATE. A 9.x/10.x shape carries no normal

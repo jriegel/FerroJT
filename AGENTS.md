@@ -352,40 +352,104 @@ Upload with `python -m twine upload dist\*`.
   of the reference samples caught it; the regression fixture is
   `encode.rs::heptegintagon_bipyramid` (two coder vertices of degree 70).
 - **An attribute mask word is an *unsigned bit vector*, and the context-7 auxiliary
-  stream holds its 32 MSBs.** `decode/mesh.rs::next_attr_mask` composes
-  `(msbs << 32) | lsbs` from `attr_masks[context]` and `masks_high`, then ORs the
-  bare wide-mask words at word index `bit_length - 1 - context`; the pre-10.x second
-  array (`masks_extra`, `attr_masks_aux` in the hash chain) is framing and composite
-  hash only — it owns no bit of the mask. TKJT's `_nextAttrMaskSymbol`
-  (`JtDecode_MeshCoderDriver.cxx:1390-1411`) instead **sign-extends both**
-  auxiliaries and shifts them by **30**, which we deliberately do not reproduce:
-  `0xFFFFFFFF` then reads as 64 set bits and a genuine MSB arrives at bit 32. Both
-  consequences show on `C:\Data\CLA_EXPORT_JR\fmsr_21a5163e4fa711f1b65c6045bd172ff5----.jt`
-  (**JT 10.5**, 35 shapes, 17 `RangeLOD` spans): a face that seems to carry more
-  attributes than corners is taken for a split face (`read_face` → `Ok(-1)`), so one
-  split pair is consumed too early and **every later split resolves against a
-  shifted active-face queue** — the walk dies (`topological split of vertex N points
-  at face -1`) and the shape is dropped whole, which had replaced two **LOD0**
-  shapes by their coarse LOD1 (export view 709 162 → **766 152** triangles); and
-  where the counts still agree, the **attribute records** shift by a few slots for
-  every later face, so the file's own normals land on the wrong corners — the
-  "only half the text renders right, seems like a shift" report (mis-oriented faces
+  streams cut it per revision: 30 bits below JT 10.x, 32 at 10.x.**
+  `decode/mesh.rs::next_attr_mask` composes `(base & field) | ((aux & field) << shift)`
+  from `attr_masks[context]` and `masks_high`, plus `(extra & 0xf) << 60` from the third
+  array (`masks_extra`, `attr_masks_aux` in the hash chain), which **only exists below
+  JT 10.x**; `Symbols::mask_shift` carries the cut (30 / 32). Then the bare wide-mask
+  words are ORed at word index `bit_length - 1 - context`. TKJT's `_nextAttrMaskSymbol`
+  (`JtDecode_MeshCoderDriver.cxx:1390-1411`) instead **sign-extends both** auxiliaries
+  and shifts **both** by **30**, which we deliberately do not reproduce: `0xFFFFFFFF`
+  then reads as 64 set bits and two fields arrive at the same bits. (Its member names
+  `_faceAttributeMask8_30` and `_faceAttributeMask8_4` are what name the 9.x fields —
+  30 bits then 4 — while the format description only spells out the 10.x figure,
+  "Face Attribute Masks (32 LSBs)" × 8 and "Face Attribute Mask 8 (32 MSBs)".)
+  **A mask bit addresses a corner slot of the face ring** (`Mesh::vertex_face_attr`
+  tests `(mask >> slot) & 1` while walking the corners), so a wrong *shift* keeps every
+  popcount, every declared attribute total and the composite hash intact while moving an
+  attribute record — a normal — onto a different corner. That is why the two proofs are
+  geometric, not arithmetical.
+  The 10.x half is proved by `C:\Data\CLA_EXPORT_JR\fmsr_21a5163e4fa711f1b65c6045bd172ff5----.jt`
+  (**JT 10.5**, 35 shapes, 17 `RangeLOD` spans): its base words really use bits 30/31
+  (`0xa000_0000` on a 35-corner face, `0xd000_0000` on a 39-corner one) and its auxiliary
+  supplies bits 35 and 38 of a 39-ring (`aux1 = 0x48`); cut that file at 30 and six
+  attributes vanish over 7 of its 18 035 context-7 faces. Under the *signed* reading the
+  same file is worse: a face that seems to carry more attributes than corners is taken for
+  a split face (`read_face` → `Ok(-1)`), one split pair is consumed too early and
+  **every later split resolves against a shifted active-face queue** — the walk dies
+  (`topological split of vertex N points at face -1`) and the shape is dropped whole,
+  which had replaced two **LOD0** shapes by their coarse LOD1 (export view 709 162 →
+  **766 152** triangles); where the counts still agree the **attribute records** shift by
+  a few slots for every later face, so the file's own normals land on the wrong corners —
+  the "only half the text renders right, seems like a shift" report (mis-oriented faces
   3.12 % → **0.14 %** over 34 shapes / 990 753 triangles, measured by
   `target\allnorm.py`, which compares each face's winding against the mean of its
-  three file normals). **The oracle is the attribute count the shape header
+  three file normals). **The oracle there is the attribute count the shape header
   declares** (`object.rs::read_topologically_compressed_data`, still read into
   `_attribute_count`): the decisive shape declares 32 638, the fixed reading sums to
   32 638, TKJT's to 32 636. The **composite hash cannot discriminate** any of this —
   it hashes the stored *arrays*, so all 35 shapes hashed `composite hash OK` while
   three still failed their walk; "hash OK" is never proof that a decode is right.
-  `SampleJT_Server.jt` has two such faces (`masks_high[3] = 4`, one at `[34]`): the
-  popcount is identical under both readings (`4 << 30` and `4 << 32` each set one
-  bit) but the *slots* differ, so nine vertices no longer weld and the merged pin in
-  `tests/flatten.rs` moved 1 145 208 → **1 145 199** with triangles unchanged at
-  1 193 657. A viewer-side area-weighted normal **vote** (`meshes.rs::oriented()`)
-  was built, measured (it flips 2294 normals for only a 30 % reduction, concentrated
-  where the real issue is *welded smooth normals across creases*, not orientation)
-  and **reverted** — the viewer stays faithful to the file.
+  The 30-bit cut below 10.x is proved by `SampleJT_Server.jt` (**JT 9.5**): its 33-corner
+  face stores base `0x0000_0009` and auxiliary `0x0000_0004`, so its third attribute
+  belongs to corner **32**, the last of that ring — cutting at 32 moves it to **34**,
+  outside the ring, and the attributes of that face stop lining up with its corners (the
+  same for a 35-corner face, `base 0x0000_4400 / aux 0x0000_0004`). Nine shading records
+  of the file move, so nine vertices no longer weld and the merged pin in
+  `tests/flatten.rs` is **1 145 208** (the 32-cut reading gave 1 145 199), with triangles
+  unchanged at 1 193 657. Nothing else in the family contradicts the field: all 1608
+  context-7 faces of the 24 real 9.5 CAD exports of `C:\Data\CLA_EXPORT_JR` keep their
+  base word below 2³⁰ with an empty auxiliary. Pinned by
+  `decode::mesh::a_nine_x_mask_is_cut_at_thirty_bits` and
+  `decode::mesh::a_mask_bit_of_a_real_face_stays_on_one_of_its_corners`.
+  A viewer-side area-weighted normal **vote** (`meshes.rs::oriented()`) was built,
+  measured (it flips 2294 normals for only a 30 % reduction, concentrated where the real
+  issue is *welded smooth normals across creases*, not orientation) and **reverted** —
+  the viewer stays faithful to the file.
+- **The JT *writer* carried the same signed-mask assumption; the fix is symmetric.**
+  `encode.rs::emit_attr_mask` used to (a) compute the low word as `(1 << degree) - 1`
+  in **`i32`**, so an apex of **degree 31** aborted a debug build with
+  `attempt to subtract with overflow` (a release build wrote `-1` = 32 bits), (b)
+  **refuse degrees 32..=64** with `the JT 9.x/10.x attribute mask cannot describe a
+  face of N corners, it has no encoding for more than 31` — a hole that is not in the
+  format: an inline face reaches **64** corners and the bare wide array only starts at 65
+  — and (c) cut the mask at **32 bits at every revision**, so a JT 9.5 file put bit 31 in
+  a base word that a strict consumer reads **signed**: the face then counts 64 attributes
+  for 32 corners, is taken for a split, and the walk dies. Real CAD hits the hole: the
+  `C:\Data\CLA_EXPORT_JR` shapes have coder vertices (vertex figures) of degree **40**
+  and **32**. Now `mask_of_degree` builds the whole mask in `u64`, one whole word per
+  context-7 symbol goes to `Streams::masks7`, and `write_mesh_input` fragments it at
+  `attr_mask_shift(version)` — 30 bits below JT 10.x (base 0..29, auxiliary 30..59,
+  second auxiliary 60..63, and that second stream is framed and hashed **only** there),
+  32 at 10.x — and feeds the same fragmentation to the composite hash
+  (`TopologySymbols { attr_masks, attr_masks_high, attr_masks_aux }`), which is why the
+  hash counts 11 mask regions at 9.x and 10 at 10.x. The >64 path was already right —
+  the wide words are `u32` and sit at word index `bit_length - 1 - context`.
+  Pinned by `encode::an_attribute_mask_word_is_unsigned`,
+  `encode::a_face_of_up_to_64_corners_stays_in_the_context_seven_streams` (degrees
+  30/31/32/33/40/64 through the round trip at both revisions, with the 9.x base word
+  asserted below 2³⁰), `encode::a_context_seven_face_carries_every_auxiliary_mask_stream`
+  (three mask streams at 9.x, two at 10.x) and
+  `encode::a_wide_attribute_mask_round_trips_through_the_plain_array` (degrees 65/70).
+  Sweep proof through the **strict** oracle, `target\degree_probe.py`: a bipyramid whose
+  apex has 30…70 incident faces through the full `MetaData → Instance → Part → RangeLOD →
+  Group → Shape` chain at 9.5 and 10.3. Before the cut fix, 9.5 degrees **32, 33 and 40
+  came back FAIL 352** (the trihedron only — the file loads, the shape is refused) while
+  30, 31, 64, 65 and 70 drew; afterwards every degree draws at both revisions with the
+  same ink at both — 30 → 883 232, 31 → 882 652, 32 → 880 830, 33 → 883 076,
+  40 → 882 847, 64 → 885 080, 65 → 885 636, 70 → 885 882 px in a maximized 3280×1839
+  viewport. `jtinfo.exe` accepted all of them before and
+  after: it is not a geometry oracle here.
+- **A stale `VisView_NG` process turns the strict JT2Go oracle into false
+  negatives for *every* file.** A new `jt2go_picture.py` launch defers to an already
+  running JT2Go instance, so no MDI document titled with the file name ever appears and
+  each run reports `JT2Go never loaded … (timeout after 120 s)` — including the golden
+  `example_block_jt10.3.jt` and the previously verified `target\chain_10.3.jt`. Check
+  `Get-Process | Where-Object { $_.Name -like 'VisView*' }` (its window title names the
+  file it opened, often from a much earlier session), `Stop-Process -Id <pid> -Force`,
+  and re-run: the controls then come back at 388 020 / 352 594 ink px. Do not conclude
+  "structurally refused" from `never loaded` before ruling that out; `jtinfo.exe` is the
+  fast structural cross-check (`# JtkAssemblies: 2` = root chain intact).
 - `pyo3` 0.30 cannot express a tri-state keyword: nested
   `Option<Option<&str>>` is ambiguous (`SomeWrap<T>` matches both `T` and
   `Option<T>`, E0283). Model it as two parameters — the Python API is
@@ -1029,18 +1093,19 @@ Upload with `python -m twine upload dist\*`.
   even a zero.** `mask_context(degree) = (degree - 2).clamp(0, 7)`, so context 7
   means a coder vertex of degree ≥ 9, and the reader indexes both auxiliary streams
   at the **same read position** as the mask itself (TKJT ORs them into bit 30; our
-  reader treats the first as the 32 MSBs — see the mask-word bullet above).
-  `encode.rs` therefore pushes a `0` into
-  `Streams::attr_masks_high` for every context-7 mask symbol and emits it after
-  the eight degree packages — **two** packages at 9.x, **one** at 10.x, where the
-  second is never read. Empty aux packages make a strict consumer refuse that
-  face, i.e. the whole shape renders blank. A cube (degrees 4/6) and an
-  octahedron (degree 4) can never reach context 7, and the **plate** is the only
-  sample with degree-9 coder vertices (its screws) — which is why every block
-  rewrite rendered and only the plate came out empty. Splice proof: swapping only
-  those two packages of the CAD's own shape segment gives 207 109 ink px, while
-  swapping only the context-7 mask word gives 0. Pinned by
-  `a_context_seven_face_carries_both_auxiliary_mask_streams` (`encode.rs::tests`,
+  reader cuts the mask at 30 bits below JT 10.x and at 32 at 10.x — see the
+  mask-word bullet above). `encode.rs` keeps the whole mask of every context-7
+  symbol in `Streams::masks7` and fragments it into the streams when writing, so
+  each one carries a value — zero when the face needs no bits there — and they are
+  emitted after the eight degree packages: **three** mask streams at 9.x, **two**
+  at 10.x, where the second auxiliary does not exist. Empty aux packages make a
+  strict consumer refuse that face, i.e. the whole shape renders blank. A cube
+  (degrees 4/6) and an octahedron (degree 4) can never reach context 7, and the
+  **plate** is the only sample with degree-9 coder vertices (its screws) — which is
+  why every block rewrite rendered and only the plate came out empty. Splice proof:
+  swapping only those two packages of the CAD's own shape segment gives 207 109 ink
+  px, while swapping only the context-7 mask word gives 0. Pinned by
+  `a_context_seven_face_carries_every_auxiliary_mask_stream` (`encode.rs::tests`,
   fixture `enneagon_bipyramid()` = two apices of 9 triangles). When walking the
   body by hand, the 64-bit vertex binding is **8** bytes (flag + `i32` + 3), not
   9, and a count-0 package decodes to `Payload::Null(vec![])` — test emptiness
@@ -1112,8 +1177,8 @@ Upload with `python -m twine upload dist\*`.
   integration test cannot call it and must check the bytes instead.
 - **The composite hash is revision-dependent: 11 mask-region calls at 9.x, 10 at
   10.x.** The chain (spec §7.1.4.1 Figure 95) is 8 degree arrays → valences →
-  groups → `hash16` flags → attr masks 0..6 → attr masks[7] low 32 → attr
-  masks[7] high 32 → (`masks_high`) → (`masks_extra`, **9.x only**) → large masks →
+  groups → `hash16` flags → attr masks 0..6 → attr masks[7] base word →
+  `attr_masks_high` → (`attr_masks_aux`, **9.x only**) → large masks →
   split syms → split positions, and it **ends there** — the vertex records are
   *not* part of it. Reproduced for 12 of 12 CAD shapes. The flag is
   `MeshInput::auxiliary_pair = cursor.major() < 10`. It hashes the stored **arrays**,

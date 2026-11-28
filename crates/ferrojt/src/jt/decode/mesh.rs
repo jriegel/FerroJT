@@ -399,6 +399,10 @@ struct Symbols {
     attr_masks: Vec<Vec<i32>>,
     masks_high: Vec<i32>,
     masks_extra: Vec<i32>,
+    /// Where the auxiliary context-7 mask fields start: 32 for a JT 10.x file,
+    /// 30 for an 8.x/9.x one. Zero — what a hand-built `Symbols` gets — means
+    /// the JT 10.x halves, and [`Symbols::next_attr_mask`] explains the layout.
+    mask_shift: u32,
     attr_masks_large: Vec<u32>,
     split_faces: Vec<i32>,
     split_positions: Vec<i32>,
@@ -457,33 +461,66 @@ impl Symbols {
 
     /// Next face attribute mask of context `context`.
     ///
-    /// A mask is a **bit vector**, never a signed number: every word of the
-    /// stream counts as its 32 unsigned bits. The 8th (context 7) stream owns an
-    /// auxiliary array holding the 32 most significant bits of each of its
-    /// masks, so such a mask is `(msbs << 32) | lsbs`. Files below JT 10.x store
-    /// a second auxiliary array at that place as well; the format description
-    /// names only the two streams above, every file examined here keeps that
-    /// extra one at zero, and it cannot own a mask bit — a 64-bit mask has no
-    /// room for it — so it is read for framing and hashed, but folded into no
-    /// mask.
+    /// A mask is a **bit vector**, never a signed number: every word counts as
+    /// its unsigned bits. The 8th (context 7) stream owns auxiliary arrays that
+    /// hold the rest of the same vector, and how the vector is cut between them
+    /// belongs to the revision — [`Symbols::mask_shift`] carries that:
     ///
-    /// The C++ reference instead adds both auxiliary arrays and shifts them by
-    /// 30, which sign-extends every word whose top bit is set and moves the high
-    /// bits to the wrong place. That makes a face *name more attributes than it
-    /// has corners* as soon as a mask reaches past bit 30: a real CAD export
-    /// hits it with a degree-40 face whose low word is all ones, and the shape
-    /// is then lost as a whole because the walk desynchronises (see
-    /// [`MeshInput::decode`]). The set-bit count settles the reading: a shape
-    /// declares its total attribute count in its header, and only the unsigned
-    /// words with the auxiliary array at bit 32 add up to it — shifting by 30
-    /// misses two of the 32 638 records of one shape.
+    /// * JT 10.x stores two halves, base word bits 0..31 and auxiliary bits
+    ///   32..63, and no third array.
+    /// * JT 8.x and 9.x store three fields of **thirty** bits: base bits 0..29,
+    ///   first auxiliary bits 30..59, second auxiliary bits 60..63 — which is
+    ///   what the reference reader calls `Mask8`, `Mask8_30` and `Mask8_4`.
+    ///
+    /// The cut is forced by the bytes of a file of each revision, and a face's
+    /// ring is what decides it: a mask bit at or beyond the degree addresses a
+    /// corner that does not exist, so the attributes of that face stop lining up
+    /// with its corners while the popcount stays plausible.
+    ///
+    /// The 9.5 server assembly proves the thirty-bit cut. Its 33-corner face
+    /// stores base `0x0000_0009` and auxiliary `0x0000_0004`, so the third
+    /// attribute belongs to corner 32, the last of the ring; cutting at 32
+    /// instead moves it to 34, beyond the ring, and nine shading records of that
+    /// file land on the wrong corners. Cutting the other way matters when
+    /// writing: a 30-bit field keeps the base word below 2³⁰, which a strict
+    /// consumer needs because it reads that word signed — a set bit 31 invents
+    /// attributes, the face is taken for a split and the shape is refused
+    /// (measured: a fixture of 32-corner faces draws at 10.3 and is refused at
+    /// 9.5). The same file family never contradicts the field: all 1608
+    /// context-7 faces of the 24 real 9.5 CAD exports keep their base word below
+    /// 2³⁰ with an empty auxiliary.
+    ///
+    /// A 10.5 export proves the half cut of its own revision: its base words do
+    /// carry bits 30 and 31 (`0xa000_0000` on a 35-corner face, `0xd000_0000` on
+    /// a 39-corner one) and its auxiliary word supplies bits 35 and 38 of a
+    /// 39-corner face. Cutting that file at 30 instead deletes six attributes
+    /// over seven faces and slides the remaining ones down.
+    ///
+    /// The C++ reference ORs both auxiliary arrays shifted by 30
+    /// (`JtDecode_MeshCoderDriver.cxx:1402-1405`), which folds them onto each
+    /// other and sign-extends a word whose top bit is set; that is a defect of
+    /// its own and not reproduced here.
     fn next_attr_mask(&mut self, context: usize) -> i64 {
         let position = self.attr_mask_pos[context];
         let base = self.attr_masks[context].get(position).copied().unwrap_or(0);
         let mut mask = u64::from(base as u32);
         if context == 7 {
-            let msbs = self.masks_high.get(position).copied().unwrap_or(0);
-            mask |= u64::from(msbs as u32) << 32;
+            let shift = if self.mask_shift == 0 {
+                32
+            } else {
+                self.mask_shift
+            };
+            let field = (1u64 << shift) - 1;
+            let aux = self.masks_high.get(position).copied().unwrap_or(0);
+            mask = (mask & field) | ((u64::from(aux as u32) & field) << shift);
+            if shift < 32 {
+                // The third field only exists below JT 10.x, where a 64-bit
+                // mask leaves room for its lowest `64 - 2 * shift` bits.
+                let extra = self.masks_extra.get(position).copied().unwrap_or(0);
+                let room = (64 - 2 * shift) as u64;
+                let top = (1u64 << room) - 1;
+                mask |= (u64::from(extra as u32) & top) << (2 * shift);
+            }
         }
         self.attr_mask_pos[context] += 1;
         mask as i64
@@ -662,7 +699,7 @@ impl MeshInput {
     ///
     /// A shape whose walk diverges is dropped as a whole, which is what the C++
     /// reference does — and what loses a whole level of detail when a symbol is
-    /// misread. [`Symbols::next_attr_mask`] is the reading that keeps a real CAD
+    /// misread. `Symbols::next_attr_mask` is the reading that keeps a real CAD
     /// export walkable.
     pub fn decode(mut self, order: ByteOrder) -> Result<Topology> {
         let mut degrees = Vec::with_capacity(8);
@@ -683,6 +720,7 @@ impl MeshInput {
             face_flags: self.face_flags.decode(order, Unpack::Lag1)?,
             masks_high: self.masks_high.decode(order, Unpack::Null)?,
             masks_extra: self.masks_extra.decode(order, Unpack::Null)?,
+            mask_shift: if self.auxiliary_pair { 30 } else { 32 },
             attr_masks_large: std::mem::take(&mut self.attr_masks_large),
             split_faces: self.split_faces.decode(order, Unpack::Lag1)?,
             split_positions: self.split_positions.decode(order, Unpack::Null)?,
@@ -1257,13 +1295,99 @@ mod tests {
             attr_mask_pos: vec![0; 8],
             ..Symbols::default()
         };
-        // The low word comes from the context array, the first auxiliary array
-        // supplies the 32 most significant bits, and the second auxiliary array
-        // (here 4) is only framed and hashed — it owns no bit of the mask.
+        // The JT 10.x layout: the low word comes from the context array, the
+        // first auxiliary array supplies the 32 most significant bits, and the
+        // second auxiliary array (here 4) is only framed and hashed — it owns
+        // no bit of the mask.
         let mask = symbols.next_attr_mask(7);
         assert_eq!(mask, (3i64 << 32) | 2);
         assert_eq!(symbols.attr_mask_pos[7], 1);
         assert_eq!(symbols.next_attr_mask(7), 0);
+    }
+
+    #[test]
+    fn a_nine_x_mask_is_cut_at_thirty_bits() {
+        // Below JT 10.x the same three streams own bits 0..29, 30..59 and
+        // 60..63 — the reference reader names them `Mask8`, `Mask8_30` and
+        // `Mask8_4`. Cutting them at 32 instead would hand a face of 32 corners
+        // a base word whose sign bit is set, which a consumer reads as a
+        // negative mask naming more attributes than the face has corners, and
+        // the walk loses the shape.
+        let mut symbols = Symbols {
+            degrees: vec![Vec::new(); 8],
+            attr_masks: vec![
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![0x3fff_ffff],
+            ],
+            masks_high: vec![0x3fff_ffff],
+            masks_extra: vec![0x0000_000f],
+            mask_shift: 30,
+            degree_pos: vec![0; 8],
+            attr_mask_pos: vec![0; 8],
+            ..Symbols::default()
+        };
+        // 30 bits from the base, 30 from the first auxiliary array and 4 from
+        // the second: a full 64-corner mask that stays positive in the base.
+        let mask = symbols.next_attr_mask(7);
+        assert_eq!(mask as u64, u64::MAX);
+        assert_eq!(mask.count_ones(), 64);
+        assert_eq!(symbols.attr_mask_pos[7], 1);
+    }
+
+    #[test]
+    fn a_mask_bit_of_a_real_face_stays_on_one_of_its_corners() {
+        // The bytes the server assembly stores for one of its 33-corner faces:
+        // two attributes in the base word and one in the auxiliary array. Only
+        // the 30-bit cut lands the third one on corner 32, the last corner of
+        // the ring. Reading the same words at 32 puts it on 34, where no vertex
+        // of that face can ever reach it, and the face's attributes stop
+        // matching its corners.
+        let corners = 33u32;
+        let mut symbols = Symbols {
+            degrees: vec![Vec::new(); 8],
+            attr_masks: vec![
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![0x0000_0009],
+            ],
+            masks_high: vec![0x0000_0004],
+            masks_extra: vec![0],
+            mask_shift: 30,
+            degree_pos: vec![0; 8],
+            attr_mask_pos: vec![0; 8],
+            ..Symbols::default()
+        };
+        let set_bits =
+            |mask: u64| -> Vec<u32> { (0..64).filter(|bit| (mask >> bit) & 1 != 0).collect() };
+        let mask = symbols.next_attr_mask(7) as u64;
+        assert_eq!(
+            set_bits(mask),
+            [0, 3, 32],
+            "the 30-bit cut must keep every attribute on a corner of the face"
+        );
+
+        symbols.mask_shift = 32;
+        symbols.attr_mask_pos[7] = 0;
+        let shifted = symbols.next_attr_mask(7) as u64;
+        assert_eq!(
+            set_bits(shifted)
+                .iter()
+                .filter(|bit| **bit >= corners)
+                .count(),
+            1,
+            "the 32-bit cut is what loses the attribute of a real file"
+        );
     }
 
     #[test]
