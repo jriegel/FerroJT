@@ -126,11 +126,31 @@ geometry:
   the next package header reads as garbage (commonly `codec 255`) and the whole
   shape is lost. An empty array frames identically under both readings, which is
   why no sample in `data/ExampleFiles` exposes it.
+* **An attribute mask word is an unsigned bit vector.** The eight *Face Attribute
+  Masks* streams are compression *contexts* — a face of degree *d* uses context
+  `(d − 2).clamp(0, 7)`, not a bit range — and the mask of a context-7 face is
+  widened by the auxiliary stream that carries its high half:
+  `mask = (msbs << 32) | lsbs`, both halves unsigned, and the raw high-degree
+  words above that for a face wider than 64 bits. Reading the words as **signed**
+  values, or shifting both auxiliary arrays by 30 the way TKJT's
+  `_nextAttrMaskSymbol` does, turns `0xFFFFFFFF` into 64 set bits and moves a
+  genuine high bit from 34 to 32. A face then appears to name more attributes than
+  it has corners, the decoder takes it for a split face, consumes one split pair
+  too many, and every later split resolves against a shifted queue of active
+  faces: the walk dies and the whole shape — LOD0 included — is dropped in favour
+  of a coarse tier. Where the bit *counts* happen to agree the damage is subtler:
+  the attribute records of every later face sit a few slots off, so the file's own
+  normals land on the wrong corners. The decisive check is the attribute count the
+  shape header declares — in one Teamcenter export a shape declares 32 638 of them
+  and only the unsigned reading reaches that number.
 
 A decoded topology also carries a composite hash, and `jt::decode::mesh` verifies
 it against the symbols (`TopologySymbols::composite`). A mismatch is reported as a
 warning naming both hashes — the strongest available check that a stream was read
-with the right framing, since a wrong reading of any package changes the hash.
+with the right framing, since a wrong reading of any package changes the hash. It
+is *not* a check on how a value is then interpreted: the mask streams are hashed
+as the arrays that were stored, so a shape can hash perfectly and still fail its
+walk.
 
 Last, a file can be internally inconsistent: the topology of a shape may name a
 vertex index at or just past the end of the coordinate array the file itself

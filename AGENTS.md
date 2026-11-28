@@ -351,6 +351,41 @@ Upload with `python -m twine upload dist\*`.
   it. An **empty** array frames identically under both readings, which is why none
   of the reference samples caught it; the regression fixture is
   `encode.rs::heptegintagon_bipyramid` (two coder vertices of degree 70).
+- **An attribute mask word is an *unsigned bit vector*, and the context-7 auxiliary
+  stream holds its 32 MSBs.** `decode/mesh.rs::next_attr_mask` composes
+  `(msbs << 32) | lsbs` from `attr_masks[context]` and `masks_high`, then ORs the
+  bare wide-mask words at word index `bit_length - 1 - context`; the pre-10.x second
+  array (`masks_extra`, `attr_masks_aux` in the hash chain) is framing and composite
+  hash only — it owns no bit of the mask. TKJT's `_nextAttrMaskSymbol`
+  (`JtDecode_MeshCoderDriver.cxx:1390-1411`) instead **sign-extends both**
+  auxiliaries and shifts them by **30**, which we deliberately do not reproduce:
+  `0xFFFFFFFF` then reads as 64 set bits and a genuine MSB arrives at bit 32. Both
+  consequences show on `C:\Data\CLA_EXPORT_JR\fmsr_21a5163e4fa711f1b65c6045bd172ff5----.jt`
+  (**JT 10.5**, 35 shapes, 17 `RangeLOD` spans): a face that seems to carry more
+  attributes than corners is taken for a split face (`read_face` → `Ok(-1)`), so one
+  split pair is consumed too early and **every later split resolves against a
+  shifted active-face queue** — the walk dies (`topological split of vertex N points
+  at face -1`) and the shape is dropped whole, which had replaced two **LOD0**
+  shapes by their coarse LOD1 (export view 709 162 → **766 152** triangles); and
+  where the counts still agree, the **attribute records** shift by a few slots for
+  every later face, so the file's own normals land on the wrong corners — the
+  "only half the text renders right, seems like a shift" report (mis-oriented faces
+  3.12 % → **0.14 %** over 34 shapes / 990 753 triangles, measured by
+  `target\allnorm.py`, which compares each face's winding against the mean of its
+  three file normals). **The oracle is the attribute count the shape header
+  declares** (`object.rs::read_topologically_compressed_data`, still read into
+  `_attribute_count`): the decisive shape declares 32 638, the fixed reading sums to
+  32 638, TKJT's to 32 636. The **composite hash cannot discriminate** any of this —
+  it hashes the stored *arrays*, so all 35 shapes hashed `composite hash OK` while
+  three still failed their walk; "hash OK" is never proof that a decode is right.
+  `SampleJT_Server.jt` has two such faces (`masks_high[3] = 4`, one at `[34]`): the
+  popcount is identical under both readings (`4 << 30` and `4 << 32` each set one
+  bit) but the *slots* differ, so nine vertices no longer weld and the merged pin in
+  `tests/flatten.rs` moved 1 145 208 → **1 145 199** with triangles unchanged at
+  1 193 657. A viewer-side area-weighted normal **vote** (`meshes.rs::oriented()`)
+  was built, measured (it flips 2294 normals for only a 30 % reduction, concentrated
+  where the real issue is *welded smooth normals across creases*, not orientation)
+  and **reverted** — the viewer stays faithful to the file.
 - `pyo3` 0.30 cannot express a tri-state keyword: nested
   `Option<Option<&str>>` is ambiguous (`SomeWrap<T>` matches both `T` and
   `Option<T>`, E0283). Model it as two parameters — the Python API is
@@ -386,6 +421,13 @@ Upload with `python -m twine upload dist\*`.
   raw length counts too much: block 9.5 went 7 → 3. The ids are **not**
   `0..count` — block 9.5 is `[4, 5, 6]`, plate1-9.5 `[4, 5, 6, 11, 12, 13]` — so
   `mesh(id)` raises `IndexError` unless the id is in that list.
+- **A dropped shape shows up in the LSG view as a node with a LOD late load but no
+  mesh.** Walk `child_ids()` from `root_id()` and compare `n.lod_ids` with
+  `n.mesh_ids`: a `Shape` whose LOD0 late load has no `JtMesh` is a decode failure,
+  and the viewer then draws its **coarse** tier — which looks exactly like "the
+  normals are interpolated / wrong". That is how the two CLA shapes were found in
+  seconds (`ferrojt.open()` after `maturin develop`), and the decoder warning
+  naming the vertex whose split resolved to `face -1` points at the shape.
 - **`JtArray` zero copy.** `__getbuffer__(slf: Bound<'_, Self>, view, flags)` +
   `slf.into_ptr()` as the owner, `__releasebuffer__(&self, view)` frees the
   heap-owned `CString` in `view.format` and the `Box<[Py_ssize_t; 4]>` in
@@ -985,10 +1027,10 @@ Upload with `python -m twine upload dist\*`.
   consumer walking `Part → RangeLod → tier` finds no tier.
 - **A context-7 attribute mask needs one value in *each* auxiliary mask stream,
   even a zero.** `mask_context(degree) = (degree - 2).clamp(0, 7)`, so context 7
-  means a coder vertex of degree ≥ 9, and the reader
-  (`JtDecode_MeshCoderDriver.cxx:1390-1411`) indexes `_faceAttributeMask8_30` and
-  `_faceAttributeMask8_4` with the **same read position** as the mask itself and
-  ORs both at bit 30. `encode.rs` therefore pushes a `0` into
+  means a coder vertex of degree ≥ 9, and the reader indexes both auxiliary streams
+  at the **same read position** as the mask itself (TKJT ORs them into bit 30; our
+  reader treats the first as the 32 MSBs — see the mask-word bullet above).
+  `encode.rs` therefore pushes a `0` into
   `Streams::attr_masks_high` for every context-7 mask symbol and emits it after
   the eight degree packages — **two** packages at 9.x, **one** at 10.x, where the
   second is never read. Empty aux packages make a strict consumer refuse that
@@ -1071,10 +1113,12 @@ Upload with `python -m twine upload dist\*`.
 - **The composite hash is revision-dependent: 11 mask-region calls at 9.x, 10 at
   10.x.** The chain (spec §7.1.4.1 Figure 95) is 8 degree arrays → valences →
   groups → `hash16` flags → attr masks 0..6 → attr masks[7] low 32 → attr
-  masks[7] high 32 → (`mask8_30`) → (`mask8_4`, **9.x only**) → large masks →
+  masks[7] high 32 → (`masks_high`) → (`masks_extra`, **9.x only**) → large masks →
   split syms → split positions, and it **ends there** — the vertex records are
   *not* part of it. Reproduced for 12 of 12 CAD shapes. The flag is
-  `MeshInput::auxiliary_pair = cursor.major() < 10`.
+  `MeshInput::auxiliary_pair = cursor.major() < 10`. It hashes the stored **arrays**,
+  never the composed 64-bit mask, so it cannot tell a correct reading of a mask from
+  a wrong one: a shape can hash `composite hash OK` and still die in its walk.
 - **The vertex-data hash granularity is revision-dependent too**: JT 9.x feeds
   **one word per `hash32` call**, JT 10.x feeds **one whole component array per
   call**. Component-major, record-minor, over the **unique** coordinates.

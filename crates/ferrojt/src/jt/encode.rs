@@ -98,8 +98,9 @@ struct Streams {
     /// The auxiliary high-bit stream of context 7: one value per mask symbol
     /// written into [`Streams::attr_masks`]`[7]`.
     ///
-    /// The reader ORs both auxiliary arrays into a context-7 mask at bit 30, so
-    /// a mask that needs no bit above 29 still needs one value (zero) in each
+    /// The reader folds the first of these into a context-7 mask as its 32 MSBs
+    /// and reads the second for framing only, so a mask that needs no bit above
+    /// 31 still needs one value (zero) per mask symbol in each
     /// array. A consumer that renders a shape from its topological
     /// representation refuses a *context-7 face whose auxiliary streams are
     /// empty*, which is why the count must track the mask count rather than the
@@ -1096,7 +1097,7 @@ fn write_mesh_input(streams: &Streams, version: JtVersion, out: &mut Vec<u8>) {
     }
     // The two auxiliary mask arrays of context 7. JT 10.x folds them into one
     // stream and never reads the second. Both hold one value per context-7 mask
-    // symbol; the mask here never reaches past bit 30, so both are zero. The
+    // symbol; the mask here never needs a bit above 31, so both are zero. The
     // composite hash below makes one call per stream the file stores, so the
     // pair has to be hashed only where the pair is written.
     package2(&streams.attr_masks_high, version, out);

@@ -1351,7 +1351,10 @@ FLATTENED = {
     "example_block_jt10.3.jt": (24, 12, 1),
     "opening_protection_plate1_jt8.0.jt": (1084, 1012, 2),
     "opening_protection_plate1_jt9.5.jt": (923, 800, 2),
-    "SampleJT_Server.jt": (1_145_208, 1_193_657, 592),
+    # Nine of this file's vertices stop welding together now that a context-7
+    # face reads its wide attribute bits at their real position, which hands the
+    # face's attributes to the right corners (see AGENTS.md). Triangles unchanged.
+    "SampleJT_Server.jt": (1_145_199, 1_193_657, 592),
 }
 
 

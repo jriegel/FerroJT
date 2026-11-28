@@ -64,10 +64,16 @@ const EXPECTED: &[(&str, Expectation)] = &[
         },
     ),
     // 2158 nodes and 106 representations, instanced into 592 material runs.
+    // Two of its shapes hold a context-7 face whose wide attribute bits live in
+    // the auxiliary stream that holds the 32 most significant bits of that mask:
+    // reading those bits at their real position (see
+    // `crates/ferrojt/src/jt/decode/mesh.rs::next_attr_mask`) hands the face its
+    // attributes in the right slots, so nine vertices no longer weld together.
+    // The triangle count is untouched.
     (
         "SampleJT_Server.jt",
         Expectation {
-            vertices: 1_145_208,
+            vertices: 1_145_199,
             triangles: 1_193_657,
             groups: 592,
         },

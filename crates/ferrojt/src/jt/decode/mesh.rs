@@ -397,8 +397,8 @@ struct Symbols {
     groups: Vec<i32>,
     face_flags: Vec<i32>,
     attr_masks: Vec<Vec<i32>>,
-    mask8_30: Vec<i32>,
-    mask8_4: Vec<i32>,
+    masks_high: Vec<i32>,
+    masks_extra: Vec<i32>,
     attr_masks_large: Vec<u32>,
     split_faces: Vec<i32>,
     split_positions: Vec<i32>,
@@ -457,27 +457,36 @@ impl Symbols {
 
     /// Next face attribute mask of context `context`.
     ///
-    /// Context 7 also folds in the two auxiliary mask arrays. Both are shifted
-    /// by 30 bits, which is what the reference does; the second shift is a bug
-    /// in that implementation and is reproduced here so the output matches.
+    /// A mask is a **bit vector**, never a signed number: every word of the
+    /// stream counts as its 32 unsigned bits. The 8th (context 7) stream owns an
+    /// auxiliary array holding the 32 most significant bits of each of its
+    /// masks, so such a mask is `(msbs << 32) | lsbs`. Files below JT 10.x store
+    /// a second auxiliary array at that place as well; the format description
+    /// names only the two streams above, every file examined here keeps that
+    /// extra one at zero, and it cannot own a mask bit — a 64-bit mask has no
+    /// room for it — so it is read for framing and hashed, but folded into no
+    /// mask.
+    ///
+    /// The C++ reference instead adds both auxiliary arrays and shifts them by
+    /// 30, which sign-extends every word whose top bit is set and moves the high
+    /// bits to the wrong place. That makes a face *name more attributes than it
+    /// has corners* as soon as a mask reaches past bit 30: a real CAD export
+    /// hits it with a degree-40 face whose low word is all ones, and the shape
+    /// is then lost as a whole because the walk desynchronises (see
+    /// [`MeshInput::decode`]). The set-bit count settles the reading: a shape
+    /// declares its total attribute count in its header, and only the unsigned
+    /// words with the auxiliary array at bit 32 add up to it — shifting by 30
+    /// misses two of the 32 638 records of one shape.
     fn next_attr_mask(&mut self, context: usize) -> i64 {
         let position = self.attr_mask_pos[context];
-        let mut value = self.attr_masks[context]
-            .get(position)
-            .copied()
-            .map_or(0, i64::from);
+        let base = self.attr_masks[context].get(position).copied().unwrap_or(0);
+        let mut mask = u64::from(base as u32);
         if context == 7 {
-            let mut high = 0i64;
-            if let Some(value) = self.mask8_4.get(position) {
-                high += i64::from(*value) << 30;
-            }
-            if let Some(value) = self.mask8_30.get(position) {
-                high += i64::from(*value) << 30;
-            }
-            value |= high;
+            let msbs = self.masks_high.get(position).copied().unwrap_or(0);
+            mask |= u64::from(msbs as u32) << 32;
         }
         self.attr_mask_pos[context] += 1;
-        value
+        mask as i64
     }
 
     /// Next wide attribute mask, covering `degree` bits.
@@ -580,8 +589,15 @@ pub struct MeshInput {
     groups: Package,
     face_flags: Package,
     attr_masks: [Package; 8],
-    mask8_30: Package,
-    mask8_4: Package,
+    /// The 32 most significant bits of every context-7 mask. A JT 8.x/9.x file
+    /// stores a second stream of the same shape right after it, JT 10.x only
+    /// this one.
+    masks_high: Package,
+    /// The second auxiliary context-7 stream a JT 8.x/9.x file stores. The
+    /// format description names no mask array at this place and every reference
+    /// file keeps it empty or zero, so it is read for framing and for the
+    /// composite hash, but never merged into a mask.
+    masks_extra: Package,
     /// The high-degree attribute masks, stored as a plain array of unsigned
     /// integers rather than as a codec package.
     attr_masks_large: Vec<u32>,
@@ -615,8 +631,8 @@ impl MeshInput {
             *package = Package::load2(cursor)?;
         }
         let auxiliary_pair = cursor.major() < 10;
-        let mask8_30 = Package::load2(cursor)?;
-        let mask8_4 = if auxiliary_pair {
+        let masks_high = Package::load2(cursor)?;
+        let masks_extra = if auxiliary_pair {
             Package::load2(cursor)?
         } else {
             Package::empty()
@@ -632,8 +648,8 @@ impl MeshInput {
             groups,
             face_flags,
             attr_masks,
-            mask8_30,
-            mask8_4,
+            masks_high,
+            masks_extra,
             attr_masks_large,
             split_faces,
             split_positions,
@@ -643,6 +659,11 @@ impl MeshInput {
     }
 
     /// Decodes the symbol streams and rebuilds the mesh.
+    ///
+    /// A shape whose walk diverges is dropped as a whole, which is what the C++
+    /// reference does — and what loses a whole level of detail when a symbol is
+    /// misread. [`Symbols::next_attr_mask`] is the reading that keeps a real CAD
+    /// export walkable.
     pub fn decode(mut self, order: ByteOrder) -> Result<Topology> {
         let mut degrees = Vec::with_capacity(8);
         for package in &mut self.degrees {
@@ -660,8 +681,8 @@ impl MeshInput {
             valences: self.valences.decode(order, Unpack::Null)?,
             groups: self.groups.decode(order, Unpack::Null)?,
             face_flags: self.face_flags.decode(order, Unpack::Lag1)?,
-            mask8_30: self.mask8_30.decode(order, Unpack::Null)?,
-            mask8_4: self.mask8_4.decode(order, Unpack::Null)?,
+            masks_high: self.masks_high.decode(order, Unpack::Null)?,
+            masks_extra: self.masks_extra.decode(order, Unpack::Null)?,
             attr_masks_large: std::mem::take(&mut self.attr_masks_large),
             split_faces: self.split_faces.decode(order, Unpack::Lag1)?,
             split_positions: self.split_positions.decode(order, Unpack::Null)?,
@@ -686,8 +707,8 @@ impl MeshInput {
                 groups: &symbols.groups,
                 face_flags: &symbols.face_flags,
                 attr_masks: slices(&symbols.attr_masks),
-                attr_masks_high: &symbols.mask8_30,
-                attr_masks_aux: &symbols.mask8_4,
+                attr_masks_high: &symbols.masks_high,
+                attr_masks_aux: &symbols.masks_extra,
                 attr_masks_large: &symbols.attr_masks_large,
                 split_faces: &symbols.split_faces,
                 split_positions: &symbols.split_positions,
@@ -833,6 +854,8 @@ impl Decoder {
             self.mesh
                 .new_face(face, degree, attr_count, mask, Vec::new());
             if attr_count > degree {
+                // The reference treats a face that names more attributes than
+                // it has corners as a split instead of a new face.
                 return Ok(-1);
             }
         } else {
@@ -1210,12 +1233,12 @@ mod tests {
         let data = empty_mesh(10);
         let mut cursor = Cursor::new(&data, ByteOrder::Little, 10);
         let input = MeshInput::load(&mut cursor).expect("load");
-        assert!(input.mask8_4.is_empty());
+        assert!(input.masks_extra.is_empty());
         assert_eq!(cursor.remaining(), 0);
     }
 
     #[test]
-    fn context_seven_merges_both_mask_arrays() {
+    fn context_seven_folds_in_the_high_mask_array() {
         let mut symbols = Symbols {
             degrees: vec![Vec::new(); 8],
             attr_masks: vec![
@@ -1228,42 +1251,49 @@ mod tests {
                 vec![],
                 vec![0x0000_0002],
             ],
-            mask8_30: vec![0x0000_0003],
-            mask8_4: vec![0x0000_0004],
+            masks_high: vec![0x0000_0003],
+            masks_extra: vec![0x0000_0004],
             degree_pos: vec![0; 8],
             attr_mask_pos: vec![0; 8],
             ..Symbols::default()
         };
-        // The low word comes from the context array, the high bits from both
-        // auxiliary arrays shifted by 30 - the reference behaviour.
+        // The low word comes from the context array, the first auxiliary array
+        // supplies the 32 most significant bits, and the second auxiliary array
+        // (here 4) is only framed and hashed — it owns no bit of the mask.
         let mask = symbols.next_attr_mask(7);
-        let expected = 2i64 | (i64::from(4) << 30) | (i64::from(3) << 30);
-        assert_eq!(mask, expected);
+        assert_eq!(mask, (3i64 << 32) | 2);
         assert_eq!(symbols.attr_mask_pos[7], 1);
         assert_eq!(symbols.next_attr_mask(7), 0);
     }
 
     #[test]
-    fn negative_mask_words_sign_extend() {
+    fn mask_words_are_unsigned_bit_vectors() {
         let mut symbols = Symbols {
             degrees: vec![Vec::new(); 8],
             attr_masks: vec![
-                vec![-1; 8],
+                vec![-1],
                 vec![],
                 vec![],
                 vec![],
                 vec![],
                 vec![],
                 vec![],
-                vec![],
+                vec![-1],
             ],
+            masks_high: vec![-1],
             degree_pos: vec![0; 8],
             attr_mask_pos: vec![0; 8],
             ..Symbols::default()
         };
-        // The symbol is an i32 -1 that the reference widens to int64_t and then
-        // hands to a uint64_t mask, so every bit ends up set.
-        assert_eq!(symbols.next_attr_mask(0).count_ones(), 64);
+        // A mask is a bit vector, not a signed number: -1 sets its 32 bits, it
+        // does not sign-extend into the high half of the word. A face of degree
+        // 40 whose low word is all ones therefore names 32 attributes, and the
+        // walk survives; widening it signed names 64 for a 40-corner face, and
+        // the whole shape is then lost.
+        assert_eq!(symbols.next_attr_mask(0).count_ones(), 32);
+        let wide = symbols.next_attr_mask(7);
+        assert_eq!((wide as u64).count_ones(), 64);
+        assert_eq!(wide, -1);
     }
 
     #[test]

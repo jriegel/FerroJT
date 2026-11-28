@@ -229,14 +229,16 @@ Read out of the samples, since no reference writer exists:
   carry the per-normal **flag package** after the normals. The OpenJT reader
   ignores that section, a rendering consumer stops on the missing field and
   draws nothing.
-* A **context-7 attribute mask** is widened by two **auxiliary streams**, and
-  both need one value per mask symbol even when no bit above 29 is ever set.
+* A **context-7 attribute mask** is widened by **auxiliary streams**, and each
+  needs one value per mask symbol even when no bit above 31 is ever set.
   `mask_context(degree) = (degree − 2).clamp(0, 7)`, so context 7 means a coder
-  vertex of degree ≥ 9; the decoder indexes `_faceAttributeMask8_30` and
-  `_faceAttributeMask8_4` with the *same* read position as the mask itself and
-  ORs both at bit 30. `encode.rs` keeps them in `Streams::attr_masks_high`,
-  pushes a `0` for every context-7 symbol, and emits them after the eight degree
-  packages — two packages at 9.x, one at 10.x, where the second is never read.
+  vertex of degree ≥ 9; the decoder indexes the auxiliary streams with the *same*
+  read position as the mask itself, and the value of the first one supplies the 32
+  **most significant** bits of that mask (`(msbs << 32) | lsbs`, both unsigned —
+  see `decode/mesh.rs::next_attr_mask`). `encode.rs` keeps them in
+  `Streams::attr_masks_high`, pushes a `0` for every context-7 symbol, and emits
+  them after the eight degree packages — two packages at 9.x, one at 10.x, where
+  the second is never read.
   A consumer that renders refuses a context-7 face whose auxiliary streams are
   empty, so the whole shape comes out blank. A cube (degrees 4 and 6) and an
   octahedron (degree 4) can never reach context 7, and the screws of
@@ -289,10 +291,14 @@ the stored value of every shape of every sample.
   symbol arrays, and the chain is **revision dependent**: eight degree arrays,
   valences, groups, the flag array, attribute masks 0..6, the low and high 32
   bits of mask 7, the large masks, the split symbols and the split positions —
-  eleven calls at 9.x and **ten** at 10.x, where the `mask8_4` region is not
-  hashed. The vertex records are not part of it. The flag is
-  `MeshInput::auxiliary_pair = cursor.major() < 10`, and the reader verifies the
-  same chain it reports. Reproduced for all twelve CAD shapes of the samples.
+  eleven calls at 9.x and **ten** at 10.x, where the second auxiliary region
+  (`masks_extra`) is not hashed. The vertex records are not part of it. The flag
+  is `MeshInput::auxiliary_pair = cursor.major() < 10`, and the reader verifies
+  the same chain it reports. Reproduced for all twelve CAD shapes of the samples.
+  The chain hashes the stored **arrays**, so it cannot discriminate how a value is
+  interpreted afterwards: a shape can hash perfectly and still fail its walk (see
+  `docs/jt-reader.md` on reading the mask words), which is why "hash OK" is never
+  evidence that a decode is right.
 * The **vertex-data hashes** of the coordinates and normals are revision
   dependent in their **granularity**, not their content: JT 9.x feeds one word
   per `hash32` call and chains the seed through, JT 10.x feeds one whole
